@@ -1,0 +1,957 @@
+2025-12-10 21:33:32.406609: I tensorflow/stream_executor/platform/default/dso_loader.cc:49] Successfully opened dynamic library libcudart.so.11.0
+2025-12-10 21:33:34.419062: I tensorflow/compiler/jit/xla_cpu_device.cc:41] Not creating XLA devices, tf_xla_enable_xla_devices not set
+2025-12-10 21:33:34.419233: I tensorflow/stream_executor/platform/default/dso_loader.cc:49] Successfully opened dynamic library libcuda.so.1
+2025-12-10 21:33:34.419590: I tensorflow/stream_executor/cuda/cuda_gpu_executor.cc:941] successful NUMA node read from SysFS had negative value (-1), but there must be at least one NUMA node, so returning NUMA node zero
+2025-12-10 21:33:34.421902: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1720] Found device 0 with properties: 
+pciBusID: 0000:01:00.0 name: NVIDIA GeForce RTX 4090 computeCapability: 8.9
+coreClock: 2.52GHz coreCount: 128 deviceMemorySize: 23.53GiB deviceMemoryBandwidth: 938.86GiB/s
+2025-12-10 21:33:34.421971: I tensorflow/stream_executor/platform/default/dso_loader.cc:49] Successfully opened dynamic library libcudart.so.11.0
+2025-12-10 21:33:34.422065: I tensorflow/stream_executor/platform/default/dso_loader.cc:49] Successfully opened dynamic library libcublas.so.11
+2025-12-10 21:33:34.422120: I tensorflow/stream_executor/platform/default/dso_loader.cc:49] Successfully opened dynamic library libcublasLt.so.11
+2025-12-10 21:33:34.422167: I tensorflow/stream_executor/platform/default/dso_loader.cc:49] Successfully opened dynamic library libcufft.so.10
+2025-12-10 21:33:34.422211: I tensorflow/stream_executor/platform/default/dso_loader.cc:49] Successfully opened dynamic library libcurand.so.10
+2025-12-10 21:33:34.422405: W tensorflow/stream_executor/platform/default/dso_loader.cc:60] Could not load dynamic library 'libcusolver.so.10'; dlerror: libcusolver.so.10: cannot open shared object file: No such file or directory; LD_LIBRARY_PATH: /home/ajifang/miniconda3/envs/py37/lib/python3.7/site-packages/cv2/../../lib64:
+2025-12-10 21:33:34.422487: I tensorflow/stream_executor/platform/default/dso_loader.cc:49] Successfully opened dynamic library libcusparse.so.11
+2025-12-10 21:33:34.422545: I tensorflow/stream_executor/platform/default/dso_loader.cc:49] Successfully opened dynamic library libcudnn.so.8
+2025-12-10 21:33:34.422562: W tensorflow/core/common_runtime/gpu/gpu_device.cc:1757] Cannot dlopen some GPU libraries. Please make sure the missing libraries mentioned above are installed properly if you would like to use GPU. Follow the guide at https://www.tensorflow.org/install/gpu for how to download and setup the required libraries for your platform.
+Skipping registering GPU devices...
+2025-12-10 21:33:34.423067: I tensorflow/core/platform/cpu_feature_guard.cc:142] This TensorFlow binary is optimized with oneAPI Deep Neural Network Library (oneDNN) to use the following CPU instructions in performance-critical operations:  AVX512F
+To enable them in other operations, rebuild TensorFlow with the appropriate compiler flags.
+2025-12-10 21:33:34.425217: I tensorflow/compiler/jit/xla_gpu_device.cc:99] Not creating XLA devices, tf_xla_enable_xla_devices not set
+2025-12-10 21:33:34.425276: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1261] Device interconnect StreamExecutor with strength 1 edge matrix:
+2025-12-10 21:33:34.425291: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1267]      
+2025-12-10 21:33:35.141072: W tensorflow/python/util/util.cc:348] Sets are not currently considered sequences, but this may change in the future, so consider avoiding using them.
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+2025-12-10 21:33:35,379 - INFO - Starting new episode
+2025-12-10 21:33:37.197025: I tensorflow/compiler/mlir/mlir_graph_optimization_pass.cc:116] None of the MLIR optimization passes are enabled (registered 2)
+2025-12-10 21:33:37.197726: I tensorflow/core/platform/profile_utils/cpu_utils.cc:112] CPU Frequency: 2493955000 Hz
+/home/ajifang/SAC_carla/reward_monitor.py:259: UserWarning: This figure includes Axes that are not compatible with tight_layout, so results might be incorrect.
+  self.fig.tight_layout()
+2025-12-10 21:34:56,932 - INFO - Starting new episode
+WARNING: attempting to unsubscribe from stream but sensor wasn't listening: Actor 24368 (sensor.camera.rgb) 
+2025-12-10 21:35:09,312 - INFO - Starting new episode
+WARNING: attempting to unsubscribe from stream but sensor wasn't listening: Actor 24375 (sensor.camera.rgb) 
+======================================================================
+PPO简化训练 - 使用agent.learn()
+======================================================================
+
+🎯 停车障碍场景配置:
+  - 停车数量: 4辆
+  - 停车间距: 50.0m
+
+[1] 加载激进版Reward配置...
+✅ 激进版Reward已加载
+
+[2] 创建训练日志记录器...
+[TrainingLogger] 日志文件初始化: training_log.json
+✅ 日志记录器创建成功
+  - 日志文件: training_log.json
+  - 自动保存间隔: 每5个episode
+
+[3] 创建CARLA Gym环境...
+[CarlaEnv] __init__ start
+[CarlaEnv] spaces ready. obs_dim = 9 action_dim = 1
+2000
+[CarlaEnv] 尝试连接Traffic Manager端口: 8000
+[CarlaEnv] ✅ Traffic Manager成功连接到端口: 8000
+✅ 环境创建成功（带日志记录）
+
+[4] 创建PPO Agent...
+
+⚠️  权重不完整，从头开始
+state_spec: {'state': (9,)}
+action_shape: 2
+distribution: gaussian
+Optimizer: adam.
+Optimizer: adam.
+✅ PPO Agent创建成功
+  - Policy LR: 5e-5
+  - Value LR: 1e-4
+  - Entropy: 0.05
+  - 模型保存路径: weights/ppo-carla-simple
+
+[5] 开始训练...
+----------------------------------------------------------------------
+[CarlaEnv] 🚗 使用 parked_obstacles 场景，准备放置 4 辆停车障碍...
+[CarlaEnv] 找到起始waypoint: (-3.7, 13.2)
+[CarlaEnv] 放置停车 #1 at (-32.6, 10.9)
+[CarlaEnv] 放置停车 #2 at (-39.9, -31.3)
+[CarlaEnv] 放置停车 #3 at (-15.0, -55.9)
+[CarlaEnv] 放置停车 #4 at (35.1, -55.6)
+[CarlaEnv] ✅ 成功放置 4 辆停车障碍
+[CarlaEnv] 自车spawn位置: (-3.7, 13.2)
+🎯 [STEP 1] action网络输出: [[-2.3234363 -4.182822 ]]
+🎯 [STEP 1] action_env转换后: [-2.3234363 -4.182822 ]
+🎯 [STEP 1] mean: [[ 0.33368605 -1.8705946 ]], std: [[1.8114935 1.7579101]]
+[DEBUG] Episode 1, Step 0: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 1, Step 1: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 1, Step 2: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 1, Step 3: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 1, Step 4: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+🎯 [STEP 51] action网络输出: [[-4.664638   1.6490742]]
+🎯 [STEP 51] action_env转换后: [-4.664638   1.6490742]
+🎯 [STEP 51] mean: [[-2.6123462  1.8359584]], std: [[1.5371447 1.8400917]]
+🎯 [STEP 101] action网络输出: [[-3.6366053 -0.5610919]]
+🎯 [STEP 101] action_env转换后: [-3.6366053 -0.5610919]
+🎯 [STEP 101] mean: [[-2.615177  1.840157]], std: [[1.5353858 1.8453174]]
+🎯 [STEP 151] action网络输出: [[-7.0029783 -1.3893625]]
+🎯 [STEP 151] action_env转换后: [-7.0029783 -1.3893625]
+🎯 [STEP 151] mean: [[-2.612478   1.8357702]], std: [[1.5371329 1.8399262]]
+🎯 [STEP 201] action网络输出: [[-1.7699621 -1.0948409]]
+🎯 [STEP 201] action_env转换后: [-1.7699621 -1.0948409]
+🎯 [STEP 201] mean: [[-2.6125238  1.8356189]], std: [[1.5371845 1.8397421]]
+🎯 [STEP 251] action网络输出: [[-2.987509   2.1740408]]
+🎯 [STEP 251] action_env转换后: [-2.987509   2.1740408]
+🎯 [STEP 251] mean: [[-2.6125271  1.8356419]], std: [[1.5371975 1.839706 ]]
+🎯 [STEP 301] action网络输出: [[-5.0348763  2.4601645]]
+🎯 [STEP 301] action_env转换后: [-5.0348763  2.4601645]
+🎯 [STEP 301] mean: [[-2.6131523  1.8458651]], std: [[1.5348611 1.8486248]]
+🎯 [STEP 351] action网络输出: [[-2.2650597 -1.003798 ]]
+🎯 [STEP 351] action_env转换后: [-2.2650597 -1.003798 ]
+🎯 [STEP 351] mean: [[-2.6158192  1.8818042]], std: [[1.5259279 1.8837949]]
+🎯 [STEP 401] action网络输出: [[-2.488069  3.994449]]
+🎯 [STEP 401] action_env转换后: [-2.488069  3.994449]
+🎯 [STEP 401] mean: [[-2.620355   1.8548708]], std: [[1.5307306 1.8614388]]
+🎯 [STEP 451] action网络输出: [[-2.0269113   0.07424641]]
+🎯 [STEP 451] action_env转换后: [-2.0269113   0.07424641]
+🎯 [STEP 451] mean: [[-2.615196   1.8399807]], std: [[1.5353665 1.8453307]]
+Episode 1 terminated after 500 timesteps in 55.448s with reward -123.804.
+[TRD] dumping to: weights/ppo-carla-simple/trd_debug.txt
+Update took 3.406s
+[TRD] dumping to: weights/ppo-carla-simple/trd_debug.txt
+[write_summaries] error.
+
+======================================================================
+Episode 1 完成
+======================================================================
+  当前: Reward=-123.80, Length=500, Speed=0.02 m/s
+  最近10个平均:
+    - Reward: -123.80
+    - Length: 500
+    - Policy Loss: 0.0000
+    - Value Loss: 0.0000
+    - Entropy: 0.0000
+    - Speed: 0.02 m/s
+    - Collision Rate: 0.00%
+======================================================================
+
+[CarlaEnv] 🚗 使用 parked_obstacles 场景，准备放置 4 辆停车障碍...
+[CarlaEnv] 找到起始waypoint: (-110.5, 85.8)
+[CarlaEnv] 放置停车 #1 at (-102.0, 115.6)
+[CarlaEnv] 放置停车 #2 at (-56.8, 138.7)
+[CarlaEnv] 放置停车 #3 at (-6.8, 139.0)
+[CarlaEnv] 放置停车 #4 at (43.2, 139.4)
+[CarlaEnv] ✅ 成功放置 4 辆停车障碍
+[CarlaEnv] 自车spawn位置: (-110.5, 85.8)
+🎯 [STEP 1] action网络输出: [[-1.3872291 -1.7077887]]
+🎯 [STEP 1] action_env转换后: [-1.3872291 -1.7077887]
+🎯 [STEP 1] mean: [[1.3428253 0.5243767]], std: [[2.0025766 2.2337947]]
+[DEBUG] Episode 2, Step 0: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 2, Step 1: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 2, Step 2: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 2, Step 3: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 2, Step 4: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+🎯 [STEP 51] action网络输出: [[1.1910679 2.960241 ]]
+🎯 [STEP 51] action_env转换后: [1.1910679 2.960241 ]
+🎯 [STEP 51] mean: [[ 2.9184306 -1.0228822]], std: [[1.3783615 2.1625416]]
+[DEBUG] 🚨 Collision detected! Episode step: 65
+[DEBUG] _get_reward: collision=True, done=True, episode_steps=65
+[DEBUG] Episode 2, Step 65: info keys=['reward_components', 'planner_id', 'collision'], collision=True
+[DEBUG] 🚨 Collision recorded in episode 2, step 65
+Episode 2 terminated after 66 timesteps in 7.31s with reward 0.662.
+[TRD] dumping to: weights/ppo-carla-simple/trd_debug.txt
+Update took 1.345s
+[TRD] dumping to: weights/ppo-carla-simple/trd_debug.txt
+[write_summaries] error.
+
+======================================================================
+Episode 2 完成
+======================================================================
+  当前: Reward=0.66, Length=66, Speed=5.27 m/s
+  最近10个平均:
+    - Reward: -61.57
+    - Length: 283
+    - Policy Loss: 0.0000
+    - Value Loss: 0.0000
+    - Entropy: 0.0000
+    - Speed: 2.65 m/s
+    - Collision Rate: 0.76%
+======================================================================
+
+[CarlaEnv] 🚗 使用 parked_obstacles 场景，准备放置 4 辆停车障碍...
+[CarlaEnv] 找到起始waypoint: (-52.3, -23.4)
+[CarlaEnv] 放置停车 #1 at (-54.1, 6.7)
+[CarlaEnv] 放置停车 #2 at (-53.9, 56.7)
+[CarlaEnv] 放置停车 #3 at (-53.8, 106.7)
+[CarlaEnv] 放置停车 #4 at (-78.9, 123.8)
+[CarlaEnv] ✅ 成功放置 4 辆停车障碍
+[CarlaEnv] 自车spawn位置: (-52.3, -23.4)
+🎯 [STEP 1] action网络输出: [[ 0.01468503 -1.9452041 ]]
+🎯 [STEP 1] action_env转换后: [ 0.01468503 -1.9452041 ]
+🎯 [STEP 1] mean: [[ 1.136526 -2.046747]], std: [[1.4242879 1.3073186]]
+[DEBUG] Episode 3, Step 0: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 3, Step 1: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 3, Step 2: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 3, Step 3: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 3, Step 4: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+🎯 [STEP 51] action网络输出: [[-0.04914951  0.7224095 ]]2025-12-10 21:36:26,434 - INFO - Starting new episode
+WARNING: attempting to unsubscribe from stream but sensor wasn't listening: Actor 24382 (sensor.camera.rgb) 
+2025-12-10 21:36:48,204 - INFO - Starting new episode
+WARNING: attempting to unsubscribe from stream but sensor wasn't listening: Actor 24389 (sensor.camera.rgb) 
+2025-12-10 21:38:06,035 - INFO - Starting new episode
+
+🎯 [STEP 51] action_env转换后: [-0.04914951  0.7224095 ]
+🎯 [STEP 51] mean: [[-0.61560583 -1.2537836 ]], std: [[1.398953  2.6487505]]
+🎯 [STEP 101] action网络输出: [[-0.764902  -1.6409914]]
+🎯 [STEP 101] action_env转换后: [-0.764902  -1.6409914]
+🎯 [STEP 101] mean: [[-0.7261017 -1.2541183]], std: [[1.3794026 2.6673803]]
+🎯 [STEP 151] action网络输出: [[0.86745435 0.75725543]]
+🎯 [STEP 151] action_env转换后: [0.86745435 0.75725543]
+🎯 [STEP 151] mean: [[-0.6068894 -1.2668265]], std: [[1.3944228 2.6462612]]
+🎯 [STEP 201] action网络输出: [[-2.923376  -2.2014372]]
+🎯 [STEP 201] action_env转换后: [-2.923376  -2.2014372]
+🎯 [STEP 201] mean: [[-0.45769125 -1.2354686 ]], std: [[1.3912476 2.8127058]]
+🎯 [STEP 251] action网络输出: [[-3.4181252   0.70372784]]
+🎯 [STEP 251] action_env转换后: [-3.4181252   0.70372784]
+🎯 [STEP 251] mean: [[-0.47953334 -1.3529242 ]], std: [[1.3736928 2.5902827]]
+🎯 [STEP 301] action网络输出: [[ 0.17471793 -3.8077843 ]]
+🎯 [STEP 301] action_env转换后: [ 0.17471793 -3.8077843 ]
+🎯 [STEP 301] mean: [[-0.4959515 -1.3540471]], std: [[1.3684804 2.604368 ]]
+🎯 [STEP 351] action网络输出: [[0.14208978 0.58270025]]
+🎯 [STEP 351] action_env转换后: [0.14208978 0.58270025]
+🎯 [STEP 351] mean: [[-0.25710064 -1.1462066 ]], std: [[1.2563772 3.1543527]]
+🎯 [STEP 401] action网络输出: [[1.4834936  0.00170118]]
+🎯 [STEP 401] action_env转换后: [1.4834936  0.00170118]
+🎯 [STEP 401] mean: [[ 0.26818272 -0.35861617]], std: [[1.190289 4.006944]]
+🎯 [STEP 451] action网络输出: [[-0.28229958 -0.8591777 ]]
+🎯 [STEP 451] action_env转换后: [-0.28229958 -0.8591777 ]
+🎯 [STEP 451] mean: [[ 0.05584216 -0.796494  ]], std: [[1.7779875 2.3499074]]
+Episode 3 terminated after 500 timesteps in 53.731s with reward -64.329.
+[TRD] dumping to: weights/ppo-carla-simple/trd_debug.txt
+Update took 1.462s
+[TRD] dumping to: weights/ppo-carla-simple/trd_debug.txt
+[write_summaries] error.
+
+======================================================================
+Episode 3 完成
+======================================================================
+  当前: Reward=-64.33, Length=500, Speed=2.41 m/s
+  最近10个平均:
+    - Reward: -62.49
+    - Length: 355
+    - Policy Loss: 0.0000
+    - Value Loss: 0.0000
+    - Entropy: 0.0000
+    - Speed: 2.57 m/s
+    - Collision Rate: 0.51%
+======================================================================
+
+[CarlaEnv] 🚗 使用 parked_obstacles 场景，准备放置 4 辆停车障碍...
+[CarlaEnv] 找到起始waypoint: (49.3, 137.6)
+[CarlaEnv] 放置停车 #1 at (80.4, 136.4)
+[CarlaEnv] 放置停车 #2 at (107.5, 92.9)
+[CarlaEnv] 放置停车 #3 at (107.9, 42.9)
+[CarlaEnv] 放置停车 #4 at (72.0, 15.1)
+[CarlaEnv] ✅ 成功放置 4 辆停车障碍
+[CarlaEnv] 自车spawn位置: (49.3, 137.6)
+🎯 [STEP 1] action网络输出: [[ 2.9704356 -2.6868608]]
+🎯 [STEP 1] action_env转换后: [ 2.9704356 -2.6868608]
+🎯 [STEP 1] mean: [[ 1.1553677 -2.0187423]], std: [[1.416625  1.3061485]]
+[DEBUG] Episode 4, Step 0: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 4, Step 1: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 4, Step 2: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 4, Step 3: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 4, Step 4: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+🎯 [STEP 51] action网络输出: [[0.32087982 0.4646294 ]]
+🎯 [STEP 51] action_env转换后: [0.32087982 0.4646294 ]
+🎯 [STEP 51] mean: [[-0.2512778 -1.2789553]], std: [[1.3719873 2.779039 ]]
+🎯 [STEP 101] action网络输出: [[-0.24950685 -4.605351  ]]
+🎯 [STEP 101] action_env转换后: [-0.24950685 -4.605351  ]
+🎯 [STEP 101] mean: [[-0.37830344 -1.4235244 ]], std: [[1.3241858 2.523583 ]]
+[DEBUG] 🚨 Collision detected! Episode step: 126
+[DEBUG] _get_reward: collision=True, done=True, episode_steps=126
+[DEBUG] Episode 4, Step 126: info keys=['reward_components', 'planner_id', 'collision'], collision=True
+[DEBUG] 🚨 Collision recorded in episode 4, step 126
+Episode 4 terminated after 127 timesteps in 13.714s with reward -15.489.
+[TRD] dumping to: weights/ppo-carla-simple/trd_debug.txt
+Update took 1.375s
+[TRD] dumping to: weights/ppo-carla-simple/trd_debug.txt
+[write_summaries] error.
+
+======================================================================
+Episode 4 完成
+======================================================================
+  当前: Reward=-15.49, Length=127, Speed=2.54 m/s
+  最近10个平均:
+    - Reward: -50.74
+    - Length: 298
+    - Policy Loss: 0.0000
+    - Value Loss: 0.0000
+    - Entropy: 0.0000
+    - Speed: 2.56 m/s
+    - Collision Rate: 0.58%
+======================================================================
+
+[CarlaEnv] 🚗 使用 parked_obstacles 场景，准备放置 4 辆停车障碍...
+[CarlaEnv] 找到起始waypoint: (101.6, -42.7)
+[CarlaEnv] 放置停车 #1 at (78.7, -64.1)
+[CarlaEnv] 放置停车 #2 at (27.8, -66.2)
+[CarlaEnv] 放置停车 #3 at (-22.2, -66.5)
+[CarlaEnv] 放置停车 #4 at (-72.3, -67.0)
+[CarlaEnv] ✅ 成功放置 4 辆停车障碍
+[CarlaEnv] 自车spawn位置: (101.6, -42.7)
+🎯 [STEP 1] action网络输出: [[ 2.0663633 -3.3343832]]
+🎯 [STEP 1] action_env转换后: [ 2.0663633 -3.3343832]
+🎯 [STEP 1] mean: [[ 1.7518381 -1.4370917]], std: [[1.2723191 1.6376421]]
+[DEBUG] Episode 5, Step 0: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 5, Step 1: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 5, Step 2: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 5, Step 3: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 5, Step 4: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+🎯 [STEP 51] action网络输出: [[0.13641524 0.8550334 ]]
+🎯 [STEP 51] action_env转换后: [0.13641524 0.8550334 ]
+🎯 [STEP 51] mean: [[-2.089855  0.533141]], std: [[1.8222163 2.5453224]]
+🎯 [STEP 101] action网络输出: [[-2.0394678  0.6915446]]
+🎯 [STEP 101] action_env转换后: [-2.0394678  0.6915446]
+🎯 [STEP 101] mean: [[-2.1094973  0.5517869]], std: [[1.8640381 2.4623623]]
+🎯 [STEP 151] action网络输出: [[-4.5909348  3.042611 ]]
+🎯 [STEP 151] action_env转换后: [-4.5909348  3.042611 ]
+🎯 [STEP 151] mean: [[-2.1094577   0.55179954]], std: [[1.8640347 2.4624057]]
+🎯 [STEP 201] action网络输出: [[1.3914316 0.6728115]]
+🎯 [STEP 201] action_env转换后: [1.3914316 0.6728115]
+🎯 [STEP 201] mean: [[-2.1114502   0.54850787]], std: [[1.8584995 2.477755 ]]
+🎯 [STEP 251] action网络输出: [[-1.4536566 -3.5725818]]
+🎯 [STEP 251] action_env转换后: [-1.4536566 -3.5725818]
+🎯 [STEP 251] mean: [[-2.1095862   0.55156094]], std: [[1.8638722 2.462184 ]]
+🎯 [STEP 301] action网络输出: [[-3.7408276  0.5329347]]
+🎯 [STEP 301] action_env转换后: [-3.7408276  0.5329347]
+🎯 [STEP 301] mean: [[-2.0948694   0.53809685]], std: [[1.8378837 2.5241394]]
+🎯 [STEP 351] action网络输出: [[-4.9706554  4.250262 ]]
+🎯 [STEP 351] action_env转换后: [-4.9706554  4.250262 ]
+🎯 [STEP 351] mean: [[-2.1074445  0.554117 ]], std: [[1.8643994 2.4621167]]
+🎯 [STEP 401] action网络输出: [[-2.071649   1.6854882]]
+🎯 [STEP 401] action_env转换后: [-2.071649   1.6854882]
+🎯 [STEP 401] mean: [[-2.1083608  0.5538946]], std: [[1.8643959 2.4607909]]
+🎯 [STEP 451] action网络输出: [[-3.049527   1.7997489]]
+🎯 [STEP 451] action_env转换后: [-3.049527   1.7997489]
+🎯 [STEP 451] mean: [[-2.1080003  0.5483408]], std: [[1.8568404 2.4769464]]
+Episode 5 terminated after 500 timesteps in 54.872s with reward -118.23.
+[TRD] dumping to: weights/ppo-carla-simple/trd_debug.txt
+Update took 1.464s
+[TRD] dumping to: weights/ppo-carla-simple/trd_debug.txt
+[write_summaries] error.
+
+======================================================================
+Episode 5 完成
+======================================================================WARNING: attempting to unsubscribe from stream but sensor wasn't listening: Actor 24396 (sensor.camera.rgb) 
+2025-12-10 21:39:24,199 - INFO - Starting new episode
+WARNING: attempting to unsubscribe from stream but sensor wasn't listening: Actor 24403 (sensor.camera.rgb) 
+2025-12-10 21:40:42,070 - INFO - Starting new episode
+WARNING: attempting to unsubscribe from stream but sensor wasn't listening: Actor 24410 (sensor.camera.rgb) 
+
+  当前: Reward=-118.23, Length=500, Speed=0.25 m/s
+  最近10个平均:
+    - Reward: -64.24
+    - Length: 339
+    - Policy Loss: 0.0000
+    - Value Loss: 0.0000
+    - Entropy: 0.0000
+    - Speed: 2.10 m/s
+    - Collision Rate: 0.46%
+======================================================================
+
+[CarlaEnv] 🚗 使用 parked_obstacles 场景，准备放置 4 辆停车障碍...
+[CarlaEnv] 找到起始waypoint: (93.1, -43.1)
+[CarlaEnv] 放置停车 #1 at (97.6, -17.7)
+[CarlaEnv] 放置停车 #2 at (77.4, 11.6)
+[CarlaEnv] 放置停车 #3 at (27.4, 11.5)
+[CarlaEnv] 放置停车 #4 at (-22.6, 11.3)
+[CarlaEnv] ✅ 成功放置 4 辆停车障碍
+[CarlaEnv] 自车spawn位置: (93.1, -43.1)
+🎯 [STEP 1] action网络输出: [[0.39139295 0.90895176]]
+🎯 [STEP 1] action_env转换后: [0.39139295 0.90895176]
+🎯 [STEP 1] mean: [[-1.9590821   0.55649877]], std: [[2.0102882 1.6475122]]
+[DEBUG] Episode 6, Step 0: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 6, Step 1: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 6, Step 2: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 6, Step 3: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 6, Step 4: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+🎯 [STEP 51] action网络输出: [[-1.3620212  0.3076708]]
+🎯 [STEP 51] action_env转换后: [-1.3620212  0.3076708]
+🎯 [STEP 51] mean: [[-1.9407032  0.3813216]], std: [[1.9863076 1.6669563]]
+🎯 [STEP 101] action网络输出: [[-3.167262  1.756835]]
+🎯 [STEP 101] action_env转换后: [-3.167262  1.756835]
+🎯 [STEP 101] mean: [[-1.9481292   0.40676233]], std: [[1.9891217 1.662816 ]]
+🎯 [STEP 151] action网络输出: [[0.897943 1.982909]]
+🎯 [STEP 151] action_env转换后: [0.897943 1.982909]
+🎯 [STEP 151] mean: [[-1.9453607  0.4069795]], std: [[1.990007  1.6639401]]
+🎯 [STEP 201] action网络输出: [[-2.1451573  1.7683004]]
+🎯 [STEP 201] action_env转换后: [-2.1451573  1.7683004]
+🎯 [STEP 201] mean: [[-1.947333    0.40365383]], std: [[1.9886873 1.6633036]]
+🎯 [STEP 251] action网络输出: [[-2.854707   2.0477498]]
+🎯 [STEP 251] action_env转换后: [-2.854707   2.0477498]
+🎯 [STEP 251] mean: [[-1.9412022   0.37964493]], std: [[1.9855974 1.6666615]]
+🎯 [STEP 301] action网络输出: [[-1.419332   -0.38135004]]
+🎯 [STEP 301] action_env转换后: [-1.419332   -0.38135004]
+🎯 [STEP 301] mean: [[-1.944972    0.40363657]], std: [[1.9912302 1.663568 ]]
+🎯 [STEP 351] action网络输出: [[-7.438656   1.7871356]]
+🎯 [STEP 351] action_env转换后: [-7.438656   1.7871356]
+🎯 [STEP 351] mean: [[-1.9395641   0.37860328]], std: [[1.9870981 1.6668937]]
+🎯 [STEP 401] action网络输出: [[ 0.07155883 -0.5755532 ]]
+🎯 [STEP 401] action_env转换后: [ 0.07155883 -0.5755532 ]
+🎯 [STEP 401] mean: [[-1.9397804   0.37898523]], std: [[1.9869456 1.666894 ]]
+🎯 [STEP 451] action网络输出: [[-3.9059095   0.50717974]]
+🎯 [STEP 451] action_env转换后: [-3.9059095   0.50717974]
+🎯 [STEP 451] mean: [[-1.939737    0.37925526]], std: [[1.9870322 1.6669331]]
+Episode 6 terminated after 500 timesteps in 54.34s with reward -124.13.
+[TRD] dumping to: weights/ppo-carla-simple/trd_debug.txt
+Update took 1.58s
+[TRD] dumping to: weights/ppo-carla-simple/trd_debug.txt
+[write_summaries] error.
+
+======================================================================
+Episode 6 完成
+======================================================================
+  当前: Reward=-124.13, Length=500, Speed=0.02 m/s
+  最近10个平均:
+    - Reward: -74.22
+    - Length: 366
+    - Policy Loss: 0.0000
+    - Value Loss: 0.0000
+    - Entropy: 0.0000
+    - Speed: 1.75 m/s
+    - Collision Rate: 0.38%
+======================================================================
+
+[CarlaEnv] 🚗 使用 parked_obstacles 场景，准备放置 4 辆停车障碍...
+[CarlaEnv] 找到起始waypoint: (-105.3, -31.8)
+[CarlaEnv] 放置停车 #1 at (-89.1, -54.1)
+[CarlaEnv] 放置停车 #2 at (-42.6, -59.6)
+[CarlaEnv] 放置停车 #3 at (7.5, -59.1)
+[CarlaEnv] 放置停车 #4 at (57.5, -59.1)
+[CarlaEnv] ✅ 成功放置 4 辆停车障碍
+[CarlaEnv] 自车spawn位置: (-105.3, -31.8)
+🎯 [STEP 1] action网络输出: [[ 1.5975875 -2.0999892]]
+🎯 [STEP 1] action_env转换后: [ 1.5975875 -2.0999892]
+🎯 [STEP 1] mean: [[ 1.8113006 -1.6768788]], std: [[1.3007209 1.6666405]]
+[DEBUG] Episode 7, Step 0: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 7, Step 1: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 7, Step 2: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 7, Step 3: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 7, Step 4: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+🎯 [STEP 51] action网络输出: [[ 2.1914468  -0.34440267]]
+🎯 [STEP 51] action_env转换后: [ 2.1914468  -0.34440267]
+🎯 [STEP 51] mean: [[ 1.8674153 -1.6414669]], std: [[1.2986773 1.6788566]]
+🎯 [STEP 101] action网络输出: [[-2.4155927 -1.8274611]]
+🎯 [STEP 101] action_env转换后: [-2.4155927 -1.8274611]
+🎯 [STEP 101] mean: [[-2.1357486   0.02985784]], std: [[1.5265505 2.2254643]]
+🎯 [STEP 151] action网络输出: [[ 0.16402721 -2.8574092 ]]
+🎯 [STEP 151] action_env转换后: [ 0.16402721 -2.8574092 ]
+🎯 [STEP 151] mean: [[-2.1838102  0.0375945]], std: [[1.5587598 2.129346 ]]
+🎯 [STEP 201] action网络输出: [[-0.5899745 -3.538829 ]]
+🎯 [STEP 201] action_env转换后: [-0.5899745 -3.538829 ]
+🎯 [STEP 201] mean: [[-2.1838136   0.03759245]], std: [[1.5587612 2.129362 ]]
+🎯 [STEP 251] action网络输出: [[-1.4656153  3.7525394]]
+🎯 [STEP 251] action_env转换后: [-1.4656153  3.7525394]
+🎯 [STEP 251] mean: [[-2.1838114   0.03760323]], std: [[1.5587523 2.1294222]]
+🎯 [STEP 301] action网络输出: [[-2.74889    1.3956406]]
+🎯 [STEP 301] action_env转换后: [-2.74889    1.3956406]
+🎯 [STEP 301] mean: [[-2.1837614  0.0375876]], std: [[1.5587196 2.1293917]]
+🎯 [STEP 351] action网络输出: [[-3.5171962   0.46919566]]
+🎯 [STEP 351] action_env转换后: [-3.5171962   0.46919566]
+🎯 [STEP 351] mean: [[-2.2038276   0.05039811]], std: [[1.5508001 2.1636937]]
+🎯 [STEP 401] action网络输出: [[-2.8317943   0.55664146]]
+🎯 [STEP 401] action_env转换后: [-2.8317943   0.55664146]
+🎯 [STEP 401] mean: [[-2.1837237   0.03769761]], std: [[1.5587071 2.129428 ]]
+🎯 [STEP 451] action网络输出: [[1.405415 2.390192]]
+🎯 [STEP 451] action_env转换后: [1.405415 2.390192]
+🎯 [STEP 451] mean: [[-2.1844523   0.03942242]], std: [[1.5542544 2.143608 ]]
+Episode 7 terminated after 500 timesteps in 54.587s with reward -108.709.
+[TRD] dumping to: weights/ppo-carla-simple/trd_debug.txt
+Update took 1.561s
+[TRD] dumping to: weights/ppo-carla-simple/trd_debug.txt
+[write_summaries] error.
+
+======================================================================
+Episode 7 完成
+======================================================================
+  当前: Reward=-108.71, Length=500, Speed=0.67 m/s
+  最近10个平均:
+    - Reward: -79.15
+    - Length: 385
+    - Policy Loss: 0.0000
+    - Value Loss: 0.0000
+    - Entropy: 0.0000
+    - Speed: 1.60 m/s
+    - Collision Rate: 0.33%
+======================================================================
+
+[CarlaEnv] 🚗 使用 parked_obstacles 场景，准备放置 4 辆停车障碍...
+[CarlaEnv] 找到起始waypoint: (-45.3, -23.3)
+[CarlaEnv] 放置停车 #1 at (-44.3, -54.4)
+[CarlaEnv] 放置停车 #2 at (-93.8, -59.4)
+[CarlaEnv] 放置停车 #3 at (-111.9, -11.7)
+[CarlaEnv] 放置停车 #4 at (-90.9, 29.7)
+[CarlaEnv] ✅ 成功放置 4 辆停车障碍
+[CarlaEnv] 自车spawn位置: (-45.3, -23.3)
+🎯 [STEP 1] action网络输出: [[ 1.5286918 -3.50919  ]]
+🎯 [STEP 1] action_env转换后: [ 1.5286918 -3.50919  ]
+🎯 [STEP 1] mean: [[-0.12735765  0.76257795]], std: [[1.9693445 2.356351 ]]
+[DEBUG] Episode 8, Step 0: info keys=['reward_components', 'planner_id', 'collision'], collision=False2025-12-10 21:40:59,684 - INFO - Starting new episode
+WARNING: attempting to unsubscribe from stream but sensor wasn't listening: Actor 24417 (sensor.camera.rgb) 
+2025-12-10 21:42:16,935 - INFO - Starting new episode
+WARNING: attempting to unsubscribe from stream but sensor wasn't listening: Actor 24424 (sensor.camera.rgb) 
+
+[DEBUG] Episode 8, Step 1: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 8, Step 2: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 8, Step 3: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 8, Step 4: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+🎯 [STEP 51] action网络输出: [[ 0.94365954 -1.4485033 ]]
+🎯 [STEP 51] action_env转换后: [ 0.94365954 -1.4485033 ]
+🎯 [STEP 51] mean: [[0.60657144 0.5990656 ]], std: [[2.2518024 2.163454 ]]
+[DEBUG] 🚨 Collision detected! Episode step: 96
+[DEBUG] _get_reward: collision=True, done=True, episode_steps=96
+[DEBUG] Episode 8, Step 96: info keys=['reward_components', 'planner_id', 'collision'], collision=True
+[DEBUG] 🚨 Collision recorded in episode 8, step 96
+Episode 8 terminated after 97 timesteps in 11.16s with reward -4.386.
+[TRD] dumping to: weights/ppo-carla-simple/trd_debug.txt
+Update took 1.297s
+[TRD] dumping to: weights/ppo-carla-simple/trd_debug.txt
+[write_summaries] error.
+
+======================================================================
+Episode 8 完成
+======================================================================
+  当前: Reward=-4.39, Length=97, Speed=4.23 m/s
+  最近10个平均:
+    - Reward: -69.80
+    - Length: 349
+    - Policy Loss: 0.0000
+    - Value Loss: 0.0000
+    - Entropy: 0.0000
+    - Speed: 1.93 m/s
+    - Collision Rate: 0.42%
+======================================================================
+
+[CarlaEnv] 🚗 使用 parked_obstacles 场景，准备放置 4 辆停车障碍...
+[CarlaEnv] 找到起始waypoint: (87.4, 121.0)
+[CarlaEnv] 放置停车 #1 at (64.4, 128.9)
+[CarlaEnv] 放置停车 #2 at (14.4, 128.6)
+[CarlaEnv] 放置停车 #3 at (-35.6, 128.2)
+[CarlaEnv] 放置停车 #4 at (-80.7, 122.8)
+[CarlaEnv] ✅ 成功放置 4 辆停车障碍
+[CarlaEnv] 自车spawn位置: (87.4, 121.0)
+🎯 [STEP 1] action网络输出: [[ 2.2021315 -2.5087667]]
+🎯 [STEP 1] action_env转换后: [ 2.2021315 -2.5087667]
+🎯 [STEP 1] mean: [[ 2.1390028 -1.4167134]], std: [[1.347748  1.6200958]]
+[DEBUG] Episode 9, Step 0: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 9, Step 1: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 9, Step 2: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 9, Step 3: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 9, Step 4: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+🎯 [STEP 51] action网络输出: [[-1.6144959  3.4211195]]
+🎯 [STEP 51] action_env转换后: [-1.6144959  3.4211195]
+🎯 [STEP 51] mean: [[-1.696181  -0.6569975]], std: [[1.6465869 2.1684918]]
+🎯 [STEP 101] action网络输出: [[-0.23457646  0.29476398]]
+🎯 [STEP 101] action_env转换后: [-0.23457646  0.29476398]
+🎯 [STEP 101] mean: [[-1.6874112  -0.65837467]], std: [[1.6429608 2.156824 ]]
+🎯 [STEP 151] action网络输出: [[0.3790455 1.234549 ]]
+🎯 [STEP 151] action_env转换后: [0.3790455 1.234549 ]
+🎯 [STEP 151] mean: [[-1.6543565  -0.65544075]], std: [[1.6373792 2.155163 ]]
+🎯 [STEP 201] action网络输出: [[ 1.6020845 -1.9248352]]
+🎯 [STEP 201] action_env转换后: [ 1.6020845 -1.9248352]
+🎯 [STEP 201] mean: [[-1.667287   -0.65441173]], std: [[1.6396675 2.1610026]]
+🎯 [STEP 251] action网络输出: [[-1.7737339 -3.8661065]]
+🎯 [STEP 251] action_env转换后: [-1.7737339 -3.8661065]
+🎯 [STEP 251] mean: [[-1.653883   -0.65557665]], std: [[1.6372652 2.1550937]]
+🎯 [STEP 301] action网络输出: [[ 0.90716684 -0.7693348 ]]
+🎯 [STEP 301] action_env转换后: [ 0.90716684 -0.7693348 ]
+🎯 [STEP 301] mean: [[-1.6536738 -0.6556691]], std: [[1.6372092 2.1549916]]
+🎯 [STEP 351] action网络输出: [[-1.4910344 -5.1749225]]
+🎯 [STEP 351] action_env转换后: [-1.4910344 -5.1749225]
+🎯 [STEP 351] mean: [[-1.6536058 -0.6556421]], std: [[1.6372129 2.155075 ]]
+🎯 [STEP 401] action网络输出: [[-2.1586206  1.6064689]]
+🎯 [STEP 401] action_env转换后: [-2.1586206  1.6064689]
+🎯 [STEP 401] mean: [[-1.653073  -0.6553921]], std: [[1.6371422 2.1556435]]
+🎯 [STEP 451] action网络输出: [[-2.033655    0.35435396]]
+🎯 [STEP 451] action_env转换后: [-2.033655    0.35435396]
+🎯 [STEP 451] mean: [[-1.652863  -0.6556656]], std: [[1.6370616 2.1550171]]
+Episode 9 terminated after 500 timesteps in 54.116s with reward -123.019.
+[TRD] dumping to: weights/ppo-carla-simple/trd_debug.txt
+Update took 1.502s
+[TRD] dumping to: weights/ppo-carla-simple/trd_debug.txt
+[write_summaries] error.
+
+======================================================================
+Episode 9 完成
+======================================================================
+  当前: Reward=-123.02, Length=500, Speed=0.06 m/s
+  最近10个平均:
+    - Reward: -75.72
+    - Length: 366
+    - Policy Loss: 0.0000
+    - Value Loss: 0.0000
+    - Entropy: 0.0000
+    - Speed: 1.72 m/s
+    - Collision Rate: 0.37%
+======================================================================
+
+[CarlaEnv] 🚗 使用 parked_obstacles 场景，准备放置 4 辆停车障碍...
+[CarlaEnv] 找到起始waypoint: (-5.1, 130.2)
+[CarlaEnv] 放置停车 #1 at (-35.1, 128.2)
+[CarlaEnv] 放置停车 #2 at (-80.4, 123.0)
+[CarlaEnv] 放置停车 #3 at (-101.6, 86.1)
+[CarlaEnv] 放置停车 #4 at (-101.4, 38.3)
+[CarlaEnv] ✅ 成功放置 4 辆停车障碍
+[CarlaEnv] 自车spawn位置: (-5.1, 130.2)
+🎯 [STEP 1] action网络输出: [[-5.009281 -3.678092]]
+🎯 [STEP 1] action_env转换后: [-5.009281 -3.678092]
+🎯 [STEP 1] mean: [[-3.041836  -0.3909357]], std: [[1.7917149 2.2861533]]
+[DEBUG] Episode 10, Step 0: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 10, Step 1: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 10, Step 2: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 10, Step 3: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 10, Step 4: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+🎯 [STEP 51] action网络输出: [[-3.910714  -1.0268337]]
+🎯 [STEP 51] action_env转换后: [-3.910714  -1.0268337]
+🎯 [STEP 51] mean: [[-3.0137837  -0.40181103]], std: [[1.7984408 2.2537265]]
+🎯 [STEP 101] action网络输出: [[-2.9791865  2.4144454]]
+🎯 [STEP 101] action_env转换后: [-2.9791865  2.4144454]
+🎯 [STEP 101] mean: [[-3.0137842  -0.40180996]], std: [[1.7984403 2.253728 ]]
+🎯 [STEP 151] action网络输出: [[-2.7001047  0.8307154]]
+🎯 [STEP 151] action_env转换后: [-2.7001047  0.8307154]
+🎯 [STEP 151] mean: [[-3.0137708 -0.4018102]], std: [[1.7984347 2.2537472]]
+🎯 [STEP 201] action网络输出: [[-3.136786 -4.78477 ]]
+🎯 [STEP 201] action_env转换后: [-3.136786 -4.78477 ]
+🎯 [STEP 201] mean: [[-3.0180147  -0.39869103]], std: [[1.7961168 2.263651 ]]
+🎯 [STEP 251] action网络输出: [[-3.3668509   0.45076784]]
+🎯 [STEP 251] action_env转换后: [-3.3668509   0.45076784]
+🎯 [STEP 251] mean: [[-3.0136948  -0.40190664]], std: [[1.7984164 2.2537568]]
+🎯 [STEP 301] action网络输出: [[-4.4759645 -0.9919996]]
+🎯 [STEP 301] action_env转换后: [-4.4759645 -0.9919996]
+🎯 [STEP 301] mean: [[-3.0136504  -0.40193287]], std: [[1.7983842 2.2537992]]
+🎯 [STEP 351] action网络输出: [[ 4.321352  -1.5460069]]
+🎯 [STEP 351] action_env转换后: [ 4.321352  -1.5460069]
+🎯 [STEP 351] mean: [[ 2.079771  -1.0299029]], std: [[1.3052517 1.7728087]]
+🎯 [STEP 401] action网络输出: [[-1.1877666  2.466569 ]]
+🎯 [STEP 401] action_env转换后: [-1.1877666  2.466569 ]
+🎯 [STEP 401] mean: [[-2.96147    -0.44049704]], std: [[1.791172  2.3002322]]
+🎯 [STEP 451] action网络输出: [[-2.6575623 -2.0504146]]
+🎯 [STEP 451] action_env转换后: [-2.6575623 -2.0504146]
+🎯 [STEP 451] mean: [[-2.9602747 -0.4464577]], std: [[1.7957996 2.286334 ]]
+Episode 10 terminated after 500 timesteps in 53.332s with reward -117.073.2025-12-10 21:43:34,350 - INFO - Starting new episode
+WARNING: attempting to unsubscribe from stream but sensor wasn't listening: Actor 24431 (sensor.camera.rgb) 
+2025-12-10 21:44:51,375 - INFO - Starting new episode
+WARNING: attempting to unsubscribe from stream but sensor wasn't listening: Actor 24438 (sensor.camera.rgb) 
+2025-12-10 21:45:14,213 - INFO - Starting new episode
+WARNING: attempting to unsubscribe from stream but sensor wasn't listening: Actor 24445 (sensor.camera.rgb) 
+
+[TRD] dumping to: weights/ppo-carla-simple/trd_debug.txt
+Update took 1.46s
+[TRD] dumping to: weights/ppo-carla-simple/trd_debug.txt
+[write_summaries] error.
+
+======================================================================
+Episode 10 完成
+======================================================================
+  当前: Reward=-117.07, Length=500, Speed=0.28 m/s
+  最近10个平均:
+    - Reward: -79.85
+    - Length: 379
+    - Policy Loss: 0.0000
+    - Value Loss: 0.0000
+    - Entropy: 0.0000
+    - Speed: 1.57 m/s
+    - Collision Rate: 0.33%
+======================================================================
+
+[CarlaEnv] 🚗 使用 parked_obstacles 场景，准备放置 4 辆停车障碍...
+[CarlaEnv] 找到起始waypoint: (14.8, 137.4)
+[CarlaEnv] 放置停车 #1 at (44.8, 139.4)
+[CarlaEnv] 放置停车 #2 at (94.1, 126.7)
+[CarlaEnv] 放置停车 #3 at (107.6, 77.4)
+[CarlaEnv] 放置停车 #4 at (105.9, 26.2)
+[CarlaEnv] ✅ 成功放置 4 辆停车障碍
+[CarlaEnv] 自车spawn位置: (14.8, 137.4)
+🎯 [STEP 1] action网络输出: [[-1.1584632 -1.3109958]]
+🎯 [STEP 1] action_env转换后: [-1.1584632 -1.3109958]
+🎯 [STEP 1] mean: [[ 0.7276568 -2.0045753]], std: [[1.6749094 1.8898501]]
+[DEBUG] Episode 11, Step 0: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 11, Step 1: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 11, Step 2: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 11, Step 3: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 11, Step 4: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+🎯 [STEP 51] action网络输出: [[-5.5719137  -0.14369857]]
+🎯 [STEP 51] action_env转换后: [-5.5719137  -0.14369857]
+🎯 [STEP 51] mean: [[-2.3879862  1.929957 ]], std: [[1.8917497 1.5498526]]
+🎯 [STEP 101] action网络输出: [[-1.503187   1.0529335]]
+🎯 [STEP 101] action_env转换后: [-1.503187   1.0529335]
+🎯 [STEP 101] mean: [[-2.3880243  1.9298515]], std: [[1.8917241 1.5498317]]
+🎯 [STEP 151] action网络输出: [[3.1086967 1.9735967]]
+🎯 [STEP 151] action_env转换后: [3.1086967 1.9735967]
+🎯 [STEP 151] mean: [[-2.388171   1.9296374]], std: [[1.891511  1.5499899]]
+🎯 [STEP 201] action网络输出: [[-3.1982527  4.37216  ]]
+🎯 [STEP 201] action_env转换后: [-3.1982527  4.37216  ]
+🎯 [STEP 201] mean: [[-2.388187   1.9295052]], std: [[1.8915431 1.5499201]]
+🎯 [STEP 251] action网络输出: [[-2.597511   1.7122622]]
+🎯 [STEP 251] action_env转换后: [-2.597511   1.7122622]
+🎯 [STEP 251] mean: [[-2.3918784  1.9316723]], std: [[1.8888483 1.5528622]]
+🎯 [STEP 301] action网络输出: [[-2.2891097  2.8641703]]
+🎯 [STEP 301] action_env转换后: [-2.2891097  2.8641703]
+🎯 [STEP 301] mean: [[-2.389143   1.9276177]], std: [[1.8904437 1.5504831]]
+🎯 [STEP 351] action网络输出: [[-6.123723   2.9589467]]
+🎯 [STEP 351] action_env转换后: [-6.123723   2.9589467]
+🎯 [STEP 351] mean: [[-2.389546   1.9271116]], std: [[1.8899277 1.5507998]]
+🎯 [STEP 401] action网络输出: [[-4.358385   1.0145395]]
+🎯 [STEP 401] action_env转换后: [-4.358385   1.0145395]
+🎯 [STEP 401] mean: [[-2.3927898  1.9364398]], std: [[1.8872836 1.555629 ]]
+🎯 [STEP 451] action网络输出: [[-2.9204493  1.5130925]]
+🎯 [STEP 451] action_env转换后: [-2.9204493  1.5130925]
+🎯 [STEP 451] mean: [[-2.389358   1.9271984]], std: [[1.8901843 1.5506251]]
+Episode 11 terminated after 500 timesteps in 54.559s with reward -124.01.
+[TRD] dumping to: weights/ppo-carla-simple/trd_debug.txt
+Update took 1.529s
+[TRD] dumping to: weights/ppo-carla-simple/trd_debug.txt
+[write_summaries] error.
+
+======================================================================
+Episode 11 完成
+======================================================================
+  当前: Reward=-124.01, Length=500, Speed=0.02 m/s
+  最近10个平均:
+    - Reward: -79.87
+    - Length: 379
+    - Policy Loss: 0.0000
+    - Value Loss: 0.0000
+    - Entropy: 0.0000
+    - Speed: 1.57 m/s
+    - Collision Rate: 0.33%
+======================================================================
+
+[CarlaEnv] 🚗 使用 parked_obstacles 场景，准备放置 4 辆停车障碍...
+[CarlaEnv] 找到起始waypoint: (79.7, 134.7)
+[CarlaEnv] 放置停车 #1 at (102.7, 113.7)
+[CarlaEnv] 放置停车 #2 at (107.7, 62.9)
+[CarlaEnv] 放置停车 #3 at (92.5, 15.3)
+[CarlaEnv] 放置停车 #4 at (42.0, 15.0)
+[CarlaEnv] ✅ 成功放置 4 辆停车障碍
+[CarlaEnv] 自车spawn位置: (79.7, 134.7)
+🎯 [STEP 1] action网络输出: [[0.6532757 4.4754305]]
+🎯 [STEP 1] action_env转换后: [0.6532757 4.4754305]
+🎯 [STEP 1] mean: [[-0.91082096  1.8022172 ]], std: [[2.5943918 1.9230887]]
+[DEBUG] Episode 12, Step 0: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 12, Step 1: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 12, Step 2: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 12, Step 3: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 12, Step 4: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+🎯 [STEP 51] action网络输出: [[-5.948428   2.0169678]]
+🎯 [STEP 51] action_env转换后: [-5.948428   2.0169678]
+🎯 [STEP 51] mean: [[-0.9436056  1.7909873]], std: [[2.659395  1.8730168]]
+🎯 [STEP 101] action网络输出: [[-2.9382517  1.5679191]]
+🎯 [STEP 101] action_env转换后: [-2.9382517  1.5679191]
+🎯 [STEP 101] mean: [[-0.09360766  1.3996243 ]], std: [[2.5605333 2.1219683]]
+[DEBUG] 🚨 Collision detected! Episode step: 131
+[DEBUG] _get_reward: collision=True, done=True, episode_steps=131
+[DEBUG] Episode 12, Step 131: info keys=['reward_components', 'planner_id', 'collision'], collision=True
+[DEBUG] 🚨 Collision recorded in episode 12, step 131
+Episode 12 terminated after 132 timesteps in 14.708s with reward -21.452.
+[TRD] dumping to: weights/ppo-carla-simple/trd_debug.txt
+Update took 1.413s
+[TRD] dumping to: weights/ppo-carla-simple/trd_debug.txt
+[write_summaries] error.
+
+======================================================================
+Episode 12 完成
+======================================================================
+  当前: Reward=-21.45, Length=132, Speed=1.86 m/s
+  最近10个平均:
+    - Reward: -82.08
+    - Length: 386
+    - Policy Loss: 0.0000
+    - Value Loss: 0.0000
+    - Entropy: 0.0000
+    - Speed: 1.23 m/s
+    - Collision Rate: 0.26%
+======================================================================
+
+[CarlaEnv] 🚗 使用 parked_obstacles 场景，准备放置 4 辆停车障碍...
+[CarlaEnv] 找到起始waypoint: (95.4, -39.4)
+[CarlaEnv] 放置停车 #1 at (97.6, -12.7)
+[CarlaEnv] 放置停车 #2 at (72.4, 11.6)
+[CarlaEnv] 放置停车 #3 at (22.4, 11.4)
+[CarlaEnv] 放置停车 #4 at (-27.6, 11.3)
+[CarlaEnv] ✅ 成功放置 4 辆停车障碍
+[CarlaEnv] 自车spawn位置: (95.4, -39.4)
+🎯 [STEP 1] action网络输出: [[ 3.1615596 -1.9353219]]
+🎯 [STEP 1] action_env转换后: [ 3.1615596 -1.9353219]
+🎯 [STEP 1] mean: [[ 2.5287228 -1.9025737]], std: [[1.3153303 1.2876899]]
+[DEBUG] Episode 13, Step 0: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 13, Step 1: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 13, Step 2: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 13, Step 3: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 13, Step 4: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+🎯 [STEP 51] action网络输出: [[-1.35313    4.0235796]]
+🎯 [STEP 51] action_env转换后: [-1.35313    4.0235796]
+🎯 [STEP 51] mean: [[-0.2974589 -1.2459846]], std: [[1.4302683 2.3867908]]
+🎯 [STEP 101] action网络输出: [[-1.1881212   0.19515252]]
+🎯 [STEP 101] action_env转换后: [-1.1881212   0.19515252]
+🎯 [STEP 101] mean: [[-0.11473779 -1.2191638 ]], std: [[1.460511  2.7743113]]2025-12-10 21:45:41,038 - INFO - Starting new episode
+WARNING: attempting to unsubscribe from stream but sensor wasn't listening: Actor 24452 (sensor.camera.rgb) 
+2025-12-10 21:45:53,028 - INFO - Starting new episode
+WARNING: attempting to unsubscribe from stream but sensor wasn't listening: Actor 24459 (sensor.camera.rgb) 
+2025-12-10 21:46:46,319 - INFO - Starting new episode
+WARNING: attempting to unsubscribe from stream but sensor wasn't listening: Actor 24466 (sensor.camera.rgb) 
+
+🎯 [STEP 151] action网络输出: [[-0.48625153 -2.0251014 ]]
+🎯 [STEP 151] action_env转换后: [-0.48625153 -2.0251014 ]
+🎯 [STEP 151] mean: [[ 0.33520764 -0.9976089 ]], std: [[1.3593057 2.4517965]]
+[DEBUG] 🚨 Collision detected! Episode step: 158
+[DEBUG] _get_reward: collision=True, done=True, episode_steps=158
+[DEBUG] Episode 13, Step 158: info keys=['reward_components', 'planner_id', 'collision'], collision=True
+[DEBUG] 🚨 Collision recorded in episode 13, step 158
+Episode 13 terminated after 159 timesteps in 17.877s with reward -11.267.
+[TRD] dumping to: weights/ppo-carla-simple/trd_debug.txt
+Update took 1.349s
+[TRD] dumping to: weights/ppo-carla-simple/trd_debug.txt
+[write_summaries] error.
+
+======================================================================
+Episode 13 完成
+======================================================================
+  当前: Reward=-11.27, Length=159, Speed=4.14 m/s
+  最近10个平均:
+    - Reward: -76.78
+    - Length: 352
+    - Policy Loss: 0.0000
+    - Value Loss: 0.0000
+    - Entropy: 0.0000
+    - Speed: 1.41 m/s
+    - Collision Rate: 0.32%
+======================================================================
+
+[CarlaEnv] 🚗 使用 parked_obstacles 场景，准备放置 4 辆停车障碍...
+[CarlaEnv] 找到起始waypoint: (2.1, 66.3)
+[CarlaEnv] 放置停车 #1 at (-27.8, 64.4)
+[CarlaEnv] 放置停车 #2 at (-39.9, 27.3)
+[CarlaEnv] 放置停车 #3 at (-40.0, -22.6)
+[CarlaEnv] 放置停车 #4 at (-23.7, -55.9)
+[CarlaEnv] ✅ 成功放置 4 辆停车障碍
+[CarlaEnv] 自车spawn位置: (2.1, 66.3)
+🎯 [STEP 1] action网络输出: [[-2.5133076  0.8325381]]
+🎯 [STEP 1] action_env转换后: [-2.5133076  0.8325381]
+🎯 [STEP 1] mean: [[-1.4320608  1.2970501]], std: [[3.5381138 1.5817572]]
+[DEBUG] Episode 14, Step 0: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 14, Step 1: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 14, Step 2: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 14, Step 3: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 14, Step 4: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+🎯 [STEP 51] action网络输出: [[-1.0848068  1.7387727]]
+🎯 [STEP 51] action_env转换后: [-1.0848068  1.7387727]
+🎯 [STEP 51] mean: [[-1.3403512  2.973206 ]], std: [[4.1376    1.2884606]]
+[DEBUG] 🚨 Collision detected! Episode step: 59
+[DEBUG] _get_reward: collision=True, done=True, episode_steps=59
+[DEBUG] Episode 14, Step 59: info keys=['reward_components', 'planner_id', 'collision'], collision=True
+[DEBUG] 🚨 Collision recorded in episode 14, step 59
+Episode 14 terminated after 60 timesteps in 6.896s with reward -11.875.
+[TRD] dumping to: weights/ppo-carla-simple/trd_debug.txt
+Update took 1.402s
+[TRD] dumping to: weights/ppo-carla-simple/trd_debug.txt
+[write_summaries] error.
+
+======================================================================
+Episode 14 完成
+======================================================================
+  当前: Reward=-11.88, Length=60, Speed=1.16 m/s
+  最近10个平均:
+    - Reward: -76.42
+    - Length: 345
+    - Policy Loss: 0.0000
+    - Value Loss: 0.0000
+    - Entropy: 0.0000
+    - Speed: 1.27 m/s
+    - Collision Rate: 0.41%
+======================================================================
+
+[CarlaEnv] 🚗 使用 parked_obstacles 场景，准备放置 4 辆停车障碍...
+[CarlaEnv] 找到起始waypoint: (106.5, -22.7)
+[CarlaEnv] 放置停车 #1 at (96.9, -52.4)
+[CarlaEnv] 放置停车 #2 at (47.8, -66.2)
+[CarlaEnv] 放置停车 #3 at (-2.1, -66.3)
+[CarlaEnv] 放置停车 #4 at (-52.1, -66.8)
+[CarlaEnv] ✅ 成功放置 4 辆停车障碍
+[CarlaEnv] 自车spawn位置: (106.5, -22.7)
+🎯 [STEP 1] action网络输出: [[1.30592   1.9409553]]
+🎯 [STEP 1] action_env转换后: [1.30592   1.9409553]
+🎯 [STEP 1] mean: [[-0.4576489 -1.3703519]], std: [[1.4129481 1.5520117]]
+[DEBUG] Episode 15, Step 0: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 15, Step 1: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 15, Step 2: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 15, Step 3: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 15, Step 4: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+🎯 [STEP 51] action网络输出: [[-4.1021075 -2.0288892]]
+🎯 [STEP 51] action_env转换后: [-4.1021075 -2.0288892]
+🎯 [STEP 51] mean: [[ 0.29621568 -1.3038075 ]], std: [[1.5743167 1.7840836]]
+🎯 [STEP 101] action网络输出: [[-2.16077    -0.39692986]]
+🎯 [STEP 101] action_env转换后: [-2.16077    -0.39692986]
+🎯 [STEP 101] mean: [[ 1.1899298 -1.5516318]], std: [[1.8822598 1.5618509]]
+🎯 [STEP 151] action网络输出: [[-1.0351379  1.9900147]]
+🎯 [STEP 151] action_env转换后: [-1.0351379  1.9900147]
+🎯 [STEP 151] mean: [[-0.3190702 -1.1072463]], std: [[1.2646575 3.7478151]]
+🎯 [STEP 201] action网络输出: [[ 1.7448033 -0.9605464]]
+🎯 [STEP 201] action_env转换后: [ 1.7448033 -0.9605464]
+🎯 [STEP 201] mean: [[ 0.01849862 -0.9529438 ]], std: [[1.9174609 2.6508474]]
+🎯 [STEP 251] action网络输出: [[-0.47232997 -3.0399015 ]]
+🎯 [STEP 251] action_env转换后: [-0.47232997 -3.0399015 ]
+🎯 [STEP 251] mean: [[ 1.4979273 -1.4256456]], std: [[1.6627443 1.8729696]]
+🎯 [STEP 301] action网络输出: [[-2.1197336 -3.1679215]]
+🎯 [STEP 301] action_env转换后: [-2.1197336 -3.1679215]
+🎯 [STEP 301] mean: [[-0.6611652 -1.3818854]], std: [[1.232754 2.613599]]
+[DEBUG] 🚨 Collision detected! Episode step: 330
+[DEBUG] _get_reward: collision=True, done=True, episode_steps=330
+[DEBUG] Episode 15, Step 330: info keys=['reward_components', 'planner_id', 'collision'], collision=True
+[DEBUG] 🚨 Collision recorded in episode 15, step 330
+Episode 15 terminated after 331 timesteps in 36.578s with reward 16.624.
+[TRD] dumping to: weights/ppo-carla-simple/trd_debug.txt
+Update took 2.095s
+[TRD] dumping to: weights/ppo-carla-simple/trd_debug.txt
+[write_summaries] error.
+
+======================================================================
+Episode 15 完成
+======================================================================
+  当前: Reward=16.62, Length=331, Speed=5.97 m/s
+  最近10个平均:
+    - Reward: -62.93
+    - Length: 328
+    - Policy Loss: 0.0000
+    - Value Loss: 0.0000
+    - Entropy: 0.0000
+    - Speed: 1.84 m/s
+    - Collision Rate: 0.44%
+======================================================================
+
+[CarlaEnv] 🚗 使用 parked_obstacles 场景，准备放置 4 辆停车障碍...
+[CarlaEnv] 找到起始waypoint: (4.8, 140.8)
+[CarlaEnv] 放置停车 #1 at (34.8, 142.8)
+[CarlaEnv] 放置停车 #2 at (87.5, 136.6)
+[CarlaEnv] 放置停车 #3 at (111.1, 87.4)
+[CarlaEnv] 放置停车 #4 at (111.4, 37.4)
+[CarlaEnv] ✅ 成功放置 4 辆停车障碍
+[CarlaEnv] 自车spawn位置: (4.8, 140.8)
+🎯 [STEP 1] action网络输出: [[ 1.2224859 -2.689938 ]]
+🎯 [STEP 1] action_env转换后: [ 1.2224859 -2.689938 ]
+🎯 [STEP 1] mean: [[-0.28594148 -1.7669845 ]], std: [[1.4124892 2.1569648]]
+[DEBUG] Episode 16, Step 0: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 16, Step 1: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 16, Step 2: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 16, Step 3: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+[DEBUG] Episode 16, Step 4: info keys=['reward_components', 'planner_id', 'collision'], collision=False
+🎯 [STEP 51] action网络输出: [[ 2.3557427 -2.1469698]]
+🎯 [STEP 51] action_env转换后: [ 2.3557427 -2.1469698]
+🎯 [STEP 51] mean: [[-0.08977009 -1.226645  ]], std: [[1.299151 4.092619]]
+[DEBUG] 🚨 Collision detected! Episode step: 86
+[DEBUG] _get_reward: collision=True, done=True, episode_steps=86
+[DEBUG] Episode 16, Step 86: info keys=['reward_components', 'planner_id', 'collision'], collision=True2025-12-10 21:47:02,726 - INFO - Starting new episode
+WARNING: attempting to unsubscribe from stream but sensor wasn't listening: Actor 24473 (sensor.camera.rgb) 
