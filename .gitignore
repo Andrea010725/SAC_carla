@@ -1,0 +1,73 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+ENV/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Logs and databases
+*.log
+*.sql
+*.sqlite
+*.db
+
+# Training outputs
+training_output.txt
+training_log*.json
+trd_debug.txt
+
+# Model checkpoints (uncomment if you want to ignore)
+# *.pth
+# *.pt
+# *.h5
+
+# Results and logs directories
+logs/
+result/output_logger/
+result/reward_logs/
+
+# Temporary files
+*.tmp
+*.bak
+*.backup
+debug_*.py
+test_*.py
+quick_fix.py
+check_*.py
+clean_*.py
+verify_*.py
+
+# CARLA specific
+CarlaUE4.sh
+Unreal/
+
+# OS
+.DS_Store
+Thumbs.db

@@ -43,7 +43,6 @@ class CarlaEnv(gym.Env):
     def __init__(self, config, carla_port: int, tm_port: int):
         super().__init__()
 
-        print("[CarlaEnv] __init__ start")
         self.config = config
         self.carla_port = int(carla_port)
         self.tm_port = int(tm_port)
@@ -56,7 +55,6 @@ class CarlaEnv(gym.Env):
         # ==== Gym 空间 ====
         self.action_space = spaces.Box(-1.0, 1.0, shape=(2,), dtype=np.float32)
         self.observation_space = spaces.Box(-np.inf, np.inf, shape=(self.obs_dim,), dtype=np.float32)
-        print("[CarlaEnv] spaces ready. obs_dim =", self.obs_dim, "action_dim =", self.action_dim)
 
         # ==== 其他配置 ====
         self.observations_type = str(getattr(config, "observations_type", "state"))
@@ -75,7 +73,6 @@ class CarlaEnv(gym.Env):
         self.planner_mode = str(getattr(config, "planner_mode", "RL")).upper()
 
         # ==== CARLA 连接 ====
-        print(self.carla_port)
         self.client: carla.Client = carla.Client("127.0.0.1", self.carla_port)
         self.client.set_timeout(60.0)  # 增加超时时间到60秒（切换大地图需要更长时间）
 
@@ -97,16 +94,13 @@ class CarlaEnv(gym.Env):
 
         for try_port in tm_ports_to_try:
             try:
-                print(f"[CarlaEnv] 尝试连接Traffic Manager端口: {try_port}")
                 self.tm = self.client.get_trafficmanager(try_port)
                 self.tm.set_synchronous_mode(True)
-                print(f"[CarlaEnv] ✅ Traffic Manager成功连接到端口: {try_port}")
                 self.tm_port = try_port  # 更新实际使用的端口
                 tm_success = True
                 break
             except RuntimeError as e:
                 if "bind error" in str(e):
-                    print(f"[CarlaEnv] ⚠️  端口 {try_port} 被占用，尝试下一个...")
                     continue
                 else:
                     raise e
@@ -222,8 +216,8 @@ class CarlaEnv(gym.Env):
             try:
                 if hasattr(self.sync_mode, '_settings') and self.sync_mode._settings is not None:
                     self.world.apply_settings(self.sync_mode._settings)
-            except Exception as e:
-                print(f"[CarlaEnv] Warning: Failed to cleanup sync_mode: {e}")
+            except Exception:
+                pass
             self.sync_mode = None
 
         # 先决定是否切图（基于 XML 或随机）
@@ -626,13 +620,11 @@ class CarlaEnv(gym.Env):
 
         # 3) cones：老逻辑随机起点
         if self.scenario == "cones":
-            print(f"[CarlaEnv] 🎯 使用cones场景，准备放置 {self.cone_num} 个锥桶...")
             start_wp = self._pick_random_start_waypoint(
                 min_gap_from_junction=self.cone_min_gap_from_junction,
                 grid=self.cone_grid
             )
             if start_wp:
-                print(f"[CarlaEnv] 找到起始waypoint: ({start_wp.transform.location.x:.1f}, {start_wp.transform.location.y:.1f})")
                 cones_spawned, first_tf, last_tf = self._place_cones_conditionally_behind(
                     start_wp=start_wp,
                     num_cones=self.cone_num,
@@ -641,34 +633,22 @@ class CarlaEnv(gym.Env):
                     z_offset=self.cone_z_offset,
                     lane_margin=self.cone_lane_margin
                 )
-                print(f"[CarlaEnv] ✅ 成功放置 {len(cones_spawned)} 个锥桶")
                 if self.world.get_settings().synchronous_mode:
                     for _ in range(3):
                         self.world.tick()
                 tf = self._spawn_tf_from_first_cone()
                 if tf is not None:
-                    try:
-                        d = self._first_cone_tf.location.distance(tf.location)
-                        print(f"[CarlaEnv] 自车spawn位置距第一个锥桶: {d:.1f} m (最小要求: {self.spawn_min_gap_from_cone:.1f} m)")
-                    except Exception:
-                        pass
                     return tf
-            else:
-                print(f"[CarlaEnv] ⚠️  未找到合适的起始waypoint，使用随机spawn点")
 
         # 🔧 新增：4) parked_obstacles - 停车障碍场景（模拟 Overtaking）
         if self.scenario == "parked_obstacles":
-            print(f"[CarlaEnv] 🚗 使用 parked_obstacles 场景，准备放置 {self.num_parked_cars} 辆停车障碍...")
             start_wp = self._pick_random_start_waypoint(
                 min_gap_from_junction=15.0,
                 grid=5.0
             )
             if start_wp:
-                print(f"[CarlaEnv] 找到起始waypoint: ({start_wp.transform.location.x:.1f}, {start_wp.transform.location.y:.1f})")
-
                 # 放置停车障碍
                 parked_vehicles = self._place_parked_vehicles(start_wp)
-                print(f"[CarlaEnv] ✅ 成功放置 {len(parked_vehicles)} 辆停车障碍")
 
                 # 同步
                 if self.world.get_settings().synchronous_mode:
@@ -678,10 +658,7 @@ class CarlaEnv(gym.Env):
                 # 自车spawn在起始点
                 ego_spawn = start_wp.transform
                 # 🔧 不修改z坐标，使用waypoint原始高度
-                print(f"[CarlaEnv] 自车spawn位置: ({ego_spawn.location.x:.1f}, {ego_spawn.location.y:.1f})")
                 return ego_spawn
-            else:
-                print(f"[CarlaEnv] ⚠️  未找到合适的起始waypoint，使用随机spawn点")
 
         # 4) 兜底：随机 spawn
         spawns = self.map.get_spawn_points()
@@ -789,15 +766,11 @@ class CarlaEnv(gym.Env):
             if prv:
                 cur_wp = prv[0]
             else:
-                print(f"[cones] 后方 {step_behind} m 无有效 waypoint，停止于第 {i+1} 个。")
                 cur_wp = None
 
         self._first_cone_tf = first_tf
         self._last_cone_tf = last_tf
-        self._actors.extend(cones_spawned)  # 记录以便清理
-        # 打印数量，便于检查
-        if cones_spawned:
-            print(f"[CarlaEnv] cones placed: {len(cones_spawned)}; first_cone={'Y' if first_tf else 'N'}")
+        self._actors.extend(cones_spawned)
 
         return cones_spawned, first_tf, last_tf
 
@@ -863,10 +836,6 @@ class CarlaEnv(gym.Env):
                 parked_vehicles.append(vehicle)
                 self._actors.append(vehicle)  # 记录以便清理
 
-                print(f"[CarlaEnv] 放置停车 #{i+1} at ({parked_loc.x:.1f}, {parked_loc.y:.1f})")
-            else:
-                print(f"[CarlaEnv] ⚠️  停车 #{i+1} spawn 失败")
-
             # 前进到下一个停车位置
             distance_covered = 0.0
             while distance_covered < self.parked_car_spacing:
@@ -875,7 +844,6 @@ class CarlaEnv(gym.Env):
                     cur_wp = next_wps[0]
                     distance_covered += 5.0
                 else:
-                    print(f"[CarlaEnv] ⚠️  无法继续前进，停止放置停车")
                     break
 
         return parked_vehicles
@@ -883,7 +851,6 @@ class CarlaEnv(gym.Env):
     # ----------------- 观测 / 奖励 -----------------
     def _on_collision(self, event):
         self.collision = True
-        print(f"[DEBUG] 🚨 Collision detected! Episode step: {self.episode_steps}")
 
     def _get_state_obs(self):
         tf = self.ego.get_transform()
@@ -1110,8 +1077,8 @@ class CarlaEnv(gym.Env):
             if self.clock is not None:
                 fps = int(round(1.0 / self.fixed_dt))
                 self.clock.tick(fps)
-        except Exception as e:
-            print(f"[CarlaEnv] Warning: Pygame rendering error: {e}")
+        except Exception:
+            pass
 
     # ----------------- 清理 -----------------
     def _cleanup_actors(self):
@@ -1164,9 +1131,8 @@ def get_font(size=14):
             return pygame.font.Font(None, size)
 
         return pygame.font.Font(font_path, size)
-    except Exception as e:
+    except Exception:
         # 任何错误都使用pygame默认字体
-        print(f"[CarlaEnv] Warning: 无法加载系统字体,使用默认字体: {e}")
         return pygame.font.Font(None, size)
 
 
