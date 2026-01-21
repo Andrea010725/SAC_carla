@@ -1,0 +1,1 @@
+{"debug/std_lon_mean":0.6396286487579346,"_runtime":16.656995577,"_wandb":{"runtime":16},"_timestamp":1.7678329232768416e+09,"env_step":0,"_step":0,"debug/std_lat_mean":0.4827519953250885,"debug/std_steer":0.6801552772521973,"debug/std_throttle":0.6396286487579346,"debug/std_y_ref":0.28534871339797974}

@@ -1,0 +1,32 @@
+{
+  "os": "Linux-5.15.0-139-generic-x86_64-with-debian-bullseye-sid",
+  "python": "3.7.7",
+  "startedAt": "2025-12-26T03:36:53.172507Z",
+  "program": "train_ppo_with_wandb.py",
+  "codePath": "train_ppo_with_wandb.py",
+  "git": {
+    "remote": "git@github.com:Andrea010725/SAC_carla.git",
+    "commit": "b24a076a3a803e339d377ba322b7e9d109547ae2"
+  },
+  "email": "1950109@tongji.edu.cn",
+  "root": "/home/ajifang/SAC_carla",
+  "host": "ajifang-PC",
+  "username": "ajifang",
+  "executable": "/home/ajifang/miniconda3/envs/py37/bin/python",
+  "codePathLocal": "train_ppo_with_wandb.py",
+  "cpu_count": 32,
+  "cpu_count_logical": 32,
+  "disk": {
+    "/": {
+      "total": "209709965312",
+      "used": "196135342080"
+    }
+  },
+  "memory": {
+    "total": "67417595904"
+  },
+  "cpu": {
+    "count": 32,
+    "countLogical": 32
+  }
+}

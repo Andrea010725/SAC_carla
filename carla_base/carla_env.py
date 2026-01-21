@@ -3,6 +3,7 @@ import os
 import sys
 import math
 import random
+import time
 from typing import Optional, Tuple, List
 import xml.etree.ElementTree as ET
 
@@ -12,14 +13,27 @@ from gym import spaces
 
 from .carla_sync_mode import CarlaSyncMode
 from .carla_weather import Weather
-CARLA_ROOT = "/home/ajifang/carla"
-# ====== 指定 CARLA 安装路径（按你的实际路径）======
-sys.path.insert(0, os.path.join(CARLA_ROOT, "PythonAPI", "carla"))
-sys.path.insert(0, os.path.join(CARLA_ROOT, "PythonAPI", "carla", "dist",
-                                "carla-0.9.15-py3.7-linux-x86_64.egg"))
+from .scenario_manager import ScenarioFactory, ScenarioBase
 
-import carla   # noqa: E402
+CARLA_ROOT = "/home/ajifang/carla"
+sys.path.insert(0, os.path.join(CARLA_ROOT, "PythonAPI", "carla"))
+sys.path.insert(
+    0,
+    os.path.join(CARLA_ROOT, "PythonAPI", "carla", "dist", "carla-0.9.15-py3.7-linux-x86_64.egg"),
+)
+
+import carla  # noqa: E402
 import pygame  # noqa: E402
+
+# matplotlib for reward visualization (使用 Agg 后端，避免与 pygame 冲突)
+try:
+    import matplotlib
+    matplotlib.use('Agg')  # ✅ 使用 Agg 后端（不创建窗口，只保存图片）
+    import matplotlib.pyplot as plt
+    MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    MATPLOTLIB_AVAILABLE = False
+    plt = None
 
 # 尝试导入 RewardMonitor，如果失败则使用占位类
 try:
@@ -32,33 +46,69 @@ except ImportError:
 
 class CarlaEnv(gym.Env):
     """
-    训练友好的 Env：
-    - 观测：9 维 state（x,y,z,pitch,yaw,roll,acc,ang_vel,vel）
-    - 动作：2 维连续 [-1,1] -> (throttle/brake, steer)
-    - 渲染：Pygame 显示前视相机 + HUD（Planner 名、控制量、速度）
-    """
+    ✅ 3维动作环境（写死）：
+      action = [throttle_brake, steer, y_ref] in [-1, 1]^3
+        - throttle_brake: >=0 -> throttle, <0 -> brake
+        - steer: 原始方向盘
+        - y_ref: “参考/偏置”信号（可选参与控制）
 
+    观测：9维 state
+    """
     metadata = {"render.modes": ["human"]}
 
     def __init__(self, config, carla_port: int, tm_port: int):
         super().__init__()
-
         self.config = config
         self.carla_port = int(carla_port)
         self.tm_port = int(tm_port)
 
-        # ==== 训练/观测参数（先于 spaces）====
+        # ==== 训练/观测参数 ====
+        # ==== 训练/观测参数 ====
         self.max_episode_steps = int(getattr(config, "max_episode_steps", 2000))
-        self.obs_dim = int(getattr(config, "obs_dim", 9))
-        self.action_dim = int(getattr(config, "action_dim", 2))
 
-        # ==== Gym 空间 ====
-        self.action_space = spaces.Box(-1.0, 1.0, shape=(2,), dtype=np.float32)
-        self.observation_space = spaces.Box(-np.inf, np.inf, shape=(self.obs_dim,), dtype=np.float32)
+        # ===== 观测类型：支持扩展 =====
+        # 可选：
+        #   "state"                   -> 9
+        #   "state_lane"              -> 9 + 6
+        #   "state_lane_obstacles"    -> 9 + 6 + 3*K
+        self.observations_type = str(getattr(config, "observations_type", "state_lane_obstacles")).lower()
 
-        # ==== 其他配置 ====
-        self.observations_type = str(getattr(config, "observations_type", "state"))
-        assert self.observations_type == "state", "当前实现仅返回 9 维 state。"
+        # obstacles 配置
+        self.obs_obstacle_k = int(getattr(config, "obs_obstacle_k", 5))
+        self.obs_obstacle_range = float(getattr(config, "obs_obstacle_range", 50.0))  # meters
+
+        # lane 配置
+        self.obs_use_lane = bool(getattr(config, "obs_use_lane", True))
+        self.obs_use_obstacles = bool(getattr(config, "obs_use_obstacles", True))
+
+        # 根据 observations_type 强制开关
+        if self.observations_type == "state":
+            self.obs_use_lane = False
+            self.obs_use_obstacles = False
+        elif self.observations_type in ["state_lane", "lane"]:
+            self.obs_use_lane = True
+            self.obs_use_obstacles = False
+        elif self.observations_type in ["state_lane_obstacles", "lane_obstacles", "full"]:
+            self.obs_use_lane = True
+            self.obs_use_obstacles = True
+        else:
+            raise ValueError(f"[CarlaEnv] Unknown observations_type={self.observations_type}")
+
+        self.base_state_dim = 9
+        self.lane_dim = 6 if self.obs_use_lane else 0
+        self.obstacle_dim = (self.obs_obstacle_k * 3) if self.obs_use_obstacles else 0
+
+        # ✅ 最终 obs_dim：自动计算，别再写死 9
+        self.obs_dim = self.base_state_dim + self.lane_dim + self.obstacle_dim
+
+        # ✅ 3维动作保持不变
+        self.action_dim = 3
+        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(self.action_dim,), dtype=np.float32)
+        # self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(self.obs_dim,), dtype=np.float32)
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(self.obs_dim,), dtype=np.float32)
+
+        # ✅ 可选：未来如果你希望场景生成时“注册障碍物”，这里先留个列表（现在不用也行）
+        self.obstacle_actors: List[carla.Actor] = []
 
         # 渲染/同步
         self.render_display = bool(getattr(config, "render", True))
@@ -72,39 +122,75 @@ class CarlaEnv(gym.Env):
         # HUD 显示的 Planner 名
         self.planner_mode = str(getattr(config, "planner_mode", "RL")).upper()
 
+        # =========================
+        # 动作映射：防站桩参数
+        # =========================
+        self.brake_deadzone = float(getattr(config, "brake_deadzone", 0.05))
+        self.stuck_speed_thresh = float(getattr(config, "stuck_speed_thresh", 0.30))  # m/s
+        self.min_throttle_when_stuck = float(getattr(config, "min_throttle_when_stuck", 0.20))
+        self.low_speed_steer_scale = float(getattr(config, "low_speed_steer_scale", 0.60))
+        self.enable_anti_stall = bool(getattr(config, "enable_anti_stall", True))
+
+        # =========================
+        # ✅ y_ref 是否参与控制（建议显式开关）
+        # =========================
+        self.use_yref_in_steer = bool(getattr(config, "use_yref_in_steer", True))
+        # 原来 0.30 太猛，训练早期很容易推到边界；先用 0.10 更稳
+        self.yref_steer_gain = float(getattr(config, "yref_steer_gain", 0.03))
+
+        # =========================
+        # Reward 参数
+        # =========================
+        self.use_forward_progress = bool(getattr(config, "use_forward_progress", True))
+        self.k_progress = float(getattr(config, "k_progress", 1.2))
+        self.progress_clip = float(getattr(config, "progress_clip", 1.0))
+
+        self.speed_gate_by_lane = bool(getattr(config, "speed_gate_by_lane", True))
+        self.speed_gate_width = float(getattr(config, "speed_gate_width", 2.2))  # 建议 >=2.0
+
+        self.smooth_only_above_speed = float(getattr(config, "smooth_only_above_speed", 1.0))
+        self.smooth_clip_min = float(getattr(config, "smooth_clip_min", -0.08))
+        self.k_smooth = float(getattr(config, "k_smooth", 0.03))
+
+        self.no_progress_speed_thresh = float(getattr(config, "no_progress_speed_thresh", 0.25))
+        self.no_progress_fwd_thresh = float(getattr(config, "no_progress_fwd_thresh", 0.01))
+        self.k_idle = float(getattr(config, "k_idle", 0.003))
+        self.no_progress_limit = int(getattr(config, "no_progress_limit", 250))
+
+        # ✅ offroad 自适应 margin（固定3.0太容易误杀）
+        self.offroad_margin = float(getattr(config, "offroad_margin", 1.0))
+
         # ==== CARLA 连接 ====
         self.client: carla.Client = carla.Client("127.0.0.1", self.carla_port)
-        self.client.set_timeout(60.0)  # 增加超时时间到60秒（切换大地图需要更长时间）
+        self.client.set_timeout(180.0)
 
-        # 初始世界 - 先获取当前世界，如果地图不对再加载
         self.world: carla.World = self.client.get_world()
+        self._original_settings = self.world.get_settings()
+
         current_map_name = self.world.get_map().name
         if self.map_name not in current_map_name:
             print(f"[CarlaEnv] 当前地图 {current_map_name} != 期望地图 {self.map_name}，正在加载...")
             self.world = self.client.load_world(self.map_name)
         self.map: carla.Map = self.world.get_map()
 
-        # 同步设置
+        # 同步设置（强制）
         self._apply_sync_settings(self.fixed_dt)
 
-        # Traffic Manager - 带重试机制
+        # Traffic Manager - 带重试
         self.tm = None
         tm_success = False
         tm_ports_to_try = [self.tm_port, self.tm_port + 1, self.tm_port + 500, 8500, 8501, 8502]
-
         for try_port in tm_ports_to_try:
             try:
                 self.tm = self.client.get_trafficmanager(try_port)
                 self.tm.set_synchronous_mode(True)
-                self.tm_port = try_port  # 更新实际使用的端口
+                self.tm_port = try_port
                 tm_success = True
                 break
             except RuntimeError as e:
                 if "bind error" in str(e):
                     continue
-                else:
-                    raise e
-
+                raise e
         if not tm_success:
             raise RuntimeError(f"无法连接Traffic Manager，尝试的端口: {tm_ports_to_try}")
 
@@ -117,6 +203,7 @@ class CarlaEnv(gym.Env):
 
         # 场景相关
         self.scenario = str(getattr(config, "scenario", "plain")).lower()
+        self.scenario_instance: Optional[ScenarioBase] = None  # 场景实例
         self._first_cone_tf: Optional[carla.Transform] = None
         self._last_cone_tf: Optional[carla.Transform] = None
         self.initial_spawn_tf = getattr(config, "initial_spawn_tf", None)
@@ -129,18 +216,30 @@ class CarlaEnv(gym.Env):
         self.clock = None
         if self.render_display:
             pygame.init()
-            self.screen = pygame.display.set_mode((800, 600), pygame.HWSURFACE | pygame.DOUBLEBUF)
+            self.screen = pygame.display.set_mode((400, 300), pygame.HWSURFACE | pygame.DOUBLEBUF)
             self.font_big = get_font(size=24)
             self.font_small = get_font(size=14)
             self.clock = pygame.time.Clock()
 
-        # ====== XML/地图来源 ======
+        # Matplotlib for reward visualization
+        self.reward_fig = None
+        self.reward_ax = None
+        self.reward_bars = None
+        self.reward_history = []  # 存储历史数据
+        self.reward_update_interval = 10  # 每10步更新一次
+        self.reward_save_dir = "./reward_plots"  # 保存图片的目录
+        if self.render_display and MATPLOTLIB_AVAILABLE:
+            # 创建保存目录
+            os.makedirs(self.reward_save_dir, exist_ok=True)
+            self._init_reward_plot()
+
+        # XML/地图来源
         self.xml_file = getattr(config, "xml_file", "/home/ajifang/czw/RL_selector/env/waypoints.xml")
         self.xml_dir = getattr(config, "xml_dir", None)
         self.randomize_town = bool(getattr(config, "randomize_town", False))
         self.town_pool = list(getattr(config, "town_pool", ["Town01", "Town03", "Town05"]))
 
-        # ====== cones 参数 ======
+        # cones 参数
         self.cone_num = int(getattr(config, "cone_num", 10))
         self.cone_step_behind = float(getattr(config, "cone_step_behind", 3.0))
         self.cone_step_lateral = float(getattr(config, "cone_step_lateral", 0.35))
@@ -149,28 +248,49 @@ class CarlaEnv(gym.Env):
         self.cone_grid = float(getattr(config, "cone_grid", 5.0))
         self.cone_lane_margin = float(getattr(config, "cone_lane_margin", 0.25))
 
-        # ====== 自车 spawn 控制 ======
-        self.spawn_wp_step = float(getattr(config, "spawn_wp_step", 2.0))  # m
-        self.spawn_min_gap_from_cone = float(getattr(config, "spawn_min_gap_from_cone", 20.0))  # m
+        # spawn 控制
+        self.spawn_wp_step = float(getattr(config, "spawn_wp_step", 2.0))
+        self.spawn_min_gap_from_cone = float(getattr(config, "spawn_min_gap_from_cone", 20.0))
 
-        # 🔧 新增：停车障碍场景参数（模拟 Overtaking）
+        # parked_obstacles 参数
         self.num_parked_cars = int(getattr(config, "num_parked_cars", 4))
         self.parked_car_spacing = float(getattr(config, "parked_car_spacing", 50.0))
         self.parked_car_offset = float(getattr(config, "parked_car_offset", 1.8))
         self.parked_car_start_distance = float(getattr(config, "parked_car_start_distance", 30.0))
 
-        # ==== 统计 & 管理 ====
+        # 统计 & 管理
         self.episode_steps = 0
         self.collision = False
-        self._actors: List[carla.Actor] = []  # 场景临时 actor
+        self._actors: List[carla.Actor] = []
 
-        # ====== Reward 监控器相关 ======
+        # Reward monitor
         self.reward_monitor: Optional[RewardMonitor] = None
         self.episode_id: int = 0
         self.last_control: Optional[carla.VehicleControl] = None
 
+        # ✅ 可视化开关
+        self.enable_debug_drawing = bool(getattr(config, "enable_debug_drawing", True))
+        self.debug_draw_interval = int(getattr(config, "debug_draw_interval", 5))  # 每5步绘制一次
 
-    # ----------------- 公共：同步设置 & 切图 -----------------
+        # ✅ 可视化细节开关
+        self.draw_detection_range = bool(getattr(config, "draw_detection_range", True))  # 青色圆圈
+        self.draw_ego_direction = bool(getattr(config, "draw_ego_direction", True))      # 绿色箭头
+        self.draw_obstacle_boxes = bool(getattr(config, "draw_obstacle_boxes", True))    # 障碍物边界框
+        self.draw_lane_center = bool(getattr(config, "draw_lane_center", True))          # 白色车道线
+
+        # ===== reward 内部状态 =====
+        self.target_wp = None
+        self.prev_wp_dist = None
+        self.wp_step_dist = float(getattr(config, "wp_step_dist", 5.0))
+        self.wp_reach_thresh = float(getattr(config, "wp_reach_thresh", 2.0))
+        self.no_progress_steps = 0
+        self.prev_control_for_smooth = None
+        self.prev_loc: Optional[carla.Location] = None  # forward progress
+
+        self.progress_ema = 0.0
+        self.last_obs = None  # 用于 reward 读取障碍信息（在 step 里更新）
+
+    # ----------------- 同步设置 & 切图 -----------------
     def _apply_sync_settings(self, fixed_dt: float):
         s = self.world.get_settings()
         s.synchronous_mode = True
@@ -178,49 +298,108 @@ class CarlaEnv(gym.Env):
         self.world.apply_settings(s)
 
     def _load_map_if_needed(self, town: str):
-        """若切换地图就先切，再进行场景搭建"""
         town = str(town).strip()
         cur = self.world.get_map().name if self.world and self.world.get_map() else ""
         if town and town != cur:
             print(f"[CarlaEnv] Loading map: {town} (was {cur})")
-            # 清理现有 actor / 传感器 / sync_mode
             self._cleanup_actors()
             if self.sync_mode is not None:
                 try:
-                    if hasattr(self.sync_mode, '_settings') and self.sync_mode._settings is not None:
+                    if hasattr(self.sync_mode, "_settings") and self.sync_mode._settings is not None:
                         self.world.apply_settings(self.sync_mode._settings)
                 except Exception:
                     pass
                 self.sync_mode = None
 
-            # 切图
             self.world = self.client.load_world(town)
             self.map = self.world.get_map()
-
-            # 恢复同步/TM/天气
             self._apply_sync_settings(self.fixed_dt)
+
             self.tm = self.client.get_trafficmanager(self.tm_port)
             self.tm.set_synchronous_mode(True)
             self.weather = Weather(self.world, float(getattr(self.config, "changing_weather_speed", 0.0)))
 
-    # 允许外部动态切换 HUD 上显示的 planner 名
+    def _get_required_town_for_scenario(self, scenario_name: str) -> Optional[str]:
+        """
+        获取场景需要的地图名称（从 XML 配置中获取）
+
+        Args:
+            scenario_name: 场景名称
+
+        Returns:
+            str: 地图名称，如果场景不需要特定地图则返回 None
+        """
+        try:
+            from carla_base.scenario_xml_parser import get_xml_parser, SCENARIO_TYPE_MAPPING
+
+            # 获取场景对应的 ScenarioRunner 类型
+            scenario_type = SCENARIO_TYPE_MAPPING.get(scenario_name)
+            if not scenario_type:
+                return None
+
+            # 获取 XML 解析器
+            parser = get_xml_parser()
+
+            # 获取该场景类型的所有配置
+            scenarios = parser.get_scenarios_for_type(scenario_type, town=None)
+
+            if scenarios:
+                # 随机选择一个场景配置，获取其 town
+                selected = random.choice(scenarios)
+                town = selected.get('town')
+                if town:
+                    print(f"[CarlaEnv] 从 XML 获取场景 {scenario_name} 的地图: {town}")
+                    return town
+        except Exception as e:
+            print(f"[CarlaEnv] ⚠️ 获取场景地图失败: {e}")
+
+        return None
+
     def set_planner_mode(self, name: str):
         self.planner_mode = str(name).upper()
 
-    # ----------------- 核心接口 -----------------
+    # ----------------- reset/step -----------------
     def reset(self):
-        self._cleanup_actors()
+        # ✅ 随机场景选择（如果启用）
+        if getattr(self.config, "random_scenario", False):
+            scenario_pool = getattr(self.config, "scenario_pool", ["parked_obstacles", "cones"])
+            self.scenario = random.choice(scenario_pool)
+            print(f"\n[RandomScenario] 本次Episode场景: {self.scenario}")
 
-        # 清理旧的 sync_mode
+        # ✅ 温和的清理方案：先清空队列，但不立即关闭 sync_mode
         if self.sync_mode is not None:
             try:
-                if hasattr(self.sync_mode, '_settings') and self.sync_mode._settings is not None:
-                    self.world.apply_settings(self.sync_mode._settings)
-            except Exception:
-                pass
-            self.sync_mode = None
+                # 清空队列中的残留数据
+                for q in self.sync_mode._queues:
+                    try:
+                        while not q.empty():
+                            q.get_nowait()
+                    except:
+                        pass
+            except Exception as e:
+                print(f"[CarlaEnv] ⚠️ 清空队列失败: {e}")
 
-        # 先决定是否切图（基于 XML 或随机）
+        # 清理 actors（包括传感器）
+        self._cleanup_actors()
+
+        # ✅ 现在关闭 sync_mode（传感器已经被销毁）
+        if self.sync_mode is not None:
+            try:
+                # 只恢复设置，不再尝试停止传感器（已经销毁了）
+                if self.sync_mode._settings is not None:
+                    self.world.apply_settings(self.sync_mode._settings)
+            except Exception as e:
+                print(f"[CarlaEnv] ⚠️ 恢复设置失败: {e}")
+            finally:
+                self.sync_mode = None
+
+        # ✅ 给 CARLA 更多时间来稳定（特别是在清理大量 actors 后）
+        time.sleep(0.5)
+
+        # 强制同步设置，避免某次异常导致 world settings 漂掉
+        self._apply_sync_settings(self.fixed_dt)
+
+        # 切图逻辑
         if self.scenario == "cones_xml":
             xml_path = self._pick_random_xml_file()
             if xml_path:
@@ -231,23 +410,26 @@ class CarlaEnv(gym.Env):
                 if self.randomize_town and self.town_pool:
                     self._load_map_if_needed(random.choice(self.town_pool))
         else:
-            if self.randomize_town and self.town_pool:
+            # ✅ 检查场景是否需要特定的 town（从 XML 获取）
+            required_town = self._get_required_town_for_scenario(self.scenario)
+            if required_town:
+                print(f"[CarlaEnv] 场景 {self.scenario} 需要地图 {required_town}，正在切换...")
+                self._load_map_if_needed(required_town)
+            elif self.randomize_town and self.town_pool:
                 self._load_map_if_needed(random.choice(self.town_pool))
 
-        # 搭场景并选择自车 spawn
+        # 搭场景 + spawn
         spawn_tf = self._maybe_setup_scene_and_pick_spawn()
 
-        # 生成自车
         self.ego = self._spawn_ego_with_transform(spawn_tf)
         if self.ego is None:
             raise RuntimeError("spawn ego failed；请确认地图有可用 spawn 点。")
 
-        # 传感器：相机 + 碰撞
         bp_lib = self.world.get_blueprint_library()
         if self.render_display:
             cam_bp = bp_lib.find("sensor.camera.rgb")
-            cam_bp.set_attribute("image_size_x", "800")
-            cam_bp.set_attribute("image_size_y", "600")
+            cam_bp.set_attribute("image_size_x", "400")
+            cam_bp.set_attribute("image_size_y", "300")
             cam_bp.set_attribute("fov", "90")
             cam_tf = carla.Transform(carla.Location(x=1.6, z=1.7))
             self.camera_display = self.world.try_spawn_actor(cam_bp, cam_tf, attach_to=self.ego)
@@ -260,154 +442,203 @@ class CarlaEnv(gym.Env):
             self.collision_sensor.listen(lambda e: self._on_collision(e))
             self._actors.append(self.collision_sensor)
 
-        # CarlaSyncMode
         fps = int(round(1.0 / self.fixed_dt))
         if self.render_display and self.camera_display is not None:
             self.sync_mode = CarlaSyncMode(self.world, self.camera_display, fps=fps)
         else:
             self.sync_mode = CarlaSyncMode(self.world, fps=fps)
 
-        # 🔧 先设置档位和初始控制，再tick
-        self.ego.set_autopilot(False)
+        # 初始控制：刹停一帧，确保稳定
+        # ✅ 增加重试机制，防止 RPC 超时
+        max_autopilot_retries = 3
+        for retry in range(max_autopilot_retries):
+            try:
+                self.ego.set_autopilot(False)
+                break
+            except RuntimeError as e:
+                if retry < max_autopilot_retries - 1:
+                    print(f"⚠️  set_autopilot 失败 (尝试 {retry+1}/{max_autopilot_retries}): {e}")
+                    time.sleep(0.5)
+                else:
+                    print(f"⚠️  set_autopilot 最终失败，继续执行: {e}")
+                    # 不抛出异常，继续执行
+
         init_control = carla.VehicleControl(throttle=0.0, brake=1.0, steer=0.0)
-        init_control.gear = 1  # 🔧 设置为前进档
-        init_control.manual_gear_shift = True  # 🔧 启用手动档位
+        init_control.gear = 1
+        init_control.manual_gear_shift = True
         self.ego.apply_control(init_control)
+        self.last_control = init_control
 
-        # 🔧 重要：让车辆落到地面（如果spawn在空中）
-        # 检查是否在空中（z > 0.2米）
-        ego_loc = self.ego.get_location()
-        if ego_loc.z > 0.2:
-            # 释放刹车，让车辆自由落体
-            fall_control = carla.VehicleControl(throttle=0.0, brake=0.0, steer=0.0)
-            fall_control.gear = 1
-            fall_control.manual_gear_shift = True
-            self.ego.apply_control(fall_control)
+        # 第一次 tick 给更长 timeout
+        # ✅ 传感器在第一次 tick 时可能还没准备好，CarlaSyncMode 会自动处理
+        try:
+            self._tick_once(timeout=5.0)
+        except Exception as e:
+            print(f"⚠️  第一次tick失败: {e}")
+            # 重试一次
+            time.sleep(0.5)
+            self._tick_once(timeout=5.0)
 
-            # Tick直到着地（最多10次）
-            for _ in range(10):
-                self._tick_once()
-                new_loc = self.ego.get_location()
-                # 如果z坐标稳定（变化<0.01米），说明已着地
-                if abs(new_loc.z - ego_loc.z) < 0.01:
-                    break
-                ego_loc = new_loc
-
-            # 着地后重新应用刹车
-            self.ego.apply_control(init_control)
-
-        # 初始一帧（让档位设置生效）
-        self._tick_once()
-
-        # ========== ✅ 在这里开始加入 waypoint 相关初始化 ==========
-        # 当前自车位置 & 所在 waypoint
-        ego_loc = self.ego.get_location()
-        ego_wp = self.map.get_waypoint(ego_loc, project_to_road=True)
-        # 每次沿着道路向前看的距离（单位：米），比如 5 米一段
-        self.wp_step_dist = 5.0
-
-        # 判定“到达当前目标 waypoint”的阈值（距离 < 2m 就认为到了）
-        self.wp_reach_thresh = 2.0
-        # 使用 CARLA API 获取“前方一段距离”的 waypoint
-        next_wps = ego_wp.next(self.wp_step_dist)
-        if len(next_wps) > 0:
-            self.target_wp = next_wps[0]
-        else:
-            # 如果前方没有 next（少见），就用当前 wp 顶上，防止 None
-            self.target_wp = ego_wp
-
-            # 计算当前到目标 waypoint 的距离，并存为“上一步”的距离
-            target_loc = self.target_wp.transform.location
-            self.prev_wp_dist = math.hypot(
-                ego_loc.x - target_loc.x,
-                ego_loc.y - target_loc.y,
-            )
-        # 初始化“连续低速步数”计数器（防止站桩）
-        self.idle_steps = 0
-
-        # ========== ✅ waypoint 初始化结束 ==========
+        # reset reward state
+        self._reset_reward_state()
 
         self.episode_steps = 0
         self.collision = False
-        self.last_control = init_control
 
-        # ====== 初始化 / 重置 RewardMonitor ======
+        # RewardMonitor reset
         self.episode_id += 1
 
-        # 保存路径：record_path/reward_logs/ep_xxxx
-        save_root = getattr(self.config, "record_path", "./logs")
+        # ✅ 打印场景初始化信息
+        self._print_scene_info()
 
+        save_root = getattr(self.config, "record_path", "./logs")
         if RewardMonitor is not None and RewardMonitorConfig is not None:
-            # 🏎️ 检查是否有自定义reward配置（激进版）
             if hasattr(self.config, "reward_config") and self.config.reward_config is not None:
-                # 使用自定义配置（激进版）
                 monitor_cfg = self.config.reward_config
-                # 更新save_dir和enable_vis（可能被自定义配置覆盖）
                 monitor_cfg.save_dir = os.path.join(save_root, "reward_logs")
                 monitor_cfg.enable_vis = self.render_display
             else:
-                # 使用默认配置
                 monitor_cfg = RewardMonitorConfig(
                     enable_vis=self.render_display,
                     save_dir=os.path.join(save_root, "reward_logs")
                 )
 
             if self.reward_monitor is None:
-                # 第一次创建
-                self.reward_monitor = RewardMonitor(
-                world=self.world,
-                ego_vehicle=self.ego,
-                config=monitor_cfg,
-            )
+                self.reward_monitor = RewardMonitor(world=self.world, ego_vehicle=self.ego, config=monitor_cfg)
             else:
-                # 地图可能切换过，需要更新 world/ego & config
                 self.reward_monitor.world = self.world
                 self.reward_monitor.ego = self.ego
                 self.reward_monitor.cfg = monitor_cfg
 
-            # 重置当前 episode 的历史记录
             self.reward_monitor.reset(episode_id=self.episode_id)
 
         return self._get_state_obs()
 
-
     def step(self, action):
-        a0 = float(action[0]); a1 = float(action[1])
+        """
+        action = [throttle_brake, steer, y_ref] in [-1,1]^3
+        """
+        # --------- 0) 兼容输入类型，并确保长度 >= 3 ---------
+        action = np.asarray(action, dtype=np.float32).reshape(-1)
+        a0 = float(action[0]) if action.shape[0] > 0 else 0.0
+        a1 = float(action[1]) if action.shape[0] > 1 else 0.0
+        a2 = float(action[2]) if action.shape[0] > 2 else 0.0
+
+        a0 = float(np.clip(a0, -1.0, 1.0))
+        a1 = float(np.clip(a1, -1.0, 1.0))
+        y_ref = float(np.clip(a2, -1.0, 1.0))
+
+        # --------- 1) throttle/brake ---------
         if a0 >= 0.0:
-            throttle, brake = np.clip(a0, 0.0, 1.0), 0.0
+            throttle = float(np.clip(a0, 0.0, 1.0))
+            brake = 0.0
         else:
-            throttle, brake = 0.0, np.clip(-a0, 0.0, 1.0)
-        steer = float(np.clip(a1, -1.0, 1.0))
+            throttle = 0.0
+            b = float(np.clip(-a0, 0.0, 1.0))
+            b = 0.0 if b < self.brake_deadzone else b
+            brake = b
 
-        # 创建control对象并应用
+        # --------- 2) steer：env 不再做 y_ref 映射，只执行最终 steer ---------
+        steer_raw = float(np.clip(a1, -1.0, 1.0))  # 这里 steer_raw 就是 applied steer
+        steer = steer_raw
+
+        # y_ref 仍然读出来，但只用于日志（不用于控制）
+        y_ref = float(np.clip(a2, -1.0, 1.0))
+
+        # --------- 3) anti-stall ---------
+        if self.enable_anti_stall and (self.ego is not None):
+            v = self.ego.get_velocity()
+            speed = float(math.sqrt(v.x * v.x + v.y * v.y + v.z * v.z))
+            if speed < self.stuck_speed_thresh:
+                brake = 0.0
+                throttle = max(throttle, self.min_throttle_when_stuck)
+                steer = float(np.clip(steer * self.low_speed_steer_scale, -1.0, 1.0))
+
+        # --------- 4) apply control ---------
         control = carla.VehicleControl(throttle=throttle, brake=brake, steer=steer)
-        control.gear = 1  # 🔧 确保始终在前进档
-        control.manual_gear_shift = True  # 🔧 启用手动档位
+        control.gear = 1
+        control.manual_gear_shift = True
         self.ego.apply_control(control)
-
-        # ✅ 更新last_control，用于reward计算
         self.last_control = control
 
-        snapshot, display_image = self._tick_once()
+        snapshot, display_image = self._tick_once(timeout=15.0)  # ✅ 增加到 15 秒
+
+        # ✅ 绘制调试信息（每N步绘制一次，避免性能影响）
+        if self.episode_steps % self.debug_draw_interval == 0:
+            self._draw_debug_info()
 
         if self.render_display and display_image is not None:
             self._draw_display(display_image, throttle, steer, brake)
 
         next_obs = self._get_state_obs()
-        reward, done, info = self._get_reward()
 
+        self.last_obs = next_obs
+
+        # env 内部 reward / done_reason（collision/offroad/no_progress 等）都由 _get_reward 给
+        reward_env, done_env, info = self._get_reward()
+
+        # ✅ 更新 matplotlib reward 可视化（每 N 步更新一次）
+        if self.render_display and MATPLOTLIB_AVAILABLE and (self.episode_steps % self.reward_update_interval == 0):
+            self._update_reward_plot()
+        if info is None:
+            info = {}
+
+        # ===== DEBUG: obstacle obs check =====
+        if getattr(self, "obs_use_obstacles", False) and hasattr(self, "last_obs") and (self.last_obs is not None):
+            K = int(getattr(self, "obs_obstacle_k", 5))
+            obs_obs = self.last_obs[-K * 3:]
+            info["dbg_obs_obstacles_sumabs"] = float(np.sum(np.abs(obs_obs)))
+            # 可选：只存前一个障碍物的3个数，避免 wandb 太长
+            info["dbg_obs_obstacles_first3"] = [float(x) for x in obs_obs[:3]]
+
+        # --------- 5) time limit（仅截断语义，不惩罚）---------
         self.episode_steps += 1
+        timeout = (self.episode_steps >= self.max_episode_steps)  # 字段名 timeout 保留给日志
+        done = bool(done_env or timeout)
 
-        timeout = (self.episode_steps >= self.max_episode_steps)
-        # success = self._check_overtake_success()
-        # offroad = self._check_offroad()
-        done = done or timeout  #or offroad  #or success
-        info["collision"] = float(self.collision)
-        info["timeout"] = float(timeout)
-        # info["success"] = float(success)
-        # info["offroad"] = float(offroad)
+        # --------- 6) done_reason 语义修正 ----------
+        # done_env=True 时：保持 _get_reward 的 done_reason（collision/offroad/no_progress）
+        # done_env=False 且 timeout=True 时：这是自然截断 -> time_limit
+        if timeout and (not done_env):
+            dr = info.get("done_reason", "running")
+            if dr in ["running", "unknown", None, ""]:
+                info["done_reason"] = "time_limit"
 
-        return next_obs, reward, done, info
+        # --------- 7) reward components 闭合 ----------
+        comps = {}
+        if hasattr(self, "last_reward_components") and isinstance(self.last_reward_components, dict):
+            comps = self.last_reward_components.copy()
+
+        # time_limit 不给惩罚：0.0
+        comps["r_timeout"] = 0.0
+
+        # 最终 reward：严格由 components 求和，保证和分解一致
+        reward = float(sum(comps.values()))
+
+        # 给 train_with_logging 用（你那边用的是 env.step_reward_components）
+        self.last_reward_components = comps.copy()
+        self.step_reward_components = comps.copy()
+
+        # --------- 8) info/debug ----------
+        info["timeout"] = float(timeout)  # 仍然保留给面板/日志
+
+        info["raw_throttle_brake"] = float(a0)
+        info["raw_steer"] = float(steer_raw)  # 这就是 applied steer
+        info["raw_y_ref"] = float(y_ref)
+
+        info["applied_steer"] = float(steer)
+
+        # env 不再使用 y_ref 映射
+        info["yref_used"] = 0.0
+        info["yref_steer_gain"] = float(self.yref_steer_gain)
+        info["steer_delta_from_yref"] = 0.0
+
+        if self.use_yref_in_steer:
+            info["steer_delta_from_yref"] = float(steer - steer_raw)
+        else:
+            info["steer_delta_from_yref"] = 0.0
+
+        return next_obs, float(reward), bool(done), info
 
     def render(self, mode="human"):
         return None
@@ -415,12 +646,42 @@ class CarlaEnv(gym.Env):
     def close(self):
         self._cleanup_actors()
         try:
+            # 恢复世界设置，避免退出后 server 被同步模式卡住
+            if self.world is not None and self._original_settings is not None:
+                self.world.apply_settings(self._original_settings)
+        except Exception:
+            pass
+        try:
             pygame.quit()
         except Exception:
             pass
 
-    # ----------------- Tick/Spawn/Scene -----------------
-    def _tick_once(self):
+    # ----------------- reward state reset -----------------
+    def _reset_reward_state(self):
+        # 彻底重置 episode 内部 reward 状态
+        self.no_progress_steps = 0
+        self.prev_control_for_smooth = None
+
+        self.target_wp = None
+        self.prev_wp_dist = None
+
+        ego_loc = self.ego.get_location()
+        self.prev_loc = ego_loc
+
+        ego_wp = self.map.get_waypoint(ego_loc, project_to_road=True)
+        step_dist = float(getattr(self, "wp_step_dist", 5.0))
+        reach_th = float(getattr(self, "wp_reach_thresh", 2.0))
+        self.wp_step_dist = step_dist
+        self.wp_reach_thresh = reach_th
+
+        next_wps = ego_wp.next(step_dist)
+        self.target_wp = next_wps[0] if next_wps else ego_wp
+
+        target_loc = self.target_wp.transform.location
+        self.prev_wp_dist = float(math.hypot(ego_loc.x - target_loc.x, ego_loc.y - target_loc.y))
+
+    # ----------------- Tick -----------------
+    def _tick_once(self, timeout=2.0):
         if self.sync_mode is None:
             if self.world.get_settings().synchronous_mode:
                 self.world.tick()
@@ -428,7 +689,7 @@ class CarlaEnv(gym.Env):
                 self.world.wait_for_tick()
             return None, None
 
-        ret = self.sync_mode.tick(timeout=2.0)
+        ret = self.sync_mode.tick(timeout=timeout)
         if isinstance(ret, (list, tuple)) and len(ret) > 0:
             snapshot = ret[0]
             image = ret[1] if len(ret) > 1 else None
@@ -437,8 +698,9 @@ class CarlaEnv(gym.Env):
 
         if self.weather is not None:
             self.weather.tick()
-        return snapshot, image
+        return snapshot,  image
 
+    # ----------------- spawn & spectator -----------------
     def _spawn_ego_with_transform(self, tf: carla.Transform) -> Optional[carla.Vehicle]:
         bp_lib = self.world.get_blueprint_library()
         model_id = f"vehicle.{self.vehicle_name}"
@@ -451,11 +713,9 @@ class CarlaEnv(gym.Env):
             self._actors.append(ego)
             return ego
 
-        # 如果这个点失败了，退回随机点兜底
         spawns = self.map.get_spawn_points()
         random.shuffle(spawns)
         for alt in spawns:
-            # 🔧 不修改z坐标，使用spawn point原始高度
             ego = self.world.try_spawn_actor(bp, alt)
             if ego:
                 self._maybe_place_spectator(ego)
@@ -476,8 +736,8 @@ class CarlaEnv(gym.Env):
             fx, fy = math.cos(rad), math.sin(rad)
             rx, ry = math.sin(rad), -math.cos(rad)
             cam_loc = carla.Location(
-                x=tf.location.x - fx*back + rx*side,
-                y=tf.location.y - fy*back + ry*side,
+                x=tf.location.x - fx * back + rx * side,
+                y=tf.location.y - fy * back + ry * side,
                 z=tf.location.z + height
             )
             tgt = carla.Location(x=tf.location.x, y=tf.location.y, z=tf.location.z + 1.5)
@@ -491,15 +751,196 @@ class CarlaEnv(gym.Env):
             fx, fy = math.cos(rad), math.sin(rad)
             rx, ry = math.sin(rad), -math.cos(rad)
             cam_loc = carla.Location(
-                x=tf.location.x - fx*back + rx*side,
-                y=tf.location.y - fy*back + ry*side,
+                x=tf.location.x - fx * back + rx * side,
+                y=tf.location.y - fy * back + ry * side,
                 z=tf.location.z + height
             )
             spec.set_transform(carla.Transform(cam_loc, carla.Rotation(pitch=pitch, yaw=yaw, roll=0.0)))
 
-    # ----------------- XML & 场景搭建 -----------------
+    # ✅ 新增：绘制调试信息
+    def _draw_debug_info(self):
+        """在CARLA世界中绘制调试信息（障碍物、检测范围等）"""
+        if not self.enable_debug_drawing:
+            return
+
+        if self.ego is None:
+            return
+
+        debug = self.world.debug
+        ego_loc = self.ego.get_location()
+        ego_tf = self.ego.get_transform()
+
+        # 1. 绘制自车检测范围（用多边形近似圆形）
+        if self.draw_detection_range:
+            R = float(self.obs_obstacle_range)
+            num_points = 32  # 圆形近似点数
+            for i in range(num_points):
+                angle1 = 2 * math.pi * i / num_points
+                angle2 = 2 * math.pi * (i + 1) / num_points
+                p1 = carla.Location(
+                    x=ego_loc.x + R * math.cos(angle1),
+                    y=ego_loc.y + R * math.sin(angle1),
+                    z=ego_loc.z + 0.5
+                )
+                p2 = carla.Location(
+                    x=ego_loc.x + R * math.cos(angle2),
+                    y=ego_loc.y + R * math.sin(angle2),
+                    z=ego_loc.z + 0.5
+                )
+                debug.draw_line(
+                    begin=p1,
+                    end=p2,
+                    thickness=0.05,
+                    color=carla.Color(0, 255, 255),  # 青色
+                    life_time=0.1
+                )
+
+        # 2. 绘制自车前向方向（箭头）
+        if self.draw_ego_direction:
+            fwd = ego_tf.get_forward_vector()
+            end_loc = carla.Location(
+                x=ego_loc.x + fwd.x * 10.0,
+                y=ego_loc.y + fwd.y * 10.0,
+                z=ego_loc.z + 1.0
+            )
+            debug.draw_arrow(
+                begin=carla.Location(x=ego_loc.x, y=ego_loc.y, z=ego_loc.z + 1.0),
+                end=end_loc,
+                thickness=0.2,
+                arrow_size=0.5,
+                color=carla.Color(0, 255, 0),  # 绿色
+                life_time=0.1
+            )
+
+        # 3. 绘制障碍物边界框
+        if self.draw_obstacle_boxes:
+            for obs in self.obstacle_actors:
+                if obs is None:
+                    continue
+                try:
+                    obs_loc = obs.get_location()
+                    bbox = obs.bounding_box
+
+                    # 计算距离
+                    dist = math.hypot(obs_loc.x - ego_loc.x, obs_loc.y - ego_loc.y)
+
+                    # 根据距离选择颜色
+                    if dist < 10.0:
+                        color = carla.Color(255, 0, 0)  # 红色：很近
+                    elif dist < 20.0:
+                        color = carla.Color(255, 165, 0)  # 橙色：中等
+                    else:
+                        color = carla.Color(255, 255, 0)  # 黄色：较远
+
+                    # 绘制边界框
+                    debug.draw_box(
+                        box=bbox,
+                        rotation=obs.get_transform().rotation,
+                        thickness=0.1,
+                        color=color,
+                        life_time=0.1
+                    )
+
+                    # 绘制距离文本
+                    debug.draw_string(
+                        location=carla.Location(x=obs_loc.x, y=obs_loc.y, z=obs_loc.z + 2.0),
+                        text=f"{dist:.1f}m",
+                        draw_shadow=True,
+                        color=color,
+                        life_time=0.1
+                    )
+                except Exception:
+                    continue
+
+        # 4. 绘制车道中心线
+        if self.draw_lane_center:
+            try:
+                wp = self.map.get_waypoint(ego_loc, project_to_road=True)
+                if wp:
+                    # 绘制前方车道中心线
+                    cur_wp = wp
+                    for _ in range(20):
+                        nxt = cur_wp.next(2.0)
+                        if not nxt:
+                            break
+                        next_wp = nxt[0]
+                        debug.draw_line(
+                            begin=carla.Location(
+                                x=cur_wp.transform.location.x,
+                                y=cur_wp.transform.location.y,
+                                z=cur_wp.transform.location.z + 0.5
+                            ),
+                            end=carla.Location(
+                                x=next_wp.transform.location.x,
+                                y=next_wp.transform.location.y,
+                                z=next_wp.transform.location.z + 0.5
+                            ),
+                            thickness=0.1,
+                            color=carla.Color(255, 255, 255),  # 白色
+                            life_time=0.1
+                        )
+                        cur_wp = next_wp
+            except Exception:
+                pass
+
+    # ✅ 新增：打印场景信息
+    def _print_scene_info(self):
+        """打印当前场景的详细信息"""
+        print("\n" + "="*70)
+        print(f"🎬 Episode {self.episode_id} - 场景初始化")
+        print("="*70)
+
+        # 地图信息
+        map_name = self.map.name if self.map else "Unknown"
+        print(f"📍 地图: {map_name}")
+        print(f"🎭 场景类型: {self.scenario}")
+
+        # 自车信息
+        if self.ego:
+            ego_loc = self.ego.get_location()
+            ego_rot = self.ego.get_transform().rotation
+            print(f"\n🚗 自车信息:")
+            print(f"   - 位置: ({ego_loc.x:.1f}, {ego_loc.y:.1f}, {ego_loc.z:.1f})")
+            print(f"   - 朝向: Yaw={ego_rot.yaw:.1f}°")
+            print(f"   - 车型: {self.vehicle_name}")
+
+        # 障碍物信息
+        if self.obstacle_actors:
+            print(f"\n🚧 障碍物信息 (共{len(self.obstacle_actors)}个):")
+            for i, obs in enumerate(self.obstacle_actors, 1):
+                if obs is None:
+                    continue
+                try:
+                    obs_loc = obs.get_location()
+                    obs_type = obs.type_id
+                    if self.ego:
+                        ego_loc = self.ego.get_location()
+                        dist = math.hypot(obs_loc.x - ego_loc.x, obs_loc.y - ego_loc.y)
+                        print(f"   [{i}] {obs_type}")
+                        print(f"       位置: ({obs_loc.x:.1f}, {obs_loc.y:.1f}, {obs_loc.z:.1f})")
+                        print(f"       距离自车: {dist:.1f}m")
+                except Exception:
+                    continue
+        else:
+            print(f"\n🚧 障碍物: 无")
+
+        # 观测配置
+        print(f"\n👁️  观测配置:")
+        print(f"   - 类型: {self.observations_type}")
+        print(f"   - 维度: {self.obs_dim}")
+        print(f"   - 障碍物检测数量: {self.obs_obstacle_k}")
+        print(f"   - 检测范围: {self.obs_obstacle_range}m")
+
+        # 可视化配置
+        print(f"\n🎨 可视化:")
+        print(f"   - Pygame渲染: {'✅' if self.render_display else '❌'}")
+        print(f"   - Spectator模式: {self.spectator_mode}")
+        print(f"   - 调试绘制: {'✅' if self.enable_debug_drawing else '❌'}")
+
+        print("="*70 + "\n")
+
+    # ----------------- XML & scene -----------------
     def _pick_random_xml_file(self) -> Optional[str]:
-        # 优先用 xml_file；否则在 xml_dir 随机挑
         if self.xml_file and os.path.isfile(self.xml_file):
             return self.xml_file
         if self.xml_dir and os.path.isdir(self.xml_dir):
@@ -511,11 +952,6 @@ class CarlaEnv(gym.Env):
 
     @staticmethod
     def _parse_xml_waypoints(xml_path: str) -> Tuple[str, List[dict]]:
-        """
-        返回 (town, waypoints列表)。优先从 <route town="TownXX"> 取 town；
-        若没有，则返回空字符串，沿用当前地图。
-        waypoints: [{'x','y','z','yaw','pitch','roll'}]
-        """
         tree = ET.parse(xml_path)
         root = tree.getroot()
         town = ""
@@ -538,43 +974,14 @@ class CarlaEnv(gym.Env):
                 continue
         return town, wps
 
-    def _spawn_tf_from_first_cone(self) -> Optional[carla.Transform]:
-        """
-        基于 first_cone_tf，沿车道中心向“上游(previous)”回溯，
-        直到满足最小纵向间距，再用该路点作为自车 spawn。
-        """
-        if self._first_cone_tf is None:
-            return None
-        amap = self.world.get_map()
-        cone_wp = amap.get_waypoint(self._first_cone_tf.location, project_to_road=True,
-                                    lane_type=carla.LaneType.Driving)
-        if cone_wp is None:
-            return None
-
-        traveled = 0.0
-        step = max(0.5, float(self.spawn_wp_step))
-        wp = cone_wp
-        while traveled < self.spawn_min_gap_from_cone:
-            prevs = wp.previous(step)
-            if not prevs:
-                break
-            wp = prevs[0]
-            traveled += step
-
-        tf = wp.transform
-        # 🔧 不修改z坐标，使用waypoint原始高度
-        return tf
-
     def _maybe_setup_scene_and_pick_spawn(self) -> carla.Transform:
         """
-        选择自车初始位姿：
-        1) 若配置给了 initial_spawn_tf -> 直接用；
-        2) cones_xml：从 XML 随机 waypoint 搭锥桶；基于锥桶回溯选 spawn；
-        3) cones：随机起点搭锥桶；基于锥桶回溯选 spawn；
-        4) 否则随机 spawn 点。
-        注意：切图已在 reset() 最前面处理，这里不做 load_world。
+        场景初始化和自车生成位置选择
+
+        Returns:
+            carla.Transform: 自车生成位置
         """
-        # 1) initial_spawn_tf
+        # 1) 如果有initial_spawn_tf，直接使用
         if isinstance(self.initial_spawn_tf, dict):
             try:
                 loc = carla.Location(
@@ -587,7 +994,36 @@ class CarlaEnv(gym.Env):
             except Exception as e:
                 print(f"[CarlaEnv] invalid initial_spawn_tf, fallback: {e}")
 
-        # 2) cones_xml：已在当前地图上
+        # 2) 使用新的场景管理系统
+        if self.scenario != "plain":
+            # 创建场景实例
+            self.scenario_instance = ScenarioFactory.create_scenario(
+                scenario_name=self.scenario,
+                world=self.world,
+                carla_map=self.map,
+                config=self.config
+            )
+
+            if self.scenario_instance is not None:
+                # 初始化场景
+                success = self.scenario_instance.setup()
+
+                if success:
+                    # 获取障碍物actors（用于观测）
+                    self.obstacle_actors = self.scenario_instance.get_obstacle_actors()
+
+                    # 获取自车生成位置
+                    spawn_tf = self.scenario_instance.get_spawn_transform()
+                    if spawn_tf is not None:
+                        return spawn_tf
+                    else:
+                        print(f"[CarlaEnv] ⚠️ 场景 {self.scenario} 未返回spawn位置，使用默认")
+                else:
+                    print(f"[CarlaEnv] ⚠️ 场景 {self.scenario} 初始化失败，使用默认spawn")
+            else:
+                print(f"[CarlaEnv] ⚠️ 未知场景 {self.scenario}，使用默认spawn")
+
+        # 3) 兼容旧的cones_xml场景（如果需要保留）
         if self.scenario == "cones_xml":
             xml_path = self._pick_random_xml_file()
             if xml_path:
@@ -595,8 +1031,7 @@ class CarlaEnv(gym.Env):
                 if wps:
                     pick = random.choice(wps)
                     start_loc = carla.Location(x=pick["x"], y=pick["y"], z=pick["z"])
-                    start_wp = self.map.get_waypoint(start_loc, project_to_road=True,
-                                                     lane_type=carla.LaneType.Driving)
+                    start_wp = self.map.get_waypoint(start_loc, project_to_road=True, lane_type=carla.LaneType.Driving)
                     if start_wp:
                         self._place_cones_conditionally_behind(
                             start_wp=start_wp,
@@ -611,21 +1046,16 @@ class CarlaEnv(gym.Env):
                                 self.world.tick()
                         tf = self._spawn_tf_from_first_cone()
                         if tf is not None:
-                            try:
-                                d = self._first_cone_tf.location.distance(tf.location)
-                                print(f"[CarlaEnv] spawn-from-xml-cone: gap ~ {d:.1f} m (>= {self.spawn_min_gap_from_cone:.1f})")
-                            except Exception:
-                                pass
                             return tf
 
-        # 3) cones：老逻辑随机起点
-        if self.scenario == "cones":
+        # 4) 兼容旧的cones场景（如果需要保留）
+        if self.scenario == "cones_old":
             start_wp = self._pick_random_start_waypoint(
                 min_gap_from_junction=self.cone_min_gap_from_junction,
                 grid=self.cone_grid
             )
             if start_wp:
-                cones_spawned, first_tf, last_tf = self._place_cones_conditionally_behind(
+                self._place_cones_conditionally_behind(
                     start_wp=start_wp,
                     num_cones=self.cone_num,
                     step_behind=self.cone_step_behind,
@@ -640,35 +1070,36 @@ class CarlaEnv(gym.Env):
                 if tf is not None:
                     return tf
 
-        # 🔧 新增：4) parked_obstacles - 停车障碍场景（模拟 Overtaking）
-        if self.scenario == "parked_obstacles":
-            start_wp = self._pick_random_start_waypoint(
-                min_gap_from_junction=15.0,
-                grid=5.0
-            )
-            if start_wp:
-                # 放置停车障碍
-                parked_vehicles = self._place_parked_vehicles(start_wp)
-
-                # 同步
-                if self.world.get_settings().synchronous_mode:
-                    for _ in range(3):
-                        self.world.tick()
-
-                # 自车spawn在起始点
-                ego_spawn = start_wp.transform
-                # 🔧 不修改z坐标，使用waypoint原始高度
-                return ego_spawn
-
-        # 4) 兜底：随机 spawn
+        # 5) fallback: 使用地图默认spawn点
         spawns = self.map.get_spawn_points()
         if not spawns:
             return carla.Transform(carla.Location(x=0.0, y=0.0, z=0.0), carla.Rotation(yaw=0.0))
-        tf = random.choice(spawns)
-        # 🔧 不修改z坐标，使用spawn point原始高度
-        return tf
+        return random.choice(spawns)
 
-    # --- 随机起点（非 XML） ---
+    # ============== 旧的cones函数（保留用于兼容） ==============
+    def _spawn_tf_from_first_cone(self) -> Optional[carla.Transform]:
+        if self._first_cone_tf is None:
+            return None
+        amap = self.world.get_map()
+        cone_wp = amap.get_waypoint(
+            self._first_cone_tf.location,
+            project_to_road=True,
+            lane_type=carla.LaneType.Driving
+        )
+        if cone_wp is None:
+            return None
+
+        traveled = 0.0
+        step = max(0.5, float(self.spawn_wp_step))
+        wp = cone_wp
+        while traveled < self.spawn_min_gap_from_cone:
+            prevs = wp.previous(step)
+            if not prevs:
+                break
+            wp = prevs[0]
+            traveled += step
+        return wp.transform
+
     def _pick_random_start_waypoint(self, min_gap_from_junction: float = 15.0, grid: float = 5.0, max_tries: int = 300):
         amap = self.world.get_map()
         cands = [wp for wp in amap.generate_waypoints(grid) if wp.lane_type == carla.LaneType.Driving]
@@ -677,18 +1108,26 @@ class CarlaEnv(gym.Env):
         random.shuffle(cands)
 
         def _is_near_junction(wp: carla.Waypoint, dist: float = 15.0, step: float = 1.0):
-            cur = wp; traveled = 0.0
+            cur = wp
+            traveled = 0.0
             while traveled < dist:
                 nxt = cur.next(step)
-                if not nxt: break
-                cur = nxt[0]; traveled += step
-                if cur.is_junction: return True
-            cur = wp; traveled = 0.0
+                if not nxt:
+                    break
+                cur = nxt[0]
+                traveled += step
+                if cur.is_junction:
+                    return True
+            cur = wp
+            traveled = 0.0
             while traveled < dist:
                 prv = cur.previous(step)
-                if not prv: break
-                cur = prv[0]; traveled += step
-                if cur.is_junction: return True
+                if not prv:
+                    break
+                cur = prv[0]
+                traveled += step
+                if cur.is_junction:
+                    return True
             return False
 
         tries = 0
@@ -703,13 +1142,20 @@ class CarlaEnv(gym.Env):
                 return wp
         return cands[0]
 
-    def _place_cones_conditionally_behind(self,
-                                          start_wp: carla.Waypoint,
-                                          num_cones: int = 10,
-                                          step_behind: float = 3.0,
-                                          step_lateral_per_cone: float = 0.35,
-                                          z_offset: float = 0.0,
-                                          lane_margin: float = 0.25):
+    def _place_cones_conditionally_behind(
+        self,
+        start_wp: carla.Waypoint,
+        num_cones: int = 10,
+        step_behind: float = 3.0,
+        step_lateral_per_cone: float = 0.35,
+        z_offset: float = 0.0,
+        lane_margin: float = 0.25,
+    ):
+        """
+        ⚠️ 已废弃 - 此函数已移至 scenario_manager.ConesScenario
+        保留此函数仅用于向后兼容
+        """
+        print("[DEPRECATED] _place_cones_conditionally_behind 已废弃，请使用 scenario_manager.ConesScenario")
         world = self.world
         lib = world.get_blueprint_library()
         try:
@@ -717,17 +1163,16 @@ class CarlaEnv(gym.Env):
         except Exception:
             cone_bp = lib.find("static.prop.trafficcone")
 
-        # 方向：优先把锥桶从“靠近路肩的一侧”往另一侧推进
         left_lane_wp = start_wp.get_left_lane()
         right_lane_wp = start_wp.get_right_lane()
         is_left_driving = left_lane_wp and left_lane_wp.lane_type == carla.LaneType.Driving
         is_right_driving = right_lane_wp and right_lane_wp.lane_type == carla.LaneType.Driving
 
-        lateral_multiplier = 1.0  # +右 -左
+        lateral_multiplier = 1.0
         if is_left_driving and not is_right_driving:
-            lateral_multiplier = 1.0  #-1.0
+            lateral_multiplier = 1.0
         elif is_right_driving and not is_left_driving:
-            lateral_multiplier = -1.0  #1.0
+            lateral_multiplier = -1.0
         elif is_left_driving and is_right_driving:
             lateral_multiplier = random.choice([-1.0, 1.0])
 
@@ -739,7 +1184,6 @@ class CarlaEnv(gym.Env):
         for i in range(num_cones):
             if not cur_wp:
                 break
-
             wp_tf = cur_wp.transform
             right_vec = wp_tf.get_right_vector()
             half_w = cur_wp.lane_width * 0.5
@@ -763,94 +1207,359 @@ class CarlaEnv(gym.Env):
                 last_tf = cone_tf
 
             prv = cur_wp.previous(step_behind)
-            if prv:
-                cur_wp = prv[0]
-            else:
-                cur_wp = None
+            cur_wp = prv[0] if prv else None
 
         self._first_cone_tf = first_tf
         self._last_cone_tf = last_tf
         self._actors.extend(cones_spawned)
-
         return cones_spawned, first_tf, last_tf
 
-    # 🔧 新增：放置停车障碍车辆（模拟 Overtaking ParkedObstacle 场景）
     def _place_parked_vehicles(self, start_wp: carla.Waypoint):
         """
-        沿着路线放置停车障碍车辆
+        ⚠️ 已废弃 - 此函数已移至 scenario_manager.ParkedObstaclesScenario
+        保留此函数仅用于向后兼容
 
-        Args:
-            start_wp: 起始waypoint
-
-        Returns:
-            List[carla.Actor]: 生成的停车车辆列表
+        双车场景：在ego车前方12-20米范围内生成2辆障碍车
+        第一辆: 12-20米随机
+        第二辆: 第一辆后8米
         """
+        print("[DEPRECATED] _place_parked_vehicles 已废弃，请使用 scenario_manager.ParkedObstaclesScenario")
         world = self.world
         lib = world.get_blueprint_library()
 
-        # 获取车辆蓝图（优先使用常见车型）
+        # 调试输出
+        start_loc = start_wp.transform.location
+        num_cars = int(getattr(self.config, "num_parked_cars", 1))
+        print(f"\n[OBSTACLE] 双车场景 - 开始生成{num_cars}辆障碍车:")
+        print(f"  - 起始waypoint: ({start_loc.x:.1f}, {start_loc.y:.1f}, {start_loc.z:.1f})")
+        print(f"  - 车道类型: {start_wp.lane_type}")
+        print(f"  - 车道宽度: {start_wp.lane_width:.1f}m")
+
+        # 获取车辆blueprints
         vehicle_bps = [
-            lib.filter('vehicle.tesla.model3'),
-            lib.filter('vehicle.audi.a2'),
-            lib.filter('vehicle.bmw.grandtourer'),
-            lib.filter('vehicle.toyota.prius'),
+            lib.filter("vehicle.tesla.model3"),
+            lib.filter("vehicle.audi.a2"),
+            lib.filter("vehicle.bmw.grandtourer"),
+            lib.filter("vehicle.toyota.prius"),
         ]
         available_bps = [bp for bps in vehicle_bps for bp in bps if bps]
         if not available_bps:
-            available_bps = lib.filter('vehicle.*')
+            available_bps = lib.filter("vehicle.*")
 
         parked_vehicles = []
+
+        # ✅ 第一辆车：随机距离（12-20米）
+        min_dist = float(getattr(self.config, "parked_car_start_distance_min", 12.0))
+        max_dist = float(getattr(self.config, "parked_car_start_distance_max", 20.0))
+        first_car_distance = random.uniform(min_dist, max_dist)
+
+        print(f"  - 第一辆车目标距离: {first_car_distance:.1f}m (范围: {min_dist}-{max_dist}m)")
+
+        # 生成第一辆车
         cur_wp = start_wp
+        traveled = 0.0
+        step_size = 2.0
 
-        # 前进到第一辆车的起始位置
-        for _ in range(int(self.parked_car_start_distance / 2.0)):
-            next_wps = cur_wp.next(2.0)
-            if next_wps:
-                cur_wp = next_wps[0]
-            else:
+        while traveled < first_car_distance:
+            nxt = cur_wp.next(step_size)
+            if not nxt:
+                print(f"    ⚠️ 无法继续前进（路径尽头），已前进{traveled:.1f}m")
                 break
+            cur_wp = nxt[0]
+            traveled += step_size
 
-        # 放置每辆停车
-        for i in range(self.num_parked_cars):
-            if not cur_wp:
-                break
-
-            # 计算停车位置（右侧路边）
-            wp_tf = cur_wp.transform
-            right_vec = wp_tf.get_right_vector()
-
-            # 停车横向偏移（正值=右侧）
-            parked_loc = wp_tf.location + right_vec * self.parked_car_offset
-            parked_loc.z += 0.1  # 稍微抬高避免卡地面
-
-            parked_tf = carla.Transform(parked_loc, wp_tf.rotation)
-
-            # 随机选择车型
-            vehicle_bp = random.choice(available_bps)
-
-            # 尝试spawn
-            vehicle = world.try_spawn_actor(vehicle_bp, parked_tf)
+        if cur_wp:
+            vehicle = self._spawn_single_vehicle(world, cur_wp, available_bps, 1, traveled)
             if vehicle:
-                # 设置为静止（不模拟物理）
-                vehicle.set_simulate_physics(False)
                 parked_vehicles.append(vehicle)
-                self._actors.append(vehicle)  # 记录以便清理
 
-            # 前进到下一个停车位置
-            distance_covered = 0.0
-            while distance_covered < self.parked_car_spacing:
-                next_wps = cur_wp.next(5.0)
-                if next_wps:
-                    cur_wp = next_wps[0]
-                    distance_covered += 5.0
-                else:
+        # ✅ 第二辆车：在第一辆车后spacing米
+        if num_cars >= 2 and cur_wp:
+            spacing = float(getattr(self.config, "parked_car_spacing", 8.0))
+            print(f"  - 第二辆车间隔: {spacing:.1f}m")
+
+            # 继续前进spacing米
+            second_car_traveled = 0.0
+            while second_car_traveled < spacing:
+                nxt = cur_wp.next(step_size)
+                if not nxt:
+                    print(f"    ⚠️ 无法继续前进（路径尽头），已前进{second_car_traveled:.1f}m")
                     break
+                cur_wp = nxt[0]
+                second_car_traveled += step_size
+
+            if cur_wp:
+                total_distance = traveled + second_car_traveled
+                vehicle = self._spawn_single_vehicle(world, cur_wp, available_bps, 2, total_distance)
+                if vehicle:
+                    parked_vehicles.append(vehicle)
+
+        # 汇总输出
+        print(f"\n[OBSTACLE DEBUG] 双车场景生成完成:")
+        print(f"  - 尝试生成: {num_cars} 辆")
+        print(f"  - 成功生成: {len(parked_vehicles)} 辆")
+        if len(parked_vehicles) >= 1:
+            v1_loc = parked_vehicles[0].get_location()
+            print(f"  - 车辆1位置: ({v1_loc.x:.1f}, {v1_loc.y:.1f}, {v1_loc.z:.1f})")
+        if len(parked_vehicles) >= 2:
+            v2_loc = parked_vehicles[1].get_location()
+            print(f"  - 车辆2位置: ({v2_loc.x:.1f}, {v2_loc.y:.1f}, {v2_loc.z:.1f})")
+            # 计算两车距离
+            if len(parked_vehicles) >= 2:
+                v1_loc = parked_vehicles[0].get_location()
+                v2_loc = parked_vehicles[1].get_location()
+                dist = math.sqrt((v2_loc.x - v1_loc.x)**2 + (v2_loc.y - v1_loc.y)**2)
+                print(f"  - 两车间距: {dist:.1f}m")
+        print(f"  - 横向偏移: 0.0m (车道中心)")
+        print(f"  - 注册到obstacle_actors: {len(self.obstacle_actors)} 个\n")
 
         return parked_vehicles
 
-    # ----------------- 观测 / 奖励 -----------------
+    def _spawn_single_vehicle(self, world, waypoint, available_bps, car_index, distance_from_ego):
+        """
+        在指定waypoint生成单个车辆
+        """
+        wp_loc = waypoint.transform.location
+        wp_rot = waypoint.transform.rotation
+
+        print(f"  - 车辆{car_index}: 目标距离={distance_from_ego:.1f}m, 位置=({wp_loc.x:.1f}, {wp_loc.y:.1f})")
+
+        # 策略1: 车道中心（最优）
+        spawn_loc = carla.Location(
+            x=wp_loc.x,
+            y=wp_loc.y,
+            z=wp_loc.z + 0.5  # 抬高0.5米防止穿地
+        )
+        spawn_tf = carla.Transform(spawn_loc, wp_rot)
+
+        vehicle_bp = random.choice(available_bps)
+        vehicle = world.try_spawn_actor(vehicle_bp, spawn_tf)
+
+        # 策略2: 如果失败，尝试更高位置
+        if not vehicle:
+            print(f"    ⚠️ 车道中心生成失败，尝试更高位置...")
+            spawn_loc.z = wp_loc.z + 1.0
+            spawn_tf = carla.Transform(spawn_loc, wp_rot)
+            vehicle = world.try_spawn_actor(vehicle_bp, spawn_tf)
+
+        # 策略3: 如果还失败，尝试稍微偏移
+        if not vehicle:
+            print(f"    ⚠️ 高位置生成失败，尝试轻微偏移...")
+            right_vec = wp_rot.get_right_vector()
+            spawn_loc = carla.Location(
+                x=wp_loc.x + right_vec.x * 0.5,
+                y=wp_loc.y + right_vec.y * 0.5,
+                z=wp_loc.z + 0.5
+            )
+            spawn_tf = carla.Transform(spawn_loc, wp_rot)
+            vehicle = world.try_spawn_actor(vehicle_bp, spawn_tf)
+
+        if vehicle:
+            vehicle.set_simulate_physics(False)
+            self._actors.append(vehicle)
+            self.obstacle_actors.append(vehicle)
+
+            v_loc = vehicle.get_location()
+            print(f"    ✅ 成功生成！ID={vehicle.id}, 实际位置=({v_loc.x:.1f}, {v_loc.y:.1f}, {v_loc.z:.1f})")
+            return vehicle
+        else:
+            print(f"    ❌ 所有策略都失败！")
+            return None
+
+    # ----------------- obs / collision -----------------
     def _on_collision(self, event):
         self.collision = True
+
+    def _wrap_angle(self, a: float) -> float:
+        # wrap to [-pi, pi]
+        while a > math.pi:
+            a -= 2 * math.pi
+        while a < -math.pi:
+            a += 2 * math.pi
+        return a
+
+    def _world_to_ego_frame(self, dx: float, dy: float, ego_yaw_rad: float):
+        c = math.cos(ego_yaw_rad)
+        s = math.sin(ego_yaw_rad)
+        # ego x+: forward, ego y+: left
+        rel_x = c * dx + s * dy
+        rel_y = -s * dx + c * dy
+        return rel_x, rel_y
+
+    def _compute_lane_obs(self) -> np.ndarray:
+        """
+        lane obs (6):
+          [lane_dev_norm, sin(heading_err), cos(heading_err), lane_width_norm, wp_rel_x_norm, wp_rel_y_norm]
+        """
+        loc = self.ego.get_location()
+        tf = self.ego.get_transform()
+        ego_yaw = math.radians(float(tf.rotation.yaw))
+
+        wp = self.map.get_waypoint(loc, project_to_road=True)
+        if wp is None:
+            return np.zeros((6,), dtype=np.float32)
+
+        # lane deviation (meters)
+        lane_dev = float(math.hypot(loc.x - wp.transform.location.x, loc.y - wp.transform.location.y))
+        lane_w = float(getattr(wp, "lane_width", 3.5))
+
+        # heading error
+        fwd = wp.transform.get_forward_vector()
+        lane_yaw = math.atan2(float(fwd.y), float(fwd.x))
+        heading_err = self._wrap_angle(lane_yaw - ego_yaw)
+
+        # target waypoint direction (use self.target_wp if exists)
+        tgt = self.target_wp
+        if tgt is None:
+            nxt = wp.next(float(getattr(self, "wp_step_dist", 5.0)))
+            tgt = nxt[0] if nxt else wp
+
+        tgt_loc = tgt.transform.location
+        dx = float(tgt_loc.x - loc.x)
+        dy = float(tgt_loc.y - loc.y)
+        wp_rel_x, wp_rel_y = self._world_to_ego_frame(dx, dy, ego_yaw)
+
+        # normalization (very important)
+        lane_dev_n = float(np.clip(lane_dev / max(1e-3, lane_w), 0.0, 3.0))
+        lane_w_n = float(np.clip(lane_w / 4.0, 0.0, 2.0))
+        wp_rel_x_n = float(np.clip(wp_rel_x / 20.0, -2.0, 2.0))
+        wp_rel_y_n = float(np.clip(wp_rel_y / 10.0, -2.0, 2.0))
+
+        return np.array([
+            lane_dev_n,
+            math.sin(heading_err),
+            math.cos(heading_err),
+            lane_w_n,
+            wp_rel_x_n,
+            wp_rel_y_n,
+        ], dtype=np.float32)
+
+    def _collect_obstacle_candidates(self):
+        """
+        优先：self.obstacle_actors（如果你在 spawn 障碍物时注册了）
+        否则：fallback 扫 world 里的 vehicle.* + static.prop.*（cone/barrier 等）
+        """
+        # 1) 优先使用注册过的 obstacles
+        if hasattr(self, "obstacle_actors") and self.obstacle_actors:
+            out = []
+            for a in self.obstacle_actors:
+                if a is None:
+                    continue
+                try:
+                    _ = a.get_location()
+                    out.append(a)
+                except Exception:
+                    continue
+            return out
+
+        # 2) fallback：扫全世界 actors
+        try:
+            actors = self.world.get_actors()
+            out = []
+
+            # vehicles
+            for v in actors.filter("vehicle.*"):
+                if self.ego is not None and v.id == self.ego.id:
+                    continue
+                out.append(v)
+
+            # static props（cones / barriers / 等）
+            for p in actors.filter("static.prop.*"):
+                # 你可以按需扩展关键词
+                tid = getattr(p, "type_id", "")
+                if ("trafficcone" in tid) or ("cone" in tid) or ("barrier" in tid) or ("construction" in tid):
+                    out.append(p)
+
+            return out
+        except Exception:
+            return []
+
+    def _compute_obstacle_obs(self) -> np.ndarray:
+        """
+        obstacles obs: K * 3
+          per obstacle: [rel_x_norm, rel_y_norm, dist_norm]
+        其中：
+          rel_x = 前向投影（自车 forward 点乘）
+          rel_y = 横向投影（自车 right 点乘，右为正）
+        """
+        K = int(self.obs_obstacle_k)
+        R = float(self.obs_obstacle_range)
+
+        candidates = self._collect_obstacle_candidates()
+
+        # ✅ 添加调试输出（每50步输出一次）
+        if self.episode_steps % 50 == 0:
+            ego_loc = self.ego.get_location() if self.ego else None
+            print(f"\n[OBSTACLE DETECTION] Step {self.episode_steps}:")
+            print(f"  - 检测范围: {R}m")
+            print(f"  - 候选障碍物数量: {len(candidates)}")
+            if ego_loc:
+                print(f"  - Ego位置: ({ego_loc.x:.1f}, {ego_loc.y:.1f}, {ego_loc.z:.1f})")
+                if candidates:
+                    for i, obs in enumerate(candidates[:5]):
+                        try:
+                            obs_loc = obs.get_location()
+                            dist = math.hypot(obs_loc.x - ego_loc.x, obs_loc.y - ego_loc.y)
+                            in_range = "✅" if dist <= R else "❌"
+                            print(f"  - 障碍物{i+1}: 距离={dist:.1f}m {in_range}, 位置=({obs_loc.x:.1f}, {obs_loc.y:.1f})")
+                        except:
+                            print(f"  - 障碍物{i+1}: 无效")
+            else:
+                print(f"  - Ego: None")
+
+        if not candidates or (self.ego is None):
+            return np.zeros((K * 3,), dtype=np.float32)
+
+        ego_loc = self.ego.get_location()
+        ego_tf = self.ego.get_transform()
+        ego_fwd = ego_tf.get_forward_vector()
+        ego_right = ego_tf.get_right_vector()
+
+        items = []
+        for a in candidates:
+            try:
+                a_loc = a.get_location()
+            except Exception:
+                continue
+
+            dx = float(a_loc.x - ego_loc.x)
+            dy = float(a_loc.y - ego_loc.y)
+            dist = float(math.hypot(dx, dy))
+            if dist > R:
+                continue
+
+            # ✅ 用点乘得到 ego-frame 的前向/横向
+            rel_x = dx * float(ego_fwd.x) + dy * float(ego_fwd.y)
+            rel_y = dx * float(ego_right.x) + dy * float(ego_right.y)
+
+            items.append((dist, rel_x, rel_y))
+
+        if not items:
+            return np.zeros((K * 3,), dtype=np.float32)
+
+        items.sort(key=lambda x: x[0])
+        items = items[:K]
+
+        feats = []
+        for dist, rel_x, rel_y in items:
+            rel_x_n = float(np.clip(rel_x / R, -1.0, 1.0))
+            rel_y_n = float(np.clip(rel_y / R, -1.0, 1.0))
+            dist_n = float(np.clip(dist / R, 0.0, 1.0))
+            feats.extend([rel_x_n, rel_y_n, dist_n])
+
+        while len(feats) < K * 3:
+            feats.extend([0.0, 0.0, 0.0])
+
+        result = np.array(feats, dtype=np.float32)
+
+        # ✅ 添加调试输出（每50步输出一次）
+        if self.episode_steps % 50 == 0:
+            non_zero = np.count_nonzero(result)
+            print(f"  - 观测值非零元素: {non_zero}/{K*3}")
+            if non_zero > 0:
+                print(f"  - 前3个障碍物观测: {result[:9]}")
+
+        return result
 
     def _get_state_obs(self):
         tf = self.ego.get_transform()
@@ -858,191 +1567,596 @@ class CarlaEnv(gym.Env):
         acc = vector_to_scalar(self.ego.get_acceleration())
         ang = vector_to_scalar(self.ego.get_angular_velocity())
         vel = vector_to_scalar(self.ego.get_velocity())
-        return np.array([loc.x, loc.y, loc.z,
-                         rot.pitch, rot.yaw, rot.roll,
-                         acc, ang, vel], dtype=np.float64)
 
-    # def _get_reward(self):
-    #     loc = self.ego.get_location()
-    #     wp = self.map.get_waypoint(loc, project_to_road=True)
-    #     d = math.hypot(loc.x - wp.transform.location.x, loc.y - wp.transform.location.y)
-    #     follow_waypoint_reward = -d
-    #
-    #     done = bool(self.collision)
-    #     collision_reward = -1 if self.collision else 0
-    #     total_reward = 100 * follow_waypoint_reward + 100 * collision_reward
-    #
-    #     info = {
-    #         "follow_waypoint_reward": follow_waypoint_reward,
-    #         "collision_reward": collision_reward,
-    #         "cost": 0.0
-    #     }
-    #
-    #     self.collision = False
-    #     return total_reward, done, info
-
-    def _get_reward(self):
-        """
-        使用 RewardMonitor 计算多目标 reward，并在外面叠加
-        overtaking 场景需要的 shaping：
-        - 朝着下一 waypoint 前进（核心：r_wp）
-        - 鼓励保持合理车速
-        - 惩罚长时间龟速（防止站桩 / 原地打转）
-        - 碰撞给适度终止惩罚
-        """
-        # ==== 基础信息 ====
-        done = bool(self.collision)
-
-        # 当前车速（m/s）
-        vel = self.ego.get_velocity()
-        speed = math.sqrt(vel.x ** 2 + vel.y ** 2 + vel.z ** 2)
-
-        # 当前位置 + 车道中心偏移
-        loc = self.ego.get_location()
-        wp = self.map.get_waypoint(loc, project_to_road=True)
-        lane_deviation = math.hypot(
-            loc.x - wp.transform.location.x,
-            loc.y - wp.transform.location.y
+        base = np.array(
+            [loc.x, loc.y, loc.z, rot.pitch, rot.yaw, rot.roll, acc, ang, vel],
+            dtype=np.float32,
         )
 
-        # 记录“连续低速/静止”的步数（防止站桩）
-        if not hasattr(self, "idle_steps"):
-            self.idle_steps = 0
-        if speed < 0.2:  # 小于 0.2m/s 视为几乎不动
-            self.idle_steps += 1
+        parts = [base]
+
+        if getattr(self, "obs_use_lane", False):
+            parts.append(self._compute_lane_obs())
+
+        if getattr(self, "obs_use_obstacles", False):
+            parts.append(self._compute_obstacle_obs())
+
+        obs = np.concatenate(parts, axis=0).astype(np.float32)
+
+        # 防御：维度必须一致
+        if obs.shape[0] != int(self.obs_dim):
+            raise RuntimeError(f"[CarlaEnv] obs_dim mismatch: got {obs.shape[0]} expected {self.obs_dim}")
+
+        return obs
+
+    def _get_reward(self):
+        import math
+        import numpy as np
+
+        # ============================================================
+        # ✅ 稳定版奖励函数（可直接替换）
+        # 改动要点：
+        # 1) progress 用 ego forward（不再用 waypoint forward）
+        # 2) obstacle shaping 逻辑补齐并修复：AVOID_RANGE/SAFE_DIST/LAT_TOL 等常量 + bug fix
+        # 3) 修复 gate / ^ / 未定义变量等问题
+        # ============================================================
+
+        # ----------------- terminal -----------------
+        K_COLLISION_TERMINAL = 25.0
+        K_OFFROAD_TERMINAL = 6.0
+        K_NO_PROGRESS_TERMINAL = 6.0
+        NO_PROGRESS_LIMIT = 300
+
+        # ----------------- progress -----------------
+        USE_FORWARD_PROGRESS = True  # ✅ 你想要 ego_forward / velocity_forward 就用 True
+        K_PROGRESS = 0.80
+        PROGRESS_CLIP = 0.40
+
+        # ----------------- speed -----------------
+        TARGET_SPEED = 4.0
+        K_SPEED = 0.25
+
+        # 全局超速惩罚
+        K_OVERSPEED_GLOBAL = 0.25
+        OVERSPEED_START = 4.8
+
+        # ----------------- lane / danger -----------------
+        LANE_DEV_MAX = 2.0
+        K_LANE = 0.18
+        W_LANE_FINAL = 0.14
+
+        K_DANGER = 0.55
+        DANGER_START_RATIO = 0.50
+        DANGER_CLIP = 0.8
+
+        # ----------------- offroad soft -----------------
+        K_OFFROAD_SOFT = 0.9
+        OFFROAD_SOFT_START_RATIO = 0.72
+
+        # ----------------- smooth / magnitude -----------------
+        K_MAG = 0.008
+        K_SMOOTH = 0.04
+        SMOOTH_ONLY_ABOVE_SPEED = 1.0
+        SMOOTH_CLIP_MIN = -0.12
+
+        # ----------------- steer penalties -----------------
+        K_STEER_SPEED = 0.20
+        STEER_SPEED_START = 3.5
+
+        K_STEER_THROTTLE = 0.15
+        STEER_THROTTLE_STEER_TH = 0.35
+
+        # ----------------- idle / no progress -----------------
+        PROGRESS_EMA_ALPHA = 0.08
+        NO_PROGRESS_FWD_THRESH = 0.01
+        NO_PROGRESS_SPEED_THRESH = 0.35
+        K_IDLE_STEP = 0.015
+
+        # ----------------- obstacle parsing config -----------------
+        HAVE_OBSTACLE_OBS = bool(getattr(self, "obs_use_obstacles", False))
+        K_OBS = int(getattr(self, "obs_obstacle_k", 5))
+        R_OBS = float(getattr(self, "obs_obstacle_range", 50.0))
+        USE_LANE_FEAT = bool(getattr(self, "obs_use_lane", True))
+        LANE_DIM = 6 if USE_LANE_FEAT else 0
+
+        # ----------------- obstacle shaping constants (✅ 你找的就是这部分) -----------------
+        AVOID_RANGE = 30.0  # 前方多少米开始产生“避障压力”
+        SAFE_DIST = 18.0  # ✅ 你想提前到 15~18m，就改这里（比如 15.0 / 16.0 / 18.0）
+        LAT_TOL = 2.5  # 横向门控宽度（车道内才强惩罚）
+
+        V_CAP = 2.8  # 有障碍时的限速上限
+        W_OBS_CLEAR = 0.55
+        W_OBS_SEP = 0.25
+        W_OBS_STUCK = 0.04
+        W_OBS_SPEED = 1.00
+
+        OFFROAD_MARGIN = 1.0
+        OBSTACLE_OFFROAD_EXTRA = 1.2
+
+        W_WP_FINAL = 1.0
+        W_SPEED_FINAL = 0.6
+
+        # ----------------- terminal flags -----------------
+        collision_flag = bool(getattr(self, "collision", False))
+        done = False
+        done_reason = "running"
+
+        # ----------------- ego states -----------------
+        vel = self.ego.get_velocity()
+        speed = float(math.sqrt(vel.x ** 2 + vel.y ** 2 + vel.z ** 2))
+
+        loc = self.ego.get_location()
+        wp = self.map.get_waypoint(loc, project_to_road=True)
+
+        lane_deviation = float(
+            math.hypot(loc.x - wp.transform.location.x, loc.y - wp.transform.location.y)
+        )
+
+        # ----------------- progress -----------------
+        progress_fwd = 0.0
+        delta_dist = 0.0
+
+        if USE_FORWARD_PROGRESS:
+            if getattr(self, "prev_loc", None) is None:
+                self.prev_loc = loc
+
+            # ✅ 用 ego 的 forward，不用 waypoint 的 forward
+            ego_tf = self.ego.get_transform()
+            ego_fwd = ego_tf.get_forward_vector()
+
+            dx = float(loc.x - self.prev_loc.x)
+            dy = float(loc.y - self.prev_loc.y)
+
+            # ego forward 投影进度（本质就是 velocity_forward 的离散版）
+            progress_fwd = dx * float(ego_fwd.x) + dy * float(ego_fwd.y)
+            progress_fwd = float(np.clip(progress_fwd, -PROGRESS_CLIP, PROGRESS_CLIP))
+
+            self.prev_loc = loc
+
+            r_progress = K_PROGRESS * progress_fwd
+            progress_signal = float(progress_fwd)
+
         else:
-            self.idle_steps = 0
+            # 旧版本：靠 waypoint 距离变化算进度
+            if getattr(self, "target_wp", None) is None:
+                self.target_wp = wp
+                self.prev_wp_dist = None
 
-        # ==== 1. 朝下一 waypoint 的进度奖励 r_wp ====
-        r_wp = 0.0
-        if hasattr(self, "target_wp") and self.target_wp is not None:
             target_loc = self.target_wp.transform.location
-            dist_to_wp = math.hypot(
-                loc.x - target_loc.x,
-                loc.y - target_loc.y
-            )
+            dist_to_wp = float(math.hypot(loc.x - target_loc.x, loc.y - target_loc.y))
 
-            # 如果没有 prev_wp_dist，先用当前距离初始化
-            if not hasattr(self, "prev_wp_dist"):
-                self.prev_wp_dist = dist_to_wp
+            if getattr(self, "prev_wp_dist", None) is None:
+                delta_dist = 0.0
+            else:
+                delta_dist = float(self.prev_wp_dist - dist_to_wp)
 
-            # 本帧相对上一帧，距离缩短了多少（>0 表示朝 waypoint 走近）
-            delta_dist = self.prev_wp_dist - dist_to_wp
             self.prev_wp_dist = dist_to_wp
+            delta_dist = float(np.clip(delta_dist, -1.0, 1.0))
 
-            # 奖励系数：1.0 可以先试，太小就放大
-            r_wp = 1.0 * delta_dist
+            r_progress = 1.0 * delta_dist
+            progress_signal = float(delta_dist)
 
-            # 如果已经很接近当前 waypoint，则切换到下一个 waypoint
-            if dist_to_wp < getattr(self, "wp_reach_thresh", 2.0):
-                step_dist = getattr(self, "wp_step_dist", 5.0)
-                next_wps = self.target_wp.next(step_dist)
-                if len(next_wps) > 0:
-                    self.target_wp = next_wps[0]
-                    new_target_loc = self.target_wp.transform.location
-                    self.prev_wp_dist = math.hypot(
-                        loc.x - new_target_loc.x,
-                        loc.y - new_target_loc.y
-                    )
+        r_wp = float(r_progress)
 
-        # ==== 2. 基于 RewardMonitor 的基础 reward（弱化权重） ====
+        # ----------------- obstacle parse -----------------
+        nearest_dist = None
+        nearest_fwd = None
+        nearest_lat = None
+        obstacle_gate = 0.0
+
+        obs_vec = getattr(self, "last_obs", None)
+
+        def _fallback_nearest_obstacle_world():
+            """如果 obs 里没有有效障碍，就用 world actor 做 fallback（只取前方障碍）。"""
+            try:
+                ego_tf2 = self.ego.get_transform()
+                ego_loc = ego_tf2.location
+                fwd_v = ego_tf2.get_forward_vector()
+                right_v = ego_tf2.get_right_vector()
+            except Exception:
+                return None, None, None
+
+            candidates = []
+            for a in getattr(self, "obstacle_actors", []):
+                if a is None:
+                    continue
+                try:
+                    if a.id != self.ego.id:
+                        candidates.append(a)
+                except Exception:
+                    continue
+
+            if bool(getattr(self, "traffic", False)):
+                try:
+                    for a in self.world.get_actors().filter("vehicle.*"):
+                        if a.id != self.ego.id:
+                            candidates.append(a)
+                except Exception:
+                    pass
+
+            best = None
+            for a in candidates:
+                try:
+                    a_loc = a.get_location()
+                except Exception:
+                    continue
+
+                dx = float(a_loc.x - ego_loc.x)
+                dy = float(a_loc.y - ego_loc.y)
+                dist = float(math.hypot(dx, dy))
+
+                if dist > R_OBS or dist < 1e-6:
+                    continue
+
+                fwdp = dx * float(fwd_v.x) + dy * float(fwd_v.y)
+                latp = dx * float(right_v.x) + dy * float(right_v.y)
+
+                # ✅ 前方过滤
+                if fwdp <= 0.0:
+                    continue
+
+                if (best is None) or (dist < best[0]):
+                    best = (dist, fwdp, latp)
+
+            if best is None:
+                return None, None, None
+
+            return best[0], best[1], best[2]
+
+        # ---- 从 obs 中解析 nearest obstacle（优先） ----
+        if HAVE_OBSTACLE_OBS and (obs_vec is not None) and (len(obs_vec) >= 9 + LANE_DIM + K_OBS * 3):
+            obs_vec = np.asarray(obs_vec, dtype=np.float32).reshape(-1)
+            start = 9 + LANE_DIM
+            block = obs_vec[start:start + K_OBS * 3].reshape(K_OBS, 3)
+
+            valid = block[:, 2] > 1e-6
+            if np.any(valid):
+                relx_n = block[valid, 0]
+                rely_n = block[valid, 1]
+                dist_n = block[valid, 2]
+
+                # 归一化 -> 米
+                relx = relx_n * R_OBS
+                rely = rely_n * R_OBS
+                dist = dist_n * R_OBS
+
+                ego_tf = self.ego.get_transform()
+                ego_fwd = ego_tf.get_forward_vector()
+                ego_right = ego_tf.get_right_vector()
+
+                yaw = math.radians(float(ego_tf.rotation.yaw))
+                cy, sy = math.cos(yaw), math.sin(yaw)
+
+                # ego坐标系 -> world 平面增量
+                dx_w = relx * cy - rely * sy
+                dy_w = relx * sy + rely * cy
+
+                # 投影到 ego前向/右向（实现“前方过滤”）
+                fwd_proj = dx_w * float(ego_fwd.x) + dy_w * float(ego_fwd.y)
+                lat_proj = dx_w * float(ego_right.x) + dy_w * float(ego_right.y)
+
+                front_mask = fwd_proj > 0.0
+                if np.any(front_mask):
+                    dist2 = dist[front_mask]
+                    fwd2 = fwd_proj[front_mask]
+                    lat2 = lat_proj[front_mask]
+
+                    j = int(np.argmin(dist2))
+                    nearest_dist = float(dist2[j])
+                    nearest_fwd = float(fwd2[j])
+                    nearest_lat = float(lat2[j])
+                else:
+                    nearest_dist, nearest_fwd, nearest_lat = _fallback_nearest_obstacle_world()
+            else:
+                nearest_dist, nearest_fwd, nearest_lat = _fallback_nearest_obstacle_world()
+        else:
+            nearest_dist, nearest_fwd, nearest_lat = _fallback_nearest_obstacle_world()
+
+        # ----------------- obstacle shaping -----------------
+        r_obstacle_clear = 0.0
+        r_obstacle_sep = 0.0
+        r_obstacle_stuck = 0.0
+        r_obstacle_speed = 0.0
+
+        if (nearest_dist is not None) and (nearest_fwd is not None):
+
+            # 前方距离门控：越靠近越大
+            g = (AVOID_RANGE - float(nearest_fwd)) / max(AVOID_RANGE, 1e-6)
+            g = float(np.clip(g, 0.0, 1.0))
+
+            # 横向门控：越在车道内越大
+            lat_gate = 1.0
+            if nearest_lat is not None:
+                lat_gate = float(np.clip(1.0 - abs(nearest_lat) / max(LAT_TOL, 1e-6), 0.0, 1.0))
+
+            obstacle_gate = g * lat_gate
+
+            # ✅ SAFE_DIST 内给强惩罚（注意 **2）
+            if nearest_dist < SAFE_DIST:
+                x = (SAFE_DIST - float(nearest_dist)) / max(SAFE_DIST, 1e-6)
+                r_obstacle_clear = -W_OBS_CLEAR * obstacle_gate * float(x ** 2)
+
+            # 分离奖励：越拉开距离越好
+            prev = getattr(self, "prev_min_obstacle_dist", None)
+            if prev is None:
+                self.prev_min_obstacle_dist = float(nearest_dist)
+            else:
+                delta = float(nearest_dist - prev)
+                delta = float(np.clip(delta, -2.0, 2.0))
+                r_obstacle_sep = W_OBS_SEP * obstacle_gate * (delta / max(AVOID_RANGE, 1e-6))
+                self.prev_min_obstacle_dist = float(nearest_dist)
+
+            # 卡住惩罚
+            if (obstacle_gate > 0.3) and (speed < 0.3) and (abs(progress_signal) < 1e-3):
+                r_obstacle_stuck = -W_OBS_STUCK
+
+            # 障碍限速惩罚
+            if obstacle_gate > 0.05:
+                over = max(0.0, speed - V_CAP)
+                r_obstacle_speed = -W_OBS_SPEED * obstacle_gate * float(over / max(V_CAP, 1e-6))
+
+        # ----------------- lane width / offroad -----------------
+        lane_width = float(getattr(wp, "lane_width", 3.5))
+        offroad_thresh = 0.5 * lane_width + OFFROAD_MARGIN + OBSTACLE_OFFROAD_EXTRA * float(obstacle_gate)
+        offroad = bool(lane_deviation > offroad_thresh)
+
+        # ✅ 出界前软惩罚
+        r_offroad_soft = 0.0
+        soft_start = OFFROAD_SOFT_START_RATIO * offroad_thresh
+        if lane_deviation > soft_start:
+            x = (lane_deviation - soft_start) / max(offroad_thresh - soft_start, 1e-6)
+            x = float(np.clip(x, 0.0, 1.5))
+            r_offroad_soft = -K_OFFROAD_SOFT * float(x ** 2)
+
+        # ----------------- speed reward + overspeed penalty -----------------
+        err = abs(speed - TARGET_SPEED) / max(TARGET_SPEED, 1e-3)
+        speed_score = float(np.clip(1.0 - err, 0.0, 1.0))
+        r_speed = K_SPEED * speed_score
+
+        # 近障碍时速度正奖励快速归零
+        r_speed *= float((1.0 - 0.9 * obstacle_gate) * (1.0 - obstacle_gate))
+
+        # 全局超速惩罚（二次增长）
+        r_overspeed_global = 0.0
+        if speed > OVERSPEED_START:
+            over = (speed - OVERSPEED_START) / max(OVERSPEED_START, 1e-6)
+            r_overspeed_global = -K_OVERSPEED_GLOBAL * float(over ** 2)
+
+        # 未知障碍保守控速（可选）
+        r_unknown_obstacle_guard = 0.0
+        if (nearest_dist is None) and (speed > (TARGET_SPEED + 0.8)):
+            r_unknown_obstacle_guard = -0.05 * float((speed - (TARGET_SPEED + 0.8)) ** 2)
+
+        # ----------------- lane keeping penalty -----------------
+        lane_dev_clip = min(lane_deviation, LANE_DEV_MAX)
+        r_lane = -K_LANE * lane_dev_clip
+        r_lane *= float(1.0 - 0.5 * obstacle_gate)
+
+        # ----------------- danger penalty -----------------
+        lane_ratio = lane_deviation / max(offroad_thresh, 1e-6)
+        danger_excess = max(0.0, lane_ratio - DANGER_START_RATIO)
+        speed_ratio = speed / max(TARGET_SPEED, 1e-3)
+        r_danger = -K_DANGER * (danger_excess ** 2) * float(np.clip(speed_ratio, 0.0, 2.0))
+        r_danger = float(np.clip(r_danger, -DANGER_CLIP, 0.0))
+        r_danger *= float(1.0 - 0.7 * obstacle_gate)
+
+        # ----------------- smoothness & magnitude + steer penalties -----------------
+        lc = getattr(self, "last_control", None)
+        th = float(getattr(lc, "throttle", 0.0)) if lc is not None else 0.0
+
+        r_smooth = 0.0
+        r_mag = 0.0
+        r_steer_speed = 0.0
+        r_steer_throttle = 0.0
+
+        st = 0.0
+        br = 0.0
+
+        if lc is not None:
+            br = float(getattr(lc, "brake", 0.0))
+            st = float(getattr(lc, "steer", 0.0))
+
+            r_mag = -K_MAG * (abs(st) + abs(th) + abs(br))
+
+            # 高速大转角惩罚： (v/v0)^2 * steer^2
+            if speed > STEER_SPEED_START:
+                ratio = speed / max(STEER_SPEED_START, 1e-6)
+                r_steer_speed = -K_STEER_SPEED * float(ratio ** 2) * float(st ** 2)
+
+            # 大舵角还给油：额外惩罚
+            if abs(st) > STEER_THROTTLE_STEER_TH and th > 0.2:
+                r_steer_throttle = -K_STEER_THROTTLE * float(abs(st) - STEER_THROTTLE_STEER_TH) * float(th)
+
+            # smoothness
+            if (getattr(self, "prev_control_for_smooth", None) is not None) and (speed > SMOOTH_ONLY_ABOVE_SPEED):
+                pc = self.prev_control_for_smooth
+                d_th = abs(th - float(getattr(pc, "throttle", 0.0)))
+                d_br = abs(br - float(getattr(pc, "brake", 0.0)))
+                d_st = abs(st - float(getattr(pc, "steer", 0.0)))
+
+                r_smooth = -K_SMOOTH * (2.0 * d_st + d_th + d_br)
+                r_smooth = max(SMOOTH_CLIP_MIN, float(r_smooth))
+
+            self.prev_control_for_smooth = lc
+
+        # ✅ progress 稳定门控：蛇形/大舵角时降低 r_wp
+        stability = float(np.clip(1.0 - 0.7 * abs(st), 0.25, 1.0))
+        r_wp *= stability
+
+        # ----------------- idle / no progress (EMA) -----------------
+        if not hasattr(self, "progress_ema"):
+            self.progress_ema = 0.0
+
+        self.progress_ema = (1.0 - PROGRESS_EMA_ALPHA) * float(self.progress_ema) + PROGRESS_EMA_ALPHA * float(
+            progress_signal)
+
+        is_idle = (abs(self.progress_ema) < NO_PROGRESS_FWD_THRESH) and (speed < NO_PROGRESS_SPEED_THRESH)
+
+        if not hasattr(self, "no_progress_steps"):
+            self.no_progress_steps = 0
+
+        if is_idle:
+            self.no_progress_steps += 1
+        else:
+            self.no_progress_steps = 0
+
+        r_idle = -K_IDLE_STEP if is_idle else 0.0
+
+        r_no_progress_terminal = 0.0
+        if self.no_progress_steps > int(NO_PROGRESS_LIMIT):
+            done = True
+            done_reason = "no_progress"
+            r_no_progress_terminal = -K_NO_PROGRESS_TERMINAL
+
+        # ----------------- terminal penalties -----------------
+        r_collision = 0.0
+        if collision_flag:
+            done = True
+            done_reason = "collision"
+            r_collision = -K_COLLISION_TERMINAL
+
+        r_offroad = 0.0
+        if (not done) and offroad:
+            done = True
+            done_reason = "offroad"
+            r_offroad = -K_OFFROAD_TERMINAL
+
+        # ----------------- RewardMonitor (optional) -----------------
         base_reward = 0.0
         rm_info = {}
-
-        if self.reward_monitor is not None and self.last_control is not None:
+        if getattr(self, "reward_monitor", None) is not None and lc is not None:
             planner_id_map = {"RULE": 0, "IL": 1, "RL": 2}
-            planner_id = planner_id_map.get(self.planner_mode, 2)  # 默认为 RL
+            planner_id = planner_id_map.get(getattr(self, "planner_mode", "RL"), 2)
 
             rm_total, comps = self.reward_monitor.update(
-                control=self.last_control,
+                control=lc,
                 planner_id=planner_id,
-                collision_flag=self.collision,
+                collision_flag=collision_flag,
                 done=done,
             )
+            rm_total = float(rm_total)
+            rm_total_clipped = float(np.clip(rm_total, -10.0, 10.0))
+            base_reward = 0.02 * rm_total_clipped
 
-            # 只当作轻量 shaping，避免动辄 -100 这种尺度
-            base_reward = 0.02 * rm_total
             rm_info = {
                 "reward_components": comps.to_dict(),
                 "planner_id": planner_id,
+                "rm_total": float(rm_total),
+                "rm_total_clipped": float(rm_total_clipped),
             }
 
-        # ==== 3. overtaking 专用的其他 shaping ====
+        # ----------------- alive bonus -----------------
+        r_alive = 0.01 if not done else 0.0
 
-        # (a) 车速奖励：鼓励保持中等速度，不要一直 0.x m/s
-        target_speed = getattr(self, "target_speed", 10.0)  # 10m/s ≈ 36km/h
-        norm_speed = min(speed, target_speed) / max(target_speed, 1e-3)
-        r_speed = 0.4 * norm_speed  # 不再 *50，而是 0~0.4 左右
+        # ----------------- final weights -----------------
+        components = {
+            "base_reward": float(base_reward),
 
-        # (b) 车道偏移惩罚：越偏离中心线惩罚越大
-        r_lane = -0.5 * lane_deviation
+            "r_wp": W_WP_FINAL * float(r_wp),
+            "r_speed": W_SPEED_FINAL * float(r_speed),
+            "r_lane": W_LANE_FINAL * float(r_lane),
 
-        # (c) 碰撞惩罚
-        r_collision = -5.0 if self.collision else 0.0
+            "r_danger": float(r_danger),
+            "r_mag": float(r_mag),
+            "r_smooth": float(r_smooth),
 
-        # (d) 长时间龟速惩罚：防止站桩拖到 timeout（包括原地打转但前进很少）
-        r_idle = 0.0
-        idle_limit = 50
-        if self.idle_steps > idle_limit:
-            r_idle = -10.0
-            done = True  # 直接终止这一局（idle fail）
+            "r_steer_speed": float(r_steer_speed),
+            "r_steer_throttle": float(r_steer_throttle),
+            "r_overspeed_global": float(r_overspeed_global),
+            "r_offroad_soft": float(r_offroad_soft),
+            "r_unknown_obstacle_guard": float(r_unknown_obstacle_guard),
 
-        # ==== 4. 汇总 reward ====
-        total_reward = (
-                base_reward +
-                r_wp +
-                r_speed +
-                r_lane +
-                r_collision +
-                r_idle
-        )
+            "r_idle": float(r_idle),
+            "r_no_progress_terminal": float(r_no_progress_terminal),
+            "r_offroad": float(r_offroad),
+            "r_collision": float(r_collision),
+            "r_alive": float(r_alive),
 
-        # ==== 5. 组织 info，方便 monitor 统计 ====
-        info = {
-            **rm_info,
-            "collision": float(self.collision),
-            "speed": float(speed),
-            "lane_deviation": float(lane_deviation),
-            "idle_steps": float(self.idle_steps),
-            "wp_delta": float(r_wp),  # 本帧朝 waypoint 的进度
-            # "wp_dist": float(dist_to_wp)  # 如果上面定义了 dist_to_wp，可以加上
+            "r_obstacle_clear": float(r_obstacle_clear),
+            "r_obstacle_sep": float(r_obstacle_sep),
+            "r_obstacle_stuck": float(r_obstacle_stuck),
+            "r_obstacle_speed": float(r_obstacle_speed),
+
+            "r_yref": 0.0,
         }
 
-        # 本帧的碰撞已经计入 reward，下一帧清零
+        total_reward = float(sum(components.values()))
+        self.last_reward_components = components.copy()
+
+        # ----------------- info (debug对齐用) -----------------
+        info = {
+            **rm_info,
+
+            "done": float(done),
+            "done_reason": done_reason,
+            "collision": float(collision_flag),
+
+            "speed": float(speed),
+            "lane_deviation": float(lane_deviation),
+            "offroad": float(offroad),
+            "offroad_thresh": float(offroad_thresh),
+            "lane_width": float(lane_width),
+
+            "no_progress_steps": float(self.no_progress_steps),
+            "progress_forward": float(progress_fwd),
+            "delta_dist": float(delta_dist),
+            "progress_signal": float(progress_signal),
+            "progress_ema": float(getattr(self, "progress_ema", 0.0)),
+
+            "nearest_obstacle_dist": float(nearest_dist) if nearest_dist is not None else -1.0,
+            "nearest_obstacle_fwd": float(nearest_fwd) if nearest_fwd is not None else 0.0,
+            "nearest_obstacle_lat": float(nearest_lat) if nearest_lat is not None else 0.0,
+            "obstacle_gate": float(obstacle_gate),
+
+            "have_obstacle_obs": float(HAVE_OBSTACLE_OBS),
+            "obs_len": float(len(getattr(self, "last_obs", []))) if getattr(self, "last_obs",
+                                                                            None) is not None else -1.0,
+
+            "r_collision": float(r_collision),
+            "r_offroad": float(r_offroad),
+            "r_offroad_soft": float(r_offroad_soft),
+
+            "r_steer_speed": float(r_steer_speed),
+            "r_steer_throttle": float(r_steer_throttle),
+            "r_overspeed_global": float(r_overspeed_global),
+            "r_unknown_obstacle_guard": float(r_unknown_obstacle_guard),
+        }
+
+        if lc is not None:
+            info["control_throttle"] = float(getattr(lc, "throttle", 0.0))
+            info["control_brake"] = float(getattr(lc, "brake", 0.0))
+            info["control_steer"] = float(getattr(lc, "steer", 0.0))
+
+        # reset collision latch
         self.collision = False
+        return float(total_reward), bool(done), info
 
-        return total_reward, done, info
-
-
-
-
-
-
-    # ----------------- 渲染 -----------------
+    # ----------------- render -----------------
     def _draw_display(self, image, throttle, steer, brake):
         try:
-            # ✅ 处理pygame事件，防止窗口"无响应"
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
-                    pass  # 忽略关闭事件，由训练循环控制
+                    pass
 
             draw_image(self.screen, image)
 
-            # HUD 面板
             panel_w, panel_h = 280, 120
             panel_x, panel_y = 12, 12
             border_radius = 14
             panel_bg = (15, 18, 22)
             panel_alpha = 150
-
             bar_w = 6
             planner_color = get_planner_color(self.planner_mode)
 
             panel = pygame.Surface((panel_w, panel_h), pygame.SRCALPHA)
             panel.fill((0, 0, 0, 0))
             try:
-                pygame.draw.rect(panel, (*panel_bg, panel_alpha), pygame.Rect(0, 0, panel_w, panel_h),
-                                 border_radius=border_radius)
+                pygame.draw.rect(
+                    panel,
+                    (*panel_bg, panel_alpha),
+                    pygame.Rect(0, 0, panel_w, panel_h),
+                    border_radius=border_radius,
+                )
             except TypeError:
                 pygame.draw.rect(panel, (*panel_bg, panel_alpha), pygame.Rect(0, 0, panel_w, panel_h))
             pygame.draw.rect(panel, (*planner_color, 220), pygame.Rect(0, 0, bar_w, panel_h),
@@ -1057,8 +2171,13 @@ class CarlaEnv(gym.Env):
             speed_kmh = speed_ms * 3.6
 
             if self.font_big is not None:
-                draw_text_with_shadow(panel, self.font_big, f"Planner: {self.planner_mode}",
-                                      (cur_x, cur_y), color=(240, 240, 240))
+                draw_text_with_shadow(
+                    panel,
+                    self.font_big,
+                    f"Planner: {self.planner_mode}",
+                    (cur_x, cur_y),
+                    color=(240, 240, 240),
+                )
             cur_y += 36
 
             if self.font_small is not None:
@@ -1067,20 +2186,155 @@ class CarlaEnv(gym.Env):
                 draw_text_with_shadow(panel, self.font_small, f"Steer:    {steer:.2f}", (cur_x, cur_y))
                 cur_y += line_gap
                 draw_text_with_shadow(panel, self.font_small, f"Brake:    {brake:.2f}", (cur_x, cur_y))
+
                 sp_text = f"{speed_kmh:5.1f} km/h"
                 sp_surf = self.font_small.render(sp_text, True, (220, 220, 220))
                 panel.blit(sp_surf, (panel_w - sp_surf.get_width() - 10, panel_h - sp_surf.get_height() - 8))
 
             self.screen.blit(panel, (panel_x, panel_y))
-
             pygame.display.flip()
+
             if self.clock is not None:
                 fps = int(round(1.0 / self.fixed_dt))
                 self.clock.tick(fps)
         except Exception:
             pass
 
-    # ----------------- 清理 -----------------
+    def _init_reward_plot(self):
+        """初始化 matplotlib reward 可视化（Agg 后端，保存图片）"""
+        try:
+            self.reward_fig, self.reward_ax = plt.subplots(figsize=(12, 6))
+
+            # 设置样式
+            self.reward_ax.set_facecolor('#1e1e1e')
+            self.reward_fig.patch.set_facecolor('#2d2d2d')
+            self.reward_ax.grid(True, alpha=0.3, linestyle='--')
+            self.reward_ax.axhline(y=0, color='white', linestyle='-', linewidth=0.5, alpha=0.5)
+
+            # 设置标签
+            self.reward_ax.set_xlabel('Reward Component', color='white', fontsize=10)
+            self.reward_ax.set_ylabel('Value', color='white', fontsize=10)
+            self.reward_ax.set_title('Reward Components', color='white', fontsize=12, fontweight='bold')
+
+            # 设置刻度颜色
+            self.reward_ax.tick_params(colors='white', labelsize=8)
+
+            plt.tight_layout()
+            print(f"[CarlaEnv] ✅ Matplotlib reward 可视化已初始化（保存到 {self.reward_save_dir}）")
+        except Exception as e:
+            print(f"[CarlaEnv] ⚠️ Matplotlib 初始化失败: {e}")
+            self.reward_fig = None
+
+    def _update_reward_plot(self):
+        """更新 matplotlib reward 可视化并保存图片"""
+        if not hasattr(self, 'last_reward_components') or not self.last_reward_components:
+            return
+
+        if self.reward_fig is None:
+            return
+
+        try:
+            # 定义要显示的 reward 组成部分（按重要性排序）
+            important_keys = [
+                ("base_reward", "Base"),
+                ("r_wp", "WP"),
+                ("r_speed", "Speed"),
+                ("r_lane", "Lane"),
+                ("r_collision", "Collision"),
+                ("r_offroad", "Offroad"),
+                ("r_alive", "Alive"),
+                ("r_danger", "Danger"),
+                ("r_obstacle_clear", "Obs\nClear"),
+                ("r_obstacle_sep", "Obs\nSep"),
+                ("r_obstacle_speed", "Obs\nSpeed"),
+                ("r_obstacle_stuck", "Obs\nStuck"),
+                ("r_smooth", "Smooth"),
+                ("r_mag", "Mag"),
+                ("r_steer_speed", "Steer\nSpeed"),
+                ("r_idle", "Idle"),
+            ]
+
+            # 提取数据
+            labels = []
+            values = []
+            colors = []
+
+            for key, label in important_keys:
+                if key in self.last_reward_components:
+                    value = self.last_reward_components[key]
+                    labels.append(label)
+                    values.append(value)
+
+                    # 根据数值选择颜色
+                    if abs(value) < 0.0001:
+                        colors.append('#666666')  # 灰色
+                    elif value > 0:
+                        colors.append('#00ff00')  # 绿色
+                    else:
+                        colors.append('#ff4444')  # 红色
+
+            # 清空并重绘
+            self.reward_ax.clear()
+
+            # 绘制柱状图
+            bars = self.reward_ax.bar(range(len(values)), values, color=colors, alpha=0.8, edgecolor='white', linewidth=0.5)
+
+            # 设置 x 轴标签
+            self.reward_ax.set_xticks(range(len(labels)))
+            self.reward_ax.set_xticklabels(labels, rotation=45, ha='right', fontsize=8)
+
+            # 在柱子上显示数值
+            for i, (bar, value) in enumerate(zip(bars, values)):
+                if abs(value) > 0.001:  # 只显示非零值
+                    height = bar.get_height()
+                    self.reward_ax.text(bar.get_x() + bar.get_width()/2., height,
+                                      f'{value:.3f}',
+                                      ha='center', va='bottom' if height > 0 else 'top',
+                                      fontsize=7, color='white', fontweight='bold')
+
+            # 计算总 reward
+            total_reward = sum(values)
+
+            # 重新设置样式
+            self.reward_ax.set_facecolor('#1e1e1e')
+            self.reward_ax.grid(True, alpha=0.3, linestyle='--', axis='y')
+            self.reward_ax.axhline(y=0, color='white', linestyle='-', linewidth=0.5, alpha=0.5)
+
+            # 设置标签和标题
+            self.reward_ax.set_xlabel('Reward Component', color='white', fontsize=10)
+            self.reward_ax.set_ylabel('Value', color='white', fontsize=10)
+
+            # 标题显示总 reward
+            title_color = '#00ff00' if total_reward >= 0 else '#ff4444'
+            self.reward_ax.set_title(f'Reward Components | Total: {total_reward:+.4f} | Episode: {self.episode_id} | Step: {self.episode_steps}',
+                                    color=title_color, fontsize=12, fontweight='bold')
+
+            # 设置刻度颜色
+            self.reward_ax.tick_params(colors='white', labelsize=8)
+
+            # 调整 y 轴范围
+            if values:
+                y_max = max(max(values), 0.1)
+                y_min = min(min(values), -0.1)
+                margin = (y_max - y_min) * 0.2
+                self.reward_ax.set_ylim(y_min - margin, y_max + margin)
+
+            plt.tight_layout()
+
+            # 保存图片（覆盖同一个文件，实时更新）
+            save_path = os.path.join(self.reward_save_dir, "reward_components_latest.png")
+            self.reward_fig.savefig(save_path, dpi=100, facecolor='#2d2d2d')
+
+            # 每100步保存一个带时间戳的版本
+            if self.episode_steps % 100 == 0:
+                timestamped_path = os.path.join(self.reward_save_dir,
+                                               f"reward_ep{self.episode_id}_step{self.episode_steps}.png")
+                self.reward_fig.savefig(timestamped_path, dpi=100, facecolor='#2d2d2d')
+
+        except Exception as e:
+            print(f"[CarlaEnv] ⚠️ Reward plot 更新失败: {e}")
+
+    # ----------------- cleanup -----------------
     def _cleanup_actors(self):
         def _safe_destroy(actor):
             try:
@@ -1089,17 +2343,50 @@ class CarlaEnv(gym.Env):
             except Exception:
                 pass
 
-        # 清理注册的临时 actor（包含锥桶、相机、碰撞等）
+        # ✅ 清理场景实例中的 actors
+        if self.scenario_instance is not None:
+            try:
+                self.scenario_instance.cleanup()
+                # 给 CARLA 更多时间来处理 actor 销毁（增加 tick 次数和等待时间）
+                if self.world.get_settings().synchronous_mode:
+                    try:
+                        for _ in range(10):  # ✅ 从 5 次增加到 10 次
+                            self.world.tick()
+                            time.sleep(0.1)  # ✅ 从 0.05 增加到 0.1
+                    except Exception:
+                        pass
+                print(f"[CarlaEnv] ✅ 场景 {self.scenario} 已清理")
+            except Exception as e:
+                print(f"[CarlaEnv] ⚠️ 场景清理失败: {e}")
+            self.scenario_instance = None
+
         for a in self._actors:
             _safe_destroy(a)
         self._actors = []
 
-        _safe_destroy(self.camera_display); self.camera_display = None
-        _safe_destroy(self.collision_sensor); self.collision_sensor = None
-        _safe_destroy(self.ego); self.ego = None
+        # ✅ 先停止 sensor 监听，再销毁
+        if self.camera_display is not None:
+            try:
+                self.camera_display.stop()
+            except Exception:
+                pass
+        _safe_destroy(self.camera_display)
+        self.camera_display = None
+
+        if self.collision_sensor is not None:
+            try:
+                self.collision_sensor.stop()
+            except Exception:
+                pass
+        _safe_destroy(self.collision_sensor)
+        self.collision_sensor = None
+
+        _safe_destroy(self.ego)
+        self.ego = None
+        self.obstacle_actors = []
 
 
-# ----------------- 工具函数 -----------------
+# ----------------- utils -----------------
 def vector_to_scalar(vector):
     return float(np.sqrt(vector.x ** 2 + vector.y ** 2 + vector.z ** 2))
 
@@ -1107,7 +2394,7 @@ def vector_to_scalar(vector):
 def draw_image(surface, image, blend=False):
     array = np.frombuffer(image.raw_data, dtype=np.uint8)
     array = np.reshape(array, (image.height, image.width, 4))
-    array = array[:, :, :3][:, :, ::-1]  # BGRA -> BGR -> RGB
+    array = array[:, :, :3][:, :, ::-1]
     image_surface = pygame.surfarray.make_surface(array.swapaxes(0, 1))
     if blend:
         image_surface.set_alpha(100)
@@ -1115,24 +2402,17 @@ def draw_image(surface, image, blend=False):
 
 
 def get_font(size=14):
-    """获取字体,如果系统字体不可用则使用pygame默认字体"""
     try:
         fonts = [x for x in pygame.font.get_fonts()]
         if len(fonts) == 0:
-            # 系统字体不可用,使用pygame默认字体
             return pygame.font.Font(None, size)
-
         default_font = "ubuntumono"
         font_name = default_font if default_font in fonts else fonts[0]
         font_path = pygame.font.match_font(font_name)
-
         if font_path is None:
-            # 如果找不到字体文件,使用默认字体
             return pygame.font.Font(None, size)
-
         return pygame.font.Font(font_path, size)
     except Exception:
-        # 任何错误都使用pygame默认字体
         return pygame.font.Font(None, size)
 
 

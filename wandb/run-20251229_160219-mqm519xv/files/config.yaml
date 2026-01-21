@@ -1,0 +1,204 @@
+_wandb:
+    value:
+        cli_version: 0.18.7
+        m:
+            - "1": step/speed
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": env_step
+              "6":
+                - 3
+              "7": []
+            - "1": debug/control_throttle
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": debug_reward/r_mag
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": step/action_steer
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": debug/progress_raw
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": debug/control_brake
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": debug_reward/r_wp
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": debug/control_steer
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": step/applied_bias
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": step/forced_throttle
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": step/action_throttle_brake
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": debug_reward/r_progress
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": debug_reward/r_offroad
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": debug_reward/base_reward
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": debug_reward/r_collision
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": debug_reward/r_speed
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": debug_reward/r_lane
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": episode_num
+              "6":
+                - 3
+              "7": []
+            - "1": step/reward
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": debug_reward/r_smooth
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": debug/lane_deviation
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": debug_reward/r_idle
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": step/y_ref
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+        python_version: 3.7.7
+        t:
+            "1":
+                - 1
+                - 55
+            "2":
+                - 1
+                - 3
+                - 55
+            "3":
+                - 2
+                - 7
+                - 13
+                - 15
+                - 16
+                - 23
+                - 55
+                - 61
+            "4": 3.7.7
+            "5": 0.18.7
+            "8":
+                - 5
+            "12": 0.18.7
+            "13": linux-x86_64
+action_bias_decay:
+    value: 0.999
+action_bias_strength:
+    value: 0.7
+algorithm:
+    value: PPO
+batch_size:
+    value: 256
+clip_ratio:
+    value: 0.2
+entropy_reg:
+    value: 0.05
+env:
+    value: CARLA
+episodes:
+    value: 300
+gamma:
+    value: 0.99
+lambda:
+    value: 0.95
+max_steps_per_episode:
+    value: 512
+num_parked_cars:
+    value: 4
+policy_lr:
+    value: 5e-05
+scenario:
+    value: parked_obstacles
+use_action_bias:
+    value: false
+use_forced_throttle:
+    value: false
+value_lr:
+    value: 0.0001
+wandb_step_log_interval:
+    value: 10

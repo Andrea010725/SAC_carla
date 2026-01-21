@@ -1,0 +1,580 @@
+_wandb:
+    value:
+        cli_version: 0.18.7
+        m:
+            - "1": step/action_throttle_brake_raw
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": env_step
+              "6":
+                - 3
+              "7": []
+            - "1": debug/steer_saturated
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": debug/std_y_ref
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": reward/r_no_progress_terminal
+              "5": 6
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": episode_num
+              "6":
+                - 3
+              "7": []
+            - "1": reward/r_steer_throttle
+              "5": 6
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": episode/avg_reward_per_step
+              "5": 6
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": debug_reward/r_obstacle_speed
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": debug_reward/r_overspeed_global
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": debug_reward/r_offroad_soft
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": step/y_ref
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": debug_reward/r_wp
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": step/applied_bias
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": reward/r_unknown_obstacle_guard
+              "5": 6
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": reward/r_overspeed_global
+              "5": 6
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": training/value_loss
+              "5": 6
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": reward/r_timeout
+              "5": 6
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": debug/std_throttle
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": debug_reward/sum_components
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": debug_reward/r_no_progress_terminal
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": episode/collision_count
+              "5": 6
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": reward/r_offroad_soft
+              "5": 6
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": reward/r_obstacle_sep
+              "5": 6
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": step/action_steer_raw
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": reward/r_mag
+              "5": 6
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": debug_reward/r_collision
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": debug_reward/r_obstacle_stuck
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": debug_reward/r_obstacle_sep
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": step/speed
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": debug_reward/r_steer_throttle
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": debug/yref_used
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": reward/r_alive
+              "5": 6
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": reward/r_wp
+              "5": 6
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": episode/done_reason
+              "5": 6
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": reward/r_speed
+              "5": 6
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": training/update_count
+              "5": 6
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": step/action_throttle_brake_applied
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": debug_reward/r_idle
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": debug_reward/r_obstacle_clear
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": debug_reward/components_diff
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": training/policy_loss
+              "5": 6
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": training/entropy
+              "5": 6
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": debug_reward/r_smooth
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": debug_reward/r_timeout
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": step/action_steer_applied
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": episode/no_collision
+              "5": 6
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": reward/r_danger
+              "5": 6
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": reward/r_offroad
+              "5": 6
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": debug_reward/r_unknown_obstacle_guard
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": debug_reward/r_offroad
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": debug_reward/total_reward
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": reward/r_collision
+              "5": 6
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": reward/r_steer_speed
+              "5": 6
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": reward/r_obstacle_speed
+              "5": 6
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": episode/steps
+              "5": 6
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": episode/ran_full
+              "5": 6
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": reward/r_smooth
+              "5": 6
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": debug_reward/r_danger
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": step/reward
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": step/forced_throttle
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": debug_reward/r_alive
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": reward/r_lane
+              "5": 6
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": training/entropy_rollout_mean
+              "5": 6
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": episode/duration
+              "5": 6
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": debug/steer_delta_from_yref
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": debug/std_lon_mean
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": debug_reward/r_steer_speed
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": debug/yref_steer_gain
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": episode/total_reward
+              "5": 6
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": episode/success
+              "5": 6
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": reward/r_obstacle_stuck
+              "5": 6
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": reward/r_obstacle_clear
+              "5": 6
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": reward/r_yref
+              "5": 6
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": debug_reward/base_reward
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": debug_reward/r_yref
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": debug_reward/r_speed
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": debug_reward/r_mag
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": debug_reward/r_lane
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": reward/base_reward
+              "5": 6
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": debug/std_steer
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": debug/steer_postprocess_delta
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": debug/std_lat_mean
+              "5": 2
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": reward/r_idle
+              "5": 6
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": episode/avg_speed
+              "5": 6
+              "6":
+                - 1
+                - 3
+              "7": []
+        python_version: 3.7.7
+        t:
+            "1":
+                - 1
+                - 55
+            "2":
+                - 1
+                - 3
+                - 55
+            "3":
+                - 2
+                - 7
+                - 13
+                - 15
+                - 16
+                - 23
+                - 55
+                - 61
+            "4": 3.7.7
+            "5": 0.18.7
+            "8":
+                - 5
+            "12": 0.18.7
+            "13": linux-x86_64
+action_bias_decay:
+    value: 0.999
+action_bias_strength:
+    value: 0.7
+algorithm:
+    value: PPO
+batch_size:
+    value: 256
+clip_ratio:
+    value: 0.2
+entropy_reg:
+    value: 0.05
+env:
+    value: CARLA
+episodes:
+    value: 300
+gamma:
+    value: 0.99
+lambda:
+    value: 0.95
+log_steer_saturation:
+    value: true
+max_steps_per_episode:
+    value: 512
+num_parked_cars:
+    value: 4
+policy_lr:
+    value: 5e-05
+scenario:
+    value: parked_obstacles
+steer_sat_threshold:
+    value: 0.999
+use_action_bias:
+    value: false
+use_forced_throttle:
+    value: false
+use_yref_mapping:
+    value: true
+value_lr:
+    value: 0.0001
+wandb_step_log_interval:
+    value: 10
+yref_gain:
+    value: 0.03
+yref_penalty:
+    value: 0.05

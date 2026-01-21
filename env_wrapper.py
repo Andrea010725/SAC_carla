@@ -4,6 +4,7 @@ import sys
 import ray
 import carla
 import numpy as np
+import gym
 
 from carla_base.carla_env import CarlaEnv
 
@@ -82,6 +83,8 @@ class ParallelEnv(object):
 
         # 调试统计：记录 planner 选择次数
         self.planner_stats = {"RULE": 0, "IL": 0, "RL": 0}
+
+        self.action_space = gym.spaces.Box(-1.0, 1.0, shape=(3,), dtype=np.float32)
 
     def reset(self):
         obs_list = [env.reset.remote() for env in self.env_list]
@@ -328,16 +331,29 @@ class CarlaRemoteEnv(object):
                 self.env.set_planner_mode(pname)
 
         else:
-            # 旧模式：线性映射原样保留
+            # ====== 旧模式：支持 2维 or 3维（第3维 y_ref 只透传）======
             if arr.size == 1:
                 # 若误传标量，扩展成 [throttle_brake, steer] = [0.0, a]
                 arr = np.array([0.0, float(arr[0])], dtype=np.float32)
 
-            mapped_action = self.low_bound + (arr - (-1.0)) * (
+            # ✅ 允许 2维 或 3维
+            if arr.size >= 3:
+                y_ref = float(arr[2])
+            else:
+                y_ref = 0.0
+
+            # ✅ 只取前两维用于控制
+            arr_ctrl = arr[:2].astype(np.float32)
+
+            # 线性映射原样保留（你 CarlaEnv 本身 action_space 是[-1,1]，这步等价于不变）
+            mapped_action = self.low_bound + (arr_ctrl - (-1.0)) * (
                     (self.high_bound - self.low_bound) / 2.0
             )
             mapped_action = np.clip(mapped_action, self.low_bound, self.high_bound)
+
             next_obs, reward, done, info = self.env.step(mapped_action)
+            info = info or {}
+            info["y_ref"] = y_ref
 
         self._last_obs = next_obs
         return next_obs, reward, done, info
@@ -358,17 +374,35 @@ class LocalEnv(object):
         self.low_bound = self.env.action_space.low[0]
         self.high_bound = self.env.action_space.high[0]
 
+        self.action_space = gym.spaces.Box(-1.0, 1.0, shape=(3,), dtype=np.float32)
+        self.action_dim = 3
+
     def reset(self):
         return self.env.reset()
 
     def step(self, model_output_act):
-        arr = np.asarray(model_output_act)
+        arr = np.asarray(model_output_act, dtype=np.float32)
         if arr.ndim == 0:
             arr = arr.reshape(1)
+
         assert np.all((arr <= 1.0 + 1e-3) & (arr >= -1.0 - 1e-3)), \
             'the action should be in range [-1.0, 1.0]'
-        mapped_action = self.low_bound + (arr - (-1.0)) * (
-            (self.high_bound - self.low_bound) / 2.0
+
+        # ✅ y_ref 透传
+        y_ref = float(arr[2]) if arr.size >= 3 else 0.0
+
+        # ✅ 控制只用前两维
+        if arr.size == 1:
+            arr_ctrl = np.array([0.0, float(arr[0])], dtype=np.float32)
+        else:
+            arr_ctrl = arr[:2].astype(np.float32)
+
+        mapped_action = self.low_bound + (arr_ctrl - (-1.0)) * (
+                (self.high_bound - self.low_bound) / 2.0
         )
         mapped_action = np.clip(mapped_action, self.low_bound, self.high_bound)
-        return self.env.step(mapped_action)
+
+        obs, reward, done, info = self.env.step(mapped_action)
+        info = info or {}
+        info["y_ref"] = y_ref
+        return obs, reward, done, info

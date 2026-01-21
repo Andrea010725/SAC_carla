@@ -1,786 +1,551 @@
 # agents/rule_based/agent.py
 from __future__ import annotations
-import math
-import random
+
+import os
 import sys
-from types import SimpleNamespace
-from scipy.optimize import minimize
+import time
+import random
+import argparse
+import glob
+import math
+from typing import Optional, Tuple, List
 
-from typing import List, Tuple
-
+# 你的 egg 路径（保留也没问题）
 sys.path.append("/home/ajifang/carla/PythonAPI/carla/dist/carla-0.9.15-py3.7-linux-x86_64.egg")
+
 import carla
-import numpy as np
-import ipdb
-
-# sys.path.append("/home/ajifang/czw/RL_selector")
-# from env.highway_obs import HighwayEnv, get_ego_blueprint
-# from env.tools import SceneManager
-# from agents.rule_based.vis_debug import draw_corridor, draw_ego_marker, TelemetryLogger, draw_lane_envelope, \
-#     annotate_lane_width
-# from agents.rule_based.vis_debug import *
-
-# 注释掉外部依赖，这些在当前项目中不需要
 
 
-# ====== 2) 极简 LaneRef：沿同一条驾驶车道采样，提供 xy<->(s,ey) ======
-class LaneRef:
-    def __init__(self, amap: carla.Map, seed_wp: carla.Waypoint, step: float = 1.0, max_len: float = 500.0):
-        pts, wps = [], []
-        wp = seed_wp
-        guard_ids = (wp.road_id, wp.section_id, wp.lane_id)
-        dist = 0.0
-        pts.append((wp.transform.location.x, wp.transform.location.y))
-        wps.append(wp)
-        while dist < max_len:
-            nxts = wp.next(step)
-            if not nxts:
-                break
-            wp = nxts[0]
-            if (wp.road_id, wp.section_id, wp.lane_id) != guard_ids:
-                break
-            pts.append((wp.transform.location.x, wp.transform.location.y))
-            wps.append(wp)
-            dist += step
-        self.P = np.asarray(pts, dtype=float)  # [N,2]
-        d = np.linalg.norm(np.diff(self.P, axis=0), axis=1)
-        self.s = np.concatenate([[0.0], np.cumsum(d)])  # [N]
-        tang = np.diff(self.P, axis=0)
-        tang = np.vstack([tang, tang[-1]])
-        self.tang = tang / (np.linalg.norm(tang, axis=1, keepdims=True) + 1e-9)
-        self.wps = wps  # 保存Waypoints，便于车道宽获取
-        self.step = float(step)
-
-    def _segment_index_and_t(self, x, y):
-        P = self.P;
-        xy = np.array([x, y], dtype=float)
-        v = xy - P[:-1]
-        seg = P[1:] - P[:-1]
-        seg_len2 = (seg[:, 0] ** 2 + seg[:, 1] ** 2) + 1e-9
-        t = np.clip((v[:, 0] * seg[:, 0] + v[:, 1] * seg[:, 1]) / seg_len2, 0.0, 1.0)
-        proj = P[:-1] + seg * t[:, None]
-        dist2 = np.sum((proj - xy[None, :]) ** 2, axis=1)
-        i = int(np.argmin(dist2))
-        return i, float(t[i]), proj[i]
-
-    def xy2se(self, x: float, y: float):
-        i, t, proj = self._segment_index_and_t(x, y)
-        s_val = self.s[i] + t * (self.s[i + 1] - self.s[i])
-        tx, ty = self.tang[i]
-        nx, ny = -ty, tx
-        ey = (x - proj[0]) * nx + (y - proj[1]) * ny
-        return float(s_val), float(ey)
-
-    def se2xy(self, s: float, ey: float):
-        s = float(np.clip(s, self.s[0], self.s[-1]))
-        i = int(np.searchsorted(self.s, s) - 1)
-        i = max(0, min(i, len(self.s) - 2))
-        r = (s - self.s[i]) / max(1e-9, self.s[i + 1] - self.s[i])
-        base = self.P[i] * (1 - r) + self.P[i + 1] * r
-        tx, ty = self.tang[i]
-        nx, ny = -ty, tx
-        x = base[0] + ey * nx
-        y = base[1] + ey * ny
-        return float(x), float(y)
-
-
-# ====== 3) 生成 EGO：若基于锥桶失败则兜底到地图spawn点 ======
-# 此函数依赖外部HighwayEnv，在当前项目中不使用，仅保留代码
-def spawn_ego_upstream_lane_center(env) -> carla.Actor:
+def _add_carla_pythonapi_paths():
     """
-    【带诊断信息的版本】
-    在第一个锥桶后方生成EGO，并打印详细的执行步骤。
+    加入 CARLA PythonAPI 路径，确保 agents/traffic_manager 等模块可用
     """
-    print("\n--- [EGO 生成诊断 START] ---")
-    world = env.world
-    amap = world.get_map()
-    # ego_bp = get_ego_blueprint(world)  # 外部函数，已注释
-    ego_bp = world.get_blueprint_library().find('vehicle.tesla.model3')  # 使用默认蓝图
+    candidates = []
+    if "CARLA_ROOT" in os.environ:
+        candidates.append(os.environ["CARLA_ROOT"])
+    candidates.append("/home/ajifang/carla")
 
-    # 第一步：尝试获取第一个锥桶的位置
-    first_tf = env.get_first_cone_transform()
+    for carla_root in candidates:
+        pyapi = os.path.join(carla_root, "PythonAPI")
+        if not os.path.isdir(pyapi):
+            continue
 
-    if first_tf is not None:
-        print(f"1. 成功获取到第一个锥桶的位置: {first_tf.location}")
+        # egg
+        dist_dir = os.path.join(pyapi, "carla", "dist")
+        eggs = glob.glob(os.path.join(dist_dir, "carla-*.egg"))
+        for e in eggs:
+            if e not in sys.path:
+                sys.path.append(e)
 
-        # 第二步：尝试在锥桶位置找到一个可行驶车道(Driving Lane)的路点
-        wp = amap.get_waypoint(first_tf.location, project_to_road=True, lane_type=carla.LaneType.Driving)
+        # PythonAPI/carla (包含 agents, navigation 等)
+        carla_pkg = os.path.join(pyapi, "carla")
+        if carla_pkg not in sys.path:
+            sys.path.append(carla_pkg)
 
-        if wp is not None:
-            print(f"2. 成功在锥桶位置附近找到可行驶车道的路点: {wp.transform.location}")
+        return True
 
-            # 第三步：循环尝试在路点后方不同距离生成车辆
-            for back in [37.0, 38.0, 39.0]:  # 使用完整的距离列表以提高成功率
-                print(f"3. 尝试在路点后方 {back}米 处寻找生成点...")
-                prevs = wp.previous(back)
-
-                if prevs:
-                    spawn_wp = prevs[0]
-                    print(f"   - 找到候选路点: {spawn_wp.transform.location}")
-
-                    tf = carla.Transform(
-                        carla.Location(
-                            x=spawn_wp.transform.location.x,
-                            y=spawn_wp.transform.location.y,
-                            z=spawn_wp.transform.location.z + 1.0
-                        ),
-                        carla.Rotation(yaw=float(spawn_wp.transform.rotation.yaw))
-                    )
-                    tf_location = carla.Location(
-                        x=spawn_wp.transform.location.x,
-                        y=spawn_wp.transform.location.y,
-                        z=spawn_wp.transform.location.z + 1.0
-                    )
-                    # 尝试生成
-                    ego = world.try_spawn_actor(ego_bp, tf)
-                    if ego:
-                        env.set_ego(ego)
-                        print(f"   ✅ [成功] 车辆已在后方 {back}米 处创建！")
-                        print("--- [EGO 生成诊断 END] ---\n")
-                        return ego , amap.get_waypoint(tf_location)
-                    else:
-                        print(f"   ❌ [失败] 生成失败。该位置可能被占用或无效。")
-                else:
-                    print(f"   - [跳过] 未能找到后方 {back}米 处的路点（可能道路太短）。")
-        else:
-            print("2. ❌ [失败] 在锥桶位置附近未能找到可行驶车道的路点。")
-    else:
-        print("1. ❌ [失败] 未能获取到第一个锥桶的位置。可能是场景生成失败。")
-
-    # 如果以上所有步骤都失败了，启动后备方案
-    print("\n[后备方案] 首选方案失败，现在尝试使用地图默认生成点...")
-    spawns = amap.get_spawn_points()
-    random.shuffle(spawns)
-    for i, tf in enumerate(spawns[:10]):
-        print(f"[后备方案] 尝试默认点 #{i + 1}...")
-        tf.location.z += 0.20
-        ego = world.try_spawn_actor(ego_bp, tf)
-        if ego:
-            env.set_ego(ego)
-            print(f"   ✅ [成功] 车辆已在默认点创建！")
-            print("--- [EGO 生成诊断 END] ---\n")
-            return ego , None
-
-    print("--- [EGO 生成诊断 END] ---\n")
-    # 如果所有方案都失败，抛出最终错误
-    raise RuntimeError("所有方案都已尝试，未能生成EGO。请检查上面的诊断日志确定失败环节。")
+    return False
 
 
-# ====== 4) 可行驶区域（走廊）——极简实现：地图车道线 + 障碍收紧 ======
-def lane_bounds_from_map(world: carla.World, ref: LaneRef, s_arr: np.ndarray, lane_margin: float = 0.20):
+if not _add_carla_pythonapi_paths():
+    print("[WARN] Could not locate CARLA PythonAPI automatically. "
+          "Please set CARLA_ROOT env var or edit fallback path.")
+
+
+def set_sync_mode(world: carla.World, enable: bool, fixed_delta_seconds: float = 0.05):
+    settings = world.get_settings()
+    settings.synchronous_mode = enable
+    settings.fixed_delta_seconds = fixed_delta_seconds if enable else None
+    world.apply_settings(settings)
+
+
+def spawn_ego(world: carla.World, blueprint_filter: str = "vehicle.tesla.model3") -> carla.Vehicle:
+    bp_lib = world.get_blueprint_library()
+    bps = bp_lib.filter(blueprint_filter)
+    if not bps:
+        bps = bp_lib.filter("vehicle.*")
+    bp = random.choice(bps)
+
+    spawn_points = world.get_map().get_spawn_points()
+    if not spawn_points:
+        raise RuntimeError("No spawn points found on this map.")
+
+    random.shuffle(spawn_points)
+    ego = None
+    for sp in spawn_points:
+        ego = world.try_spawn_actor(bp, sp)
+        if ego is not None:
+            break
+    if ego is None:
+        raise RuntimeError("Failed to spawn ego vehicle. Try clearing other vehicles or choose another map.")
+
+    return ego
+
+
+def spawn_npc_traffic(world: carla.World, traffic_manager: carla.TrafficManager,
+                      num_vehicles: int = 30, seed: int = 0) -> List[carla.Actor]:
     """
-    对每个 s_i：以地图 Driving 车道宽得到左右边界（ey，左正右负）。
-    返回 (left[], right[])。
+    生成 NPC：全部 TM autopilot 控制
     """
-    amap = world.get_map()
-    left = np.zeros_like(s_arr, dtype=float)
-    right = np.zeros_like(s_arr, dtype=float)
+    if num_vehicles <= 0:
+        return []
 
-    for i, s in enumerate(s_arr):
-        x, y = ref.se2xy(float(s), 0.0)
-        wp = amap.get_waypoint(carla.Location(x=x, y=y, z=0.0),
-                               project_to_road=True,
-                               lane_type=carla.LaneType.Driving)
-        if wp is None:
-            w = 3.5
-        else:
-            w = float(getattr(wp, "lane_width", 3.5)) or 3.5
-        half = 0.5 * w
-        left[i] = +half - lane_margin
-        right[i] = -half + lane_margin
-    return left, right
+    random.seed(seed)
+    traffic_manager.set_synchronous_mode(world.get_settings().synchronous_mode)
 
+    bp_lib = world.get_blueprint_library()
+    vehicle_bps = bp_lib.filter("vehicle.*")
+    spawn_points = world.get_map().get_spawn_points()
+    random.shuffle(spawn_points)
 
-def shrink_by_obstacles(world: carla.World, ego: carla.Actor, ref: LaneRef,
-                        s_arr: np.ndarray, left: np.ndarray, right: np.ndarray,
-                        r_xy: float = 35.0, s_fwd: float = 20.0,
-                        horizon_T: float = 1.5, dt: float = 0.2, obs_margin: float = 0.30):
-    """
-    在 s ∈ [s0, s0 + s_fwd] 内，用障碍“收紧”边界：
-      - 动态：中心点常速外推
-      - 静态：底面四角（若有bb）+ 中心点
-    """
-    ego_tf = ego.get_transform()
-    s0, _ = ref.xy2se(ego_tf.location.x, ego_tf.location.y)
-    s_min = s0
-    s_max = s0 + float(s_fwd)
+    actors: List[carla.Actor] = []
+    for sp in spawn_points:
+        if len(actors) >= num_vehicles:
+            break
 
-    s_start = float(s_arr[0])
-    ds = float(s_arr[1] - s_arr[0]) if len(s_arr) >= 2 else 1.0
+        bp = random.choice(vehicle_bps)
+        if bp.has_attribute("number_of_wheels"):
+            if int(bp.get_attribute("number_of_wheels")) < 4:
+                continue
 
-    def s_to_idx(s):
-        return int(np.clip(round((s - s_start) / max(1e-6, ds)), 0, len(s_arr) - 1))
+        npc = world.try_spawn_actor(bp, sp)
+        if npc is None:
+            continue
 
-    ego_loc = ego_tf.location
-    actors = world.get_actors()
-    steps = max(1, int(horizon_T / max(1e-6, dt)))
-
-    def consider_xy(x, y):
-        try:
-            s, ey = ref.xy2se(x, y)
-        except Exception:
-            return
-        if not (s_min <= s <= s_max):
-            return
-        k = s_to_idx(s)
-        # 只收紧车道内
-        if ey >= 0.0:
-            left[k] = min(left[k], ey - obs_margin)
-        else:
-            right[k] = max(right[k], ey + obs_margin)
+        npc.set_autopilot(True, traffic_manager.get_port())
+        actors.append(npc)
 
     for a in actors:
-        # 跳过自车/观众/hero
+        traffic_manager.distance_to_leading_vehicle(a, 2.0)
+        traffic_manager.vehicle_percentage_speed_difference(a, random.uniform(-10, 15))
+        traffic_manager.auto_lane_change(a, True)
+
+    return actors
+
+
+def follow_ego_spectator(world: carla.World, ego: carla.Vehicle, height: float = 3.0, dist: float = 8.0):
+    """
+    tick 之后更新更稳定：后上方 look-at
+    """
+    spec = world.get_spectator()
+    tf = ego.get_transform()
+    fwd = tf.get_forward_vector()
+
+    loc = tf.location - carla.Location(x=fwd.x * dist, y=fwd.y * dist, z=0.0)
+    loc.z += height
+
+    target = tf.location + carla.Location(z=1.2)
+    yaw = math.degrees(math.atan2(target.y - loc.y, target.x - loc.x))
+    rot = carla.Rotation(pitch=-12.0, yaw=yaw, roll=0.0)
+    spec.set_transform(carla.Transform(loc, rot))
+
+
+def tm_set_target_speed(tm: carla.TrafficManager, vehicle: carla.Vehicle, target_speed_mps: float):
+    """
+    让 TM 的速度更接近你的目标速度。
+    优先用 tm.set_desired_speed（若存在）；否则用 vehicle_percentage_speed_difference 近似。
+    """
+    target_kmh = float(target_speed_mps) * 3.6
+
+    # 1) 新版本/部分版本存在 set_desired_speed(vehicle, kmh)
+    if hasattr(tm, "set_desired_speed"):
+        try:
+            tm.set_desired_speed(vehicle, target_kmh)
+            return
+        except Exception:
+            pass
+
+    # 2) 退化：按 speed limit 算百分比差
+    try:
+        speed_limit = float(vehicle.get_speed_limit())  # km/h
+    except Exception:
+        speed_limit = 50.0
+
+    if speed_limit <= 1e-3:
+        speed_limit = 50.0
+
+    # desired = speed_limit * (1 - perc/100)
+    perc = (1.0 - (target_kmh / speed_limit)) * 100.0
+    perc = float(max(-80.0, min(80.0, perc)))  # 限幅
+
+    tm.vehicle_percentage_speed_difference(vehicle, perc)
+
+
+def tm_force_lane_change(tm: carla.TrafficManager, vehicle: carla.Vehicle, to_left: bool) -> bool:
+    """
+    兼容性封装：尽量调用 TM 的强制变道接口。
+    CARLA 0.9.15 常见是 force_lane_change(vehicle, bool_left)
+    若不存在，会打印可用方法，返回 False。
+    """
+    if hasattr(tm, "force_lane_change"):
+        try:
+            tm.force_lane_change(vehicle, to_left)
+            return True
+        except TypeError:
+            # 有些版本签名可能不同
+            try:
+                tm.force_lane_change(vehicle, bool(to_left))
+                return True
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    # 兜底：有的版本没有 force_lane_change，只有 auto_lane_change 相关
+    print("[TM] force_lane_change not available in this build.")
+    # 打印 lane change 相关方法名，方便你确认版本暴露了什么 API
+    names = [n for n in dir(tm) if "lane" in n.lower() or "change" in n.lower()]
+    print("[TM] Available TM methods containing 'lane'/'change':", names)
+    return False
+
+
+def _actor_is_relevant_obstacle(actor: carla.Actor) -> bool:
+    tid = (getattr(actor, "type_id", "") or "").lower()
+    return tid.startswith("vehicle.") or tid.startswith("walker.") or tid.startswith("static.")
+
+
+def _get_lane_width_safe(wp: Optional[carla.Waypoint]) -> float:
+    if wp is None:
+        return 3.5
+    try:
+        w = float(getattr(wp, "lane_width", 3.5))
+        return w if w > 0.1 else 3.5
+    except Exception:
+        return 3.5
+
+
+def detect_blocking_ahead(
+    world: carla.World,
+    ego: carla.Vehicle,
+    max_forward_dist: float = 22.0,
+    lane_margin: float = 0.7,
+    fov_deg: float = 35.0,
+) -> Tuple[bool, Optional[carla.Actor], float]:
+    """
+    纯 CARLA API 前方阻塞检测：
+    - 优先看“同一车道中心线附近”的障碍
+    - 结合扇区（FOV）避免把旁边/后方当阻塞
+    返回：(blocked, actor, forward_dist)
+    """
+    amap = world.get_map()
+    ego_tf = ego.get_transform()
+    ego_loc = ego_tf.location
+    fwd = ego_tf.get_forward_vector()
+    right = ego_tf.get_right_vector()
+
+    ego_wp = amap.get_waypoint(ego_loc, project_to_road=True, lane_type=carla.LaneType.Driving)
+    lane_w = _get_lane_width_safe(ego_wp)
+
+    cos_th = math.cos(math.radians(fov_deg))
+
+    best_actor = None
+    best_fd = 1e9
+
+    for a in world.get_actors():
         try:
             if a.id == ego.id:
                 continue
         except Exception:
             continue
-        role = getattr(a, "attributes", {}).get("role_name", "")
-        if role in ("hero", "spectator", "ego"):
+
+        if not _actor_is_relevant_obstacle(a):
             continue
 
-        # 距离预筛
         try:
-            loc = a.get_transform().location
+            aloc = a.get_transform().location
         except Exception:
             continue
-        dx, dy = loc.x - ego_loc.x, loc.y - ego_loc.y
-        if dx * dx + dy * dy > r_xy * r_xy:
+
+        dx = aloc.x - ego_loc.x
+        dy = aloc.y - ego_loc.y
+
+        # 前向/侧向分量（ego坐标系）
+        fd = fwd.x * dx + fwd.y * dy
+        if fd <= 0.5 or fd > max_forward_dist:
             continue
 
-        tid = getattr(a, "type_id", "").lower()
-        is_dyn = tid.startswith("vehicle.") or tid.startswith("walker.")
+        # 扇区角度（避免旁边很近但不在前方的）
+        dist = math.hypot(dx, dy) + 1e-6
+        dot = fd / dist
+        if dot < cos_th:
+            continue
 
-        if is_dyn:
-            vel = a.get_velocity()
-            for k in range(steps + 1):
-                t = k * dt
-                consider_xy(loc.x + vel.x * t, loc.y + vel.y * t)
-        else:
+        lat = right.x * dx + right.y * dy
+
+        # 侧向阈值：车道宽/2 + margin + 障碍物半宽
+        obs_half = 0.4
+        try:
             bb = getattr(a, "bounding_box", None)
             if bb is not None:
-                try:
-                    verts = bb.get_world_vertices(a.get_transform())
-                    verts = sorted(verts, key=lambda v: v.z)[:4]  # 底面四角
-                    for v in verts:
-                        consider_xy(v.x, v.y)
-                except Exception:
-                    consider_xy(loc.x, loc.y)
-            else:
-                consider_xy(loc.x, loc.y)
-
-    # 最小宽度保护 + 轻量平滑
-    min_w = 1.8
-    for i in range(len(s_arr)):
-        if left[i] - right[i] < min_w:
-            mid = 0.5 * (left[i] + right[i])
-            left[i] = mid + 0.5 * min_w
-            right[i] = mid - 0.5 * min_w
-    if len(s_arr) >= 3:
-        l2 = left.copy();
-        r2 = right.copy()
-        l2[1:-1] = (left[:-2] + 2.0 * left[1:-1] + left[2:]) * 0.25
-        r2[1:-1] = (right[:-2] + 2.0 * right[1:-1] + right[2:]) * 0.25
-        left[:] = 0.5 * left + 0.5 * l2
-        right[:] = 0.5 * right + 0.5 * r2
-
-
-# ====== 5) 规则型 Planner（极简：中线跟随 + 边界保护 + 简易速度）======
-class RuleBasedPlanner:
-    def __init__(self, ref: LaneRef, v_ref_base: float = 12.0):
-        self.ref = ref
-        self.v_ref_base = float(v_ref_base)
-        self.corridor = None
-        self._prev_delta = 0.0
-        self._prev_ax = 0.0
-
-    def update_corridor_simplified(self, world, ego, s_ahead=30.0, ds=1.0, ey_range=8.0, dey=0.15, horizon_T=2.0,
-                                   dt=0.2, debug_draw=True):
-        """
-        使用动态规划在Frenet坐标系下进行路径规划 (V9 - 修正重构逻辑中的障碍物判断基准)
-        """
-        if not ego:
-            self.corridor = None
-            return
-
-        ego_width = ego.bounding_box.extent.y * 2.0
-        PASSABLE_WIDTH_THRESHOLD = ego_width + 0.6
-        s0, ey0 = self.ref.xy2se(ego.get_location().x, ego.get_location().y)
-        s_nodes = np.arange(s0, s0 + s_ahead, ds)
-        ey_nodes = np.arange(-ey_range, ey_range + dey, dey)
-        num_s, num_ey = len(s_nodes), len(ey_nodes)
-
-        # ================= 2. 构建代价地图 (Cost Map) =================
-        cost_map = np.zeros((num_s, num_ey))
-        W_LANE = 20000.0
-        W_OPPOSITE_LANE = 50000.0
-        W_OFFSET = 50
-        offset_cost = W_OFFSET * (ey_nodes ** 2)
-        cost_map += offset_cost
-        amap = world.get_map()  # 提前获取地图对象
-
-        for i, s in enumerate(s_nodes):
-            s_idx_ref = np.argmin(np.abs(self.ref.s - s))
-            ref_waypoint = self.ref.wps[s_idx_ref]
-            ref_lane_id = ref_waypoint.lane_id
-            half_width = ref_waypoint.lane_width * 0.5
-
-            # 遍历该s值下的所有横向采样点ey
-            for j, ey_val in enumerate(ey_nodes):
-                # 1. 判断该(s, ey)点是否在当前参考车道内
-                if abs(ey_val) <= half_width:
-                    # 在当前车道内，不施加任何惩罚
-                    continue
-
-                # 2. 对于车道外的点，将其从 (s, ey) 转回世界坐标 (x, y)
-                x, y = self.ref.se2xy(s, ey_val)
-
-                # 3. 获取该世界坐标点对应的路点信息
-                cell_waypoint = amap.get_waypoint(carla.Location(x=x, y=y),
-                                                  project_to_road=False,
-                                                  lane_type=carla.LaneType.Any)
-
-                # 4. 根据路点信息施加惩罚
-                if cell_waypoint is None or cell_waypoint.lane_type != carla.LaneType.Driving:
-                    # 如果该点没有路点信息(在路外)，或者不是可行驶车道
-                    cost_map[i, j] = W_LANE
-                elif cell_waypoint.lane_id * ref_lane_id < 0:
-                    import ipdb
-                    # 如果该点是可行驶车道，但与参考车道方向相反
-                    cost_map[i, j] = W_OPPOSITE_LANE
-
-        actors = world.get_actors()
-        ego_loc = ego.get_location()
-        OBSTACLE_RADIUS_M = 0.8
-        for actor in actors:
-            if actor.id == ego.id or "spectator" in actor.type_id: continue
-            try:
-                loc, type_id = actor.get_location(), actor.type_id
-                if loc.distance(ego_loc) > s_ahead + 10: continue
-            except Exception:
-                continue
-            is_static_prop = type_id.startswith("static.prop.")
-            if is_static_prop:
-                try:
-                    s, ey = self.ref.xy2se(loc.x, loc.y)
-                    s_idx = int((s - s0) / ds)
-                    if not (0 <= s_idx < num_s): continue
-                    indices_to_penalize = np.where(np.abs(ey_nodes - ey) < OBSTACLE_RADIUS_M)[0]
-                    cost_map[s_idx, indices_to_penalize] = float('inf')
-                except IndexError:
-                    continue
-
-            # ==================== [新增代码 START] 对动态车辆进行轨迹预测 ====================
-            elif type_id.startswith("vehicle."):
-                # 定义预测参数
-                PREDICTION_HORIZON_S = 2.0  # 向前预测 2.0 秒
-                PREDICTION_STEP_S = 0.2  # 预测时间步长为 0.2 秒
-
-                try:
-                    # 1. 获取该车辆的当前速度和所在路点
-                    vel = actor.get_velocity()
-                    speed = math.sqrt(vel.x ** 2 + vel.y ** 2)
-
-                    # 如果车辆几乎是静止的，按静态障碍物处理，简化计算
-                    if speed < 0.5:
-                        s, ey = self.ref.xy2se(loc.x, loc.y)
-                        s_idx = int((s - s0) / ds)
-                        if 0 <= s_idx < num_s:
-                            indices = np.where(np.abs(ey_nodes - ey) < OBSTACLE_RADIUS_M + 1.0)[0]  # 给予更大半径
-                            cost_map[s_idx, indices] = float('inf')
-                        continue  # 处理下一个actor
-
-                    amap = world.get_map()
-                    start_wp = amap.get_waypoint(loc, project_to_road=True, lane_type=carla.LaneType.Driving)
-                    if not start_wp:
-                        continue
-
-                    # 2. 循环预测未来时间点的路径点
-                    for t in np.arange(0.0, PREDICTION_HORIZON_S, PREDICTION_STEP_S):
-                        # 计算在该时间点，车辆沿其车道行驶的距离
-                        dist = speed * t
-                        # 使用CARLA API获取未来路点
-                        # .next(distance) 会返回一个列表，包含沿车道中心线前方`distance`米处的路点
-                        future_wps = start_wp.next(dist)
-                        if not future_wps:
-                            break  # 如果前方没有路了，就停止对该车的预测
-
-                        future_wp = future_wps[0]
-                        future_loc = future_wp.transform.location
-
-                        # 3. 将预测到的未来位置点，在我们的代价地图上标记为障碍
-                        s, ey = self.ref.xy2se(future_loc.x, future_loc.y)
-
-                        s_idx = int((s - s0) / ds)
-                        if not (0 <= s_idx < num_s):
-                            continue  # 预测点超出了我们的规划范围
-
-                        # 确定障碍物影响的ey范围，并设置为无穷大代价
-                        # OBSTACLE_RADIUS_M 可以根据车辆宽度进行调整，这里沿用之前的设置
-                        indices_to_penalize = np.where(np.abs(ey_nodes - ey) < OBSTACLE_RADIUS_M)[0]
-                        cost_map[s_idx, indices_to_penalize] = float('inf')
-
-                except Exception as e:
-                    # 捕获可能的异常，例如xy2se转换失败，避免程序崩溃
-                    # print(f"Warning: Failed to predict actor {actor.id}. Error: {e}")
-                    continue
-
-
-        # ================= 3. DP求解 =================
-        dp_table = np.full((num_s, num_ey), float('inf'))
-        parent_table = np.zeros((num_s, num_ey), dtype=int)
-        start_ey_idx = np.argmin(np.abs(ey_nodes - ey0))
-        dp_table[0, start_ey_idx] = 0
-        W_STEER, W_JERK = 200.0, 500.0
-        for i in range(1, num_s):
-            for j in range(num_ey):
-                if np.isinf(cost_map[i, j]): continue
-                for k in range(num_ey):
-                    if np.isinf(dp_table[i - 1, k]): continue
-                    ey_curr, ey_prev = ey_nodes[j], ey_nodes[k]
-                    steering_cost = (ey_curr - ey_prev) ** 2
-                    jerk_cost = 0
-                    if i > 1:
-                        ey_grandparent = ey_nodes[parent_table[i - 1, k]]
-                        jerk_cost = (ey_curr - 2 * ey_prev + ey_grandparent) ** 2
-                    transition_cost = W_STEER * steering_cost + W_JERK * jerk_cost
-                    total_cost = dp_table[i - 1, k] + cost_map[i, j] + transition_cost
-                    if total_cost < dp_table[i, j]: dp_table[i, j] = total_cost; parent_table[i, j] = k
-
-        # ================= 4. 回溯最优路径 =================
-        optimal_path_indices = np.zeros(num_s, dtype=int)
-        if np.isinf(np.min(dp_table[-1, :])):
-            print("[DP Planner] 警告: 路径被完全阻塞!")
-            try:
-                last_s_idx = np.max(np.where(np.any(np.isfinite(dp_table), axis=1))[0])
-            except ValueError:
-                last_s_idx = 0
-            optimal_path_indices[last_s_idx] = np.argmin(dp_table[last_s_idx, :])
-            for i in range(last_s_idx - 1, -1, -1): optimal_path_indices[i] = parent_table[
-                i + 1, optimal_path_indices[i + 1]]
-            optimal_path_indices[last_s_idx:] = optimal_path_indices[last_s_idx]
-        else:
-            optimal_path_indices[-1] = np.argmin(dp_table[-1, :])
-            for i in range(num_s - 2, -1, -1): optimal_path_indices[i] = parent_table[
-                i + 1, optimal_path_indices[i + 1]]
-        optimal_path_ey = ey_nodes[optimal_path_indices]
-        num_valid_s = len(optimal_path_ey)
-
-        # ================= 5. [最终修正] 提取、决策、并按明确规则重构走廊 =================
-        final_upper_ey = np.zeros(num_valid_s)
-        final_lower_ey = np.zeros(num_valid_s)
-
-        # 设置一个合理的阈值，它必须低于 W_LANE 和 W_OPPOSITE_LANE
-        # 这样扫描时才能在这些惩罚区前停下。'inf'成本的障碍物自然也会让它停下。
-        HIGH_COST_THRESHOLD = 10000.0
-
-        for i in range(num_valid_s):
-            # optimal_path_ey[i] 是DP算法给出的在s_nodes[i]处的最佳ey位置
-            center_ey = optimal_path_ey[i]
-            center_idx = np.argmin(np.abs(ey_nodes - center_ey))
-            cost_slice = cost_map[i, :]
-
-            # 从最优路径点向左扫描边界
-            upper_idx = center_idx
-            while upper_idx + 1 < num_ey and cost_slice[upper_idx + 1] < HIGH_COST_THRESHOLD:
-                upper_idx += 1
-            final_upper_ey[i] = ey_nodes[upper_idx]
-
-            # 从最优路径点向右扫描边界
-            lower_idx = center_idx
-            while lower_idx - 1 >= 0 and cost_slice[lower_idx - 1] < HIGH_COST_THRESHOLD:
-                lower_idx -= 1
-            final_lower_ey[i] = ey_nodes[lower_idx]
-
-        # 直接将扫描结果作为最终走廊
-        corridor_upper_ey = final_upper_ey
-        corridor_lower_ey = final_lower_ey
-
-        # ================= 6. 可视化与输出 =================
-        corridor_s = s_nodes[:num_valid_s]
-        upper_pts, lower_pts = [], []
-        SAFETY_MARGIN_EY = 0.3
-        for s_val, upper_ey, lower_ey in zip(corridor_s, corridor_upper_ey - SAFETY_MARGIN_EY,
-                                             corridor_lower_ey + SAFETY_MARGIN_EY):
-            ux, uy = self.ref.se2xy(s_val, upper_ey)
-            lx, ly = self.ref.se2xy(s_val, lower_ey)
-            upper_pts.append(carla.Location(x=ux, y=uy))
-            lower_pts.append(carla.Location(x=lx, y=ly))
-
-        self.corridor = SimpleNamespace(s=corridor_s, lower=corridor_lower_ey, upper=corridor_upper_ey,
-                                        upper_pts_world=upper_pts, lower_pts_world=lower_pts,
-                                        center_path_ey=optimal_path_ey)
-
-        if debug_draw and self.corridor:
-            dbg, life_time = world.debug, 0.2
-            z_offset = ego.get_location().z + 0.2
-            for i in range(len(upper_pts) - 1):
-                width = upper_pts[i].distance(lower_pts[i])
-                is_blocked_viz = width < PASSABLE_WIDTH_THRESHOLD
-                color_upper = carla.Color(255, 0, 0) if is_blocked_viz else carla.Color(64, 255, 255)
-                color_lower = carla.Color(255, 0, 0) if is_blocked_viz else carla.Color(255, 235, 64)
-                p_upper_1 = carla.Location(upper_pts[i].x, upper_pts[i].y, z_offset)
-                p_upper_2 = carla.Location(upper_pts[i + 1].x, upper_pts[i + 1].y, z_offset)
-                p_lower_1 = carla.Location(lower_pts[i].x, lower_pts[i].y, z_offset)
-                p_lower_2 = carla.Location(lower_pts[i + 1].x, lower_pts[i + 1].y, z_offset)
-                dbg.draw_line(p_upper_1, p_upper_2, thickness=0.1, color=color_upper, life_time=life_time,
-                               persistent_lines=False)
-                dbg.draw_line(p_lower_1, p_lower_2, thickness=0.1, color=color_lower, life_time=life_time,
-                               persistent_lines=False)
-
-    # 搭建车辆模型
-    def vehicle_model_frenet(self, x, u, L=2.5):
-        """
-        Frenet坐标系下的车辆动力学模型.
-
-        :param x: 状态向量 [vx, ey, yaw_err, s]
-                        vx: 纵向速度 (m/s)
-                        ey: 横向偏移 (m)
-                        yaw_err: 航向角误差 (rad)
-                        s: 沿参考线的纵向距离 (m)
-        :param u: 控制向量 [accel, delta]
-                        accel: 加速度 (m/s^2)
-                        delta: 前轮转角 (rad)
-        :param L: 车辆轴距 (m)
-        :return: 状态量的变化率 [vx_dot, ey_dot, yaw_err_dot, s_dot]
-        """
-        vx, ey, yaw_err, s = x
-        accel, delta = u
-
-        # 假设横向速度 vy 近似为 0，侧偏角 beta 通过 yaw_err 和 ey_dot 近似
-
-        # 横向偏移的变化率
-        ey_dot = vx * math.sin(yaw_err)
-
-        # 航向角误差的变化率 (车辆的横摆角速度)
-        # 经典自行车模型： omega = v * tan(delta) / L
-        yaw_err_dot = vx * math.tan(delta) / L
-
-        # 纵向速度的变化率
-        vx_dot = accel
-
-        # 纵向距离 s 的变化率
-        s_dot = vx * math.cos(yaw_err)
-
-        return np.array([vx_dot, ey_dot, yaw_err_dot, s_dot])
-
-    def compute_control(self, ego: carla.Actor, dt: float = 0.05):
-        """
-        横向：纯追踪控制，取走廊中线作为目标路径
-        纵向：简单的P控制器，以基础参考速度为目标
-        """
-        tf = ego.get_transform()
-        vel = ego.get_velocity()
-        speed = float(math.hypot(vel.x, vel.y))
-        x, y = tf.location.x, tf.location.y
-
-        # --- 1. 检查走廊是否存在 ---
-        if self.corridor is None or len(self.corridor.s) < 3:
-            return 0.0, 0.0, 1.0, {}  # 紧急刹车
-
-        # --- 2. 定义MPC参数 ---
-        H = 10  # 预测时域 (Horizon), 例如10步，对应 10 * 0.1 = 1.0秒
-        # 车辆轴距 (一个合理的默认值)
-        L = ego.bounding_box.extent.x * 2.0
-
-        # --- 3. 获取当前状态 (Frenet坐标系) ---
-        s_now, ey_now = self.ref.xy2se(x, y)
-        # TODO: yaw_err_now 需要根据车辆当前朝向和参考线朝向计算得到
-        yaw_err_now = 0.0  # 简化处理，实际需要计算
-        x0 = np.array([speed, ey_now, yaw_err_now, s_now])
-
-        # --- 4. 定义目标/代价函数 ---
-        def objective_function(u):
-            u = u.reshape((H, 2))
-
-            # 权重参数 (方便统一调整)
-            W_CONTROL = 0.1
-            W_CONTROL_RATE = 0.1
-            W_EY = 10.0
-            W_SPEED = 2.0  # 🔧 提高 (原0.5 -> 2.0) - 强化速度跟踪
-
-            # a) 控制量和变化率代价
-            cost_control = np.sum(u[:, 0] ** 2) + np.sum(u[:, 1] ** 2)
-            cost_control_rate = np.sum(np.diff(u[:, 0]) ** 2) + np.sum(np.diff(u[:, 1]) ** 2)
-
-            # 【核心修正】在预测过程中累加每一步的代价
-            x_pred = x0.copy()
-            cost_ey_tracking = 0.0
-            cost_speed_tracking = 0.0
-
-            for k in range(H):
-                # 预测下一个状态
-                x_pred += self.vehicle_model_frenet(x_pred, u[k], L) * dt
-
-                # 【新增】累加每一步的横向偏移代价
-                cost_ey_tracking += x_pred[1] ** 2
-
-                # 【新增】累加每一步的速度跟踪代价
-                speed_error = self.v_ref_base - x_pred[0]
-                cost_speed_tracking += speed_error ** 2
-
-            # 最终总代价
-            total_cost = (cost_control * W_CONTROL +
-                          cost_control_rate * W_CONTROL_RATE +
-                          cost_ey_tracking * W_EY +
-                          cost_speed_tracking * W_SPEED)
-
-            return total_cost
-
-        # --- 5. 定义约束条件 ---
-        cons = []
-        # a) 边界约束
-        for k in range(H):
-            # 不等式约束 c(x) >= 0
-            # upper_bound - ey >= 0  和  ey - lower_bound >= 0
-            # 这里的 x_k 是第k步的预测状态，ey是x_k[1]
-            # 我们需要一个函数来根据s值获取边界
-            def get_bounds_at_s(s, corridor):
-                upper = np.interp(s, corridor.s, corridor.upper)
-                lower = np.interp(s, corridor.s, corridor.lower)
-                return upper, lower
-
-            # 由于约束函数需要以 (u) 为输入，我们需要在内部进行预测
-            def upper_constraint(u, k):
-                u = u.reshape((H, 2))
-                x_pred = x0.copy()
-                for i in range(k + 1):
-                    x_pred += self.vehicle_model_frenet(x_pred, u[i], L) * dt
-                s_pred, ey_pred = x_pred[3], x_pred[1]
-                upper, _ = get_bounds_at_s(s_pred, self.corridor)
-                return upper - ey_pred  # >= 0
-
-            def lower_constraint(u, k):
-                u = u.reshape((H, 2))
-                x_pred = x0.copy()
-                for i in range(k + 1):
-                    x_pred += self.vehicle_model_frenet(x_pred, u[i], L) * dt
-                s_pred, ey_pred = x_pred[3], x_pred[1]
-                _, lower = get_bounds_at_s(s_pred, self.corridor)
-                return ey_pred - lower  # >= 0
-
-            cons.append({'type': 'ineq', 'fun': lambda u, k=k: upper_constraint(u, k)})
-            cons.append({'type': 'ineq', 'fun': lambda u, k=k: lower_constraint(u, k)})
-
-        # b) 控制量范围约束
-        # 🔧 降低 accel_max (原3.0 -> 1.5) - 提高throttle输出
-        # 原理: throttle = accel / accel_max，降低分母可以提高throttle
-        accel_min, accel_max = -5.0, 1.5
-        delta_min, delta_max = -math.radians(30), math.radians(30)
-        bounds = [(accel_min, accel_max), (delta_min, delta_max)] * H
-
-        # --- 6. 求解优化问题 ---
-        u_initial_guess = np.zeros(2 * H)  # 初始猜测
-        result = minimize(objective_function, u_initial_guess, bounds=bounds, constraints=cons, method='SLSQP')
-
-        # --- 7. 提取并应用第一个控制指令 ---
-        optimal_u = result.x.reshape((H, 2))
-        optimal_accel = optimal_u[0, 0]
-        optimal_delta = optimal_u[0, 1]
-
-        # --- 8. 将加速度和转角转换为油门和刹车 ---
-        if optimal_accel > 0:
-            throttle = float(np.clip(optimal_accel / accel_max, 0, 1))
-            brake = 0.0
-        else:
-            throttle = 0.0
-            brake = float(np.clip(optimal_accel / accel_min, 0, 1))
-
-        steer = float(np.clip(optimal_delta / delta_max, -1, 1))
-
-        # (返回控制量和调试信息)
-        s_idx = np.argmin(np.abs(self.corridor.s - s_now))
-        dbg_info = {
-            's': s_now, 'ey': ey_now,
-            'lo': self.corridor.lower[s_idx], 'up': self.corridor.upper[s_idx],
-            'width': self.corridor.upper[s_idx] - self.corridor.lower[s_idx],
-            'v': speed, 'v_ref': self.v_ref_base,  # 使用基础速度作为参考
-            'delta': optimal_delta, 'steer': steer,
-            'throttle': throttle, 'brake': brake
-        }
-        return throttle, steer, brake, dbg_info
-
-
-# ====== 6) 主程序 ======
+                obs_half = float(bb.extent.y)
+        except Exception:
+            pass
+
+        lat_th = 0.5 * lane_w + lane_margin + obs_half
+        if abs(lat) > lat_th:
+            continue
+
+        # 同车道强化：若能拿到 actor waypoint，要求 road/lane 更一致
+        try:
+            awp = amap.get_waypoint(aloc, project_to_road=True, lane_type=carla.LaneType.Driving)
+            if ego_wp is not None and awp is not None:
+                if (awp.road_id != ego_wp.road_id) or (awp.lane_id != ego_wp.lane_id):
+                    # 不是同一车道：仍可能阻塞（比如路口），但降低优先级
+                    fd = fd + 6.0
+        except Exception:
+            pass
+
+        if fd < best_fd:
+            best_fd = fd
+            best_actor = a
+
+    if best_actor is None:
+        return False, None, 0.0
+    return True, best_actor, float(best_fd)
+
+
+def lane_exists(amap: carla.Map, ego_loc: carla.Location, to_left: bool) -> bool:
+    wp = amap.get_waypoint(ego_loc, project_to_road=True, lane_type=carla.LaneType.Driving)
+    if wp is None:
+        return False
+    nxt = wp.get_left_lane() if to_left else wp.get_right_lane()
+    if nxt is None:
+        return False
+    return nxt.lane_type == carla.LaneType.Driving
+
+
+def lane_is_clear(
+    world: carla.World,
+    ego: carla.Vehicle,
+    to_left: bool,
+    check_forward: float = 18.0,
+    check_backward: float = 8.0,
+    lateral_margin: float = 0.8,
+) -> bool:
+    """
+    粗略判断目标车道是否空（前方/后方是否有车）
+    - 用 ego 当前 waypoint 的左/右邻车道作为目标车道中心
+    - 检查其他车辆投影在 ego 坐标系下的前后/侧向距离
+    """
+    amap = world.get_map()
+    ego_tf = ego.get_transform()
+    ego_loc = ego_tf.location
+    fwd = ego_tf.get_forward_vector()
+    right = ego_tf.get_right_vector()
+
+    ego_wp = amap.get_waypoint(ego_loc, project_to_road=True, lane_type=carla.LaneType.Driving)
+    if ego_wp is None:
+        return False
+
+    tgt_wp = ego_wp.get_left_lane() if to_left else ego_wp.get_right_lane()
+    if tgt_wp is None or tgt_wp.lane_type != carla.LaneType.Driving:
+        return False
+
+    # 目标车道中心相对于 ego 车道中心的侧向偏移（近似用 lane_width）
+    lane_w = _get_lane_width_safe(ego_wp)
+    center_lat = (+lane_w) if to_left else (-lane_w)
+
+    for a in world.get_actors().filter("vehicle.*"):
+        if a.id == ego.id:
+            continue
+        try:
+            aloc = a.get_transform().location
+        except Exception:
+            continue
+
+        dx = aloc.x - ego_loc.x
+        dy = aloc.y - ego_loc.y
+        fd = fwd.x * dx + fwd.y * dy
+        lat = right.x * dx + right.y * dy
+
+        # 在目标车道中心附近？
+        if abs(lat - center_lat) > (0.5 * lane_w + lateral_margin):
+            continue
+
+        # 前后范围内是否有车
+        if -check_backward <= fd <= check_forward:
+            return False
+
+    return True
+
+
 def main():
-    env = HighwayEnv(host="127.0.0.1", port=2000, sync=True, fixed_dt=0.05).connect()
-    logger = None
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=2000)
+    parser.add_argument("--tm-port", type=int, default=8000)
+    parser.add_argument("--sync", action="store_true", help="Enable synchronous mode")
+    parser.add_argument("--dt", type=float, default=0.05, help="Fixed delta seconds (sync mode)")
+    parser.add_argument("--npc", type=int, default=20, help="Number of NPC vehicles to spawn")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--spectator", action="store_true")
+    parser.add_argument("--blueprint", default="vehicle.tesla.model3")
+
+    # 行为参数
+    parser.add_argument("--target-speed", type=float, default=10.0, help="m/s (TM tries to match via speed diff)")
+    parser.add_argument("--detect-dist", type=float, default=22.0, help="Forward distance to detect obstacles (m)")
+    parser.add_argument("--cooldown", type=float, default=3.0, help="Seconds between forced lane changes")
+    parser.add_argument("--lanechange-timeout", type=float, default=4.0, help="Timeout to consider lane change done")
+    args = parser.parse_args()
+
+    client = carla.Client(args.host, args.port)
+    client.set_timeout(10.0)
+
+    world = client.get_world()
+    original_settings = world.get_settings()
+
+    traffic_manager = client.get_trafficmanager(args.tm_port)
+    traffic_manager.set_random_device_seed(args.seed)
+
+    actors: List[carla.Actor] = []
+    ego: Optional[carla.Vehicle] = None
+    npcs: List[carla.Actor] = []
+
     try:
-        env.setup_scene(
-            num_cones=5, step_forward=3.0, step_right=0.35,
-            z_offset=0.0, min_gap_from_junction=15.0,
-            grid=5.0, set_spectator=True
-        )
+        # 同步模式
+        if args.sync:
+            set_sync_mode(world, True, fixed_delta_seconds=args.dt)
+            traffic_manager.set_synchronous_mode(True)
 
-        # 1. 先生成自车，并获取其准确的初始路点
-        ego, ego_wp = spawn_ego_upstream_lane_center(env)
+        # 生成 ego
+        ego = spawn_ego(world, blueprint_filter=args.blueprint)
+        actors.append(ego)
+        print(f"[EGO] Spawned: id={ego.id}, type={ego.type_id}, loc={ego.get_location()}")
 
-        # 如果生成失败，ego_wp 可能是 None，需要处理
-        # ego_wp = env.world.get_map().get_waypoint(ego.get_location(),
-        #                                               project_to_road=True,
-        #                                                       lane_type=carla.LaneType.Driving)
-        if ego_wp is None:
-            raise RuntimeError("无法为已生成的Ego车辆找到有效的路点。")
+        # 生成 NPC
+        npcs = spawn_npc_traffic(world, traffic_manager, num_vehicles=args.npc, seed=args.seed)
+        actors.extend(npcs)
+        print(f"[NPC] Spawned {len(npcs)} vehicles")
 
-        # 2. 【核心修改】直接使用自车的路点 ego_wp 作为参考线的种子点
-        print(f"[参考线生成] 使用自车所在位置的路点 {ego_wp.transform.location} 作为参考线起点。")
-        amap = env.world.get_map()
-        ref = LaneRef(amap, seed_wp=ego_wp, step=1.0, max_len=500.0)
+        # 把 ego 也交给 TM autopilot
+        ego.set_autopilot(True, traffic_manager.get_port())
+        traffic_manager.auto_lane_change(ego, True)
+        traffic_manager.distance_to_leading_vehicle(ego, 2.0)
+        tm_set_target_speed(traffic_manager, ego, args.target_speed)
 
-        idp = 0.0 #  这里切换周围交通参与者的密度
-        scenemanager = SceneManager(ego_wp, idp)
-        import ipdb
-        # ipdb.set_trace()
-        scenemanager.gen_traffic_flow(env.world, ego_wp)
+        # 一些可选：让 ego 更“守规矩”或更“激进”
+        # traffic_manager.ignore_lights_percentage(ego, 0.0)
+        # traffic_manager.ignore_signs_percentage(ego, 0.0)
+        # traffic_manager.ignore_vehicles_percentage(ego, 0.0)
 
-        planner = RuleBasedPlanner(ref, v_ref_base=12.0)
-        logger = TelemetryLogger(out_dir="logs_rule_based")
+        amap = world.get_map()
 
-        dt = 0.05
-        frame = 0
+        # 变道状态机
+        lane_change_in_progress = False
+        lane_change_start_lane_id = None
+        lane_change_start_time = 0.0
+        last_force_time = -1e9
 
-        # import ipdb
-        # ipdb.set_trace()
+        step = 0
+
         while True:
-            # 1) 更新走廊（始终有线；有障碍则收紧）
-            planner.update_corridor_simplified(env.world, ego)
+            # 推进仿真
+            if args.sync:
+                world.tick()
+            else:
+                world.wait_for_tick()
 
-            # 2) 控制
-            throttle, steer, brake, dbg = planner.compute_control(ego, dt=dt)
+            # spectator（tick 后）
+            if args.spectator and ego is not None:
+                follow_ego_spectator(world, ego)
 
-            # 3) 执行
-            env.apply_control(throttle=throttle, steer=steer, brake=brake)
+            if ego is None:
+                continue
 
-            # 4) 仿真步进 & 可视化
-            obs, _ = env.step()
-            if frame % 2 == 0:
-                tf = ego.get_transform()
-                draw_ego_marker(env.world, tf.location.x, tf.location.y)
+            # 变道完成判定：lane_id 变化 或 超时
+            ego_wp = amap.get_waypoint(ego.get_location(), project_to_road=True, lane_type=carla.LaneType.Driving)
+            ego_lane_id = ego_wp.lane_id if ego_wp else None
 
-            # 5) 打印 & 记录
-            if frame % 10 == 0:
-                print(f"[CTRL] s={dbg['s']:.1f} ey={dbg['ey']:.2f} | lo={dbg['lo']:.2f} up={dbg['up']:.2f} "
-                      f"w={dbg['width']:.2f} | v={dbg['v']:.2f}->{dbg['v_ref']:.2f} "
-                      f"| delta={dbg['delta']:.3f} steer={dbg['steer']:.2f}")
-                print(f"[LONG] th={dbg['throttle']:.2f} br={dbg['brake']:.2f}")
+            if lane_change_in_progress:
+                done = False
+                if lane_change_start_lane_id is not None and ego_lane_id is not None:
+                    if ego_lane_id != lane_change_start_lane_id:
+                        done = True
+                if (time.time() - lane_change_start_time) > args.lanechange_timeout:
+                    done = True
 
-            logger.log(frame, obs, dbg, ref)
-            frame += 1
+                if done:
+                    lane_change_in_progress = False
+                    lane_change_start_lane_id = None
+
+            # 如果正在变道，就别频繁触发新命令
+            if lane_change_in_progress:
+                if step % 40 == 0:
+                    print(f"[LC] in progress... ego_lane={ego_lane_id}")
+                step += 1
+                continue
+
+            # 检测前方阻塞
+            blocked, actor, fd = detect_blocking_ahead(
+                world, ego,
+                max_forward_dist=args.detect_dist,
+                lane_margin=0.7,
+                fov_deg=35.0,
+            )
+
+            if blocked:
+                now = time.time()
+                if now - last_force_time < args.cooldown:
+                    # 冷却中：不重复触发
+                    if step % 40 == 0:
+                        print(f"[OBS] blocked by {actor.type_id if actor else 'unknown'} at {fd:.1f}m, cooldown...")
+                    step += 1
+                    continue
+
+                # 选择变道方向：优先存在且更空的车道
+                left_ok = lane_exists(amap, ego.get_location(), to_left=True) and lane_is_clear(world, ego, to_left=True)
+                right_ok = lane_exists(amap, ego.get_location(), to_left=False) and lane_is_clear(world, ego, to_left=False)
+
+                # 选择策略：左优先（你也可以改成右优先或更复杂）
+                chosen = None
+                if left_ok and right_ok:
+                    chosen = True  # left
+                elif left_ok:
+                    chosen = True
+                elif right_ok:
+                    chosen = False
+
+                if chosen is None:
+                    print(f"[OBS] blocked at {fd:.1f}m but no safe adjacent lane. actor={actor.type_id if actor else 'unknown'}")
+                    step += 1
+                    continue
+
+                ok = tm_force_lane_change(traffic_manager, ego, to_left=chosen)
+                if ok:
+                    last_force_time = now
+                    lane_change_in_progress = True
+                    lane_change_start_lane_id = ego_lane_id
+                    lane_change_start_time = now
+                    side = "LEFT" if chosen else "RIGHT"
+                    print(f"[LC] FORCE {side} | blocked_by={actor.type_id if actor else 'unknown'} fd={fd:.1f}m "
+                          f"ego_lane={ego_lane_id}")
+                else:
+                    print("[LC] Failed to call TM force lane change (API not available).")
+
+            # 打印一些状态
+            if step % 60 == 0:
+                v = ego.get_velocity()
+                speed = math.sqrt(v.x * v.x + v.y * v.y + v.z * v.z)
+                print(f"[STEP {step:06d}] v={speed:.2f}m/s lane={ego_lane_id} blocked={blocked} fd={fd:.1f}")
+
+            step += 1
 
     except KeyboardInterrupt:
-        print("\n[Stop] 手动退出。")
+        print("\n[STOP] KeyboardInterrupt")
     finally:
+        # 恢复 settings
         try:
-            if logger is not None:
-                logger.save_csv()
-                logger.plot()
+            world.apply_settings(original_settings)
         except Exception:
             pass
-        try:
-            env.close()
-        except Exception:
-            pass
+
+        # 清理 actors
+        for a in actors[::-1]:
+            try:
+                a.destroy()
+            except Exception:
+                pass
+        print("[CLEANUP] Destroyed actors, restored world settings.")
 
 
 if __name__ == "__main__":
