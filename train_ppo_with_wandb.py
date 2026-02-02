@@ -37,6 +37,43 @@ except ImportError:
     print("   安装命令: pip install wandb")
 
 
+# ============================================================
+# ✅ 观测归一化类（修复P0级问题：缺少观测归一化）
+# ============================================================
+class RunningMeanStd:
+    """在线计算均值和标准差（Welford算法）
+
+    用于归一化观测，解决不同维度尺度差异巨大的问题：
+    - x, y坐标: ±500米
+    - yaw: ±180度
+    - speed: 0-10 m/s
+    """
+    def __init__(self, shape, epsilon=1e-4):
+        self.mean = np.zeros(shape, dtype=np.float32)
+        self.var = np.ones(shape, dtype=np.float32)
+        self.count = epsilon
+
+    def update(self, x):
+        """更新统计量（Welford在线算法）"""
+        batch_mean = np.mean(x, axis=0)
+        batch_var = np.var(x, axis=0)
+        batch_count = x.shape[0]
+
+        delta = batch_mean - self.mean
+        total_count = self.count + batch_count
+
+        self.mean = self.mean + delta * batch_count / total_count
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        M2 = m_a + m_b + np.square(delta) * self.count * batch_count / total_count
+        self.var = M2 / total_count
+        self.count = total_count
+
+    def normalize(self, x):
+        """归一化观测到均值0、标准差1"""
+        return (x - self.mean) / np.sqrt(self.var + 1e-8)
+
+
 class CarlaGymEnv(gym.Env):
     """
     CARLA Gym wrapper for PPO
@@ -65,9 +102,6 @@ class CarlaGymEnv(gym.Env):
         # self.action_space = gym.spaces.Box(
         #     low=-1.0, high=1.0, shape=(3,), dtype=np.float32
         # )
-        # ✅ 先创建底层 CarlaEnv
-        self.carla_env = CarlaEnv(config, 2000, 8000)
-
         # ✅ wrapper 直接复用底层 env 的 space，避免维度写死
         self.observation_space = self.carla_env.observation_space
         self.action_space = self.carla_env.action_space
@@ -115,8 +149,14 @@ class CarlaGymEnv(gym.Env):
 
         self.wandb_step_log_interval = int(getattr(config, "wandb_step_log_interval", 10))
 
+        # ✅ 观测归一化（修复P0级问题）
+        self.obs_normalizer = RunningMeanStd(shape=(self.observation_space.shape[0],))
+        self.normalize_obs = True  # 可以通过config控制
+        self.obs_clip = 10.0  # 归一化后裁剪到[-10, 10]
+
         print("\n[DEBUG] CarlaEnv y_ref switch after wrapper init:")
         print("  carla_env.use_yref_in_steer =", getattr(self.carla_env, "use_yref_in_steer", None))
+        print("  ✅ 观测归一化已启用: normalize_obs =", self.normalize_obs)
         print("  carla_env.yref_steer_gain   =", getattr(self.carla_env, "yref_steer_gain", None))
 
     def reset(self):
@@ -124,7 +164,15 @@ class CarlaGymEnv(gym.Env):
         self.current_episode += 1
         self._step_count = 0
         self.episode_collision = False
-        return np.asarray(obs, dtype=np.float32)
+
+        # ✅ 归一化观测
+        obs = np.asarray(obs, dtype=np.float32)
+        if self.normalize_obs:
+            self.obs_normalizer.update(obs.reshape(1, -1))
+            obs = self.obs_normalizer.normalize(obs)
+            obs = np.clip(obs, -self.obs_clip, self.obs_clip)
+
+        return obs
 
     def step(self, action):
         step_id = int(self.global_env_step)
@@ -162,6 +210,13 @@ class CarlaGymEnv(gym.Env):
         obs, reward, done, info = self.carla_env.step(action3)
         if info is None:
             info = {}
+
+        # ✅ 归一化观测
+        obs = np.asarray(obs, dtype=np.float32)
+        if self.normalize_obs:
+            self.obs_normalizer.update(obs.reshape(1, -1))
+            obs = self.obs_normalizer.normalize(obs)
+            obs = np.clip(obs, -self.obs_clip, self.obs_clip)
 
         # ----- y_ref penalty -----
         r_yref = 0.0
@@ -318,8 +373,8 @@ def train_with_logging(agent, env, logger, wandb_run=None, episodes=300, timeste
         done_reason = "unknown"
         last_info = {}  # ✅ 保存本 episode 最后一步 info，避免作用域/未定义问题
 
-        episode_entropy_sum = 0.0
-        episode_entropy_count = 0
+        episode_std_mean_sum = 0.0
+        episode_std_mean_count = 0
 
         logger.start_episode(episode)
 
@@ -345,13 +400,13 @@ def train_with_logging(agent, env, logger, wandb_run=None, episodes=300, timeste
 
             action, mean, std, log_prob, value = agent.predict(state_t)
 
-            # ===== entropy from std (Gaussian) =====
+            # ===== rollout randomness proxy (NO distribution assumption) =====
             std_np = std.numpy() if hasattr(std, "numpy") else np.asarray(std)
             std_np = np.asarray(std_np).reshape(-1)
-            var = np.square(std_np) + 1e-8
-            ent = 0.5 * np.sum(np.log(2.0 * np.pi * np.e * var))
-            episode_entropy_sum += float(ent)
-            episode_entropy_count += 1
+
+            # 仅记录 std 的均值作为“随机性 proxy”，不叫 entropy
+            episode_std_mean_sum += float(np.mean(std_np)) if std_np.size > 0 else 0.0
+            episode_std_mean_count += 1
 
             # ===== W&B debug std（按 env_step 对齐）=====
             if wandb_run is not None:
@@ -401,8 +456,17 @@ def train_with_logging(agent, env, logger, wandb_run=None, episodes=300, timeste
                 episode_collision_count += 1
 
             # 存经验
-            agent.log(actions=action, action_env=action_env, rewards=reward,
-                      distribution_mean=mean, distribution_std=std)
+            a = action.numpy().reshape(-1)  # [3]
+            m = mean.numpy().reshape(-1)  # [3]
+            s = std.numpy().reshape(-1)  # [3]
+
+            agent.log(
+                a_th=a[0], a_steer=a[1], a_yref=a[2],
+                std_th=s[0], std_steer=s[1], std_yref=s[2],
+                mean_th=m[0], mean_steer=m[1], mean_yref=m[2],
+                reward=float(reward),
+            )
+
             agent.memory.append(state_t, action, reward, value, log_prob)
 
             state = next_state
@@ -558,7 +622,7 @@ def train_with_logging(agent, env, logger, wandb_run=None, episodes=300, timeste
                 "training/value_loss": float(value_loss_tracker),
                 "training/entropy": float(entropy_tracker),
                 "training/update_count": int(update_count),
-                "training/entropy_rollout_mean": float(episode_entropy_sum / max(1, episode_entropy_count)),
+                "training/std_rollout_mean": float(episode_std_mean_sum / max(1, episode_std_mean_count)),
 
                 # ✅ early-stop 观测指标（非常建议记录，方便你看是不是在收敛）
                 "early/success_rate_W": float(succ_rate),
@@ -645,14 +709,17 @@ def train_ppo():
                     "env": "CARLA",
                     "scenario": "parked_obstacles",
                     "num_parked_cars": 4,
-                    "policy_lr": 5e-5,
-                    "value_lr": 1e-4,
+                    # ✅ P3: 修正超参数配置，与实际agent参数一致
+                    "policy_lr": 1e-4,           # 修正：从5e-5改为1e-4
+                    "value_lr": 2e-4,            # 修正：从1e-4改为2e-4
                     "gamma": 0.99,
                     "lambda": 0.95,
-                    "clip_ratio": 0.2,
-                    "entropy_reg": 0.05,
-                    "batch_size": 256,
-                    "episodes":  300,#  gai  300,
+                    "clip_ratio": 0.2,           # 修正：与agent一致
+                    "entropy_reg": 0.05,         # 修正：与agent一致
+                    "batch_size": 128,           # 修正：从256改为128
+                    "update_frequency": 2,       # 新增：与agent一致
+                    "optimization_steps": (10, 10),  # 新增：与agent一致
+                    "episodes": 300,
                     "max_steps_per_episode": 512,
                     "wandb_step_log_interval": 10,
 
@@ -800,17 +867,18 @@ def train_ppo():
     load_existing = False
     print("\n✅ obs_dim=30：禁用旧权重加载，从头开始训练")
 
+    # ✅ 修复P1级和P2级问题：优化超参数
     agent = PPOAgent(
         env=env,
         policy_lr=1e-4,
         value_lr=2e-4,
         gamma=0.99,
         lambda_=0.95,
-        clip_ratio=0.15,
-        entropy_regularization=0.01,
-        optimization_steps=(5, 5),
-        batch_size=256,
-        update_frequency=1,
+        clip_ratio=0.2,              # ✅ P2: 从0.15改为0.2（标准PPO值）
+        entropy_regularization=0.05,  # ✅ P1: 从0.01改为0.05（增加探索）
+        optimization_steps=(10, 10),  # ✅ P2: 从(5,5)改为(10,10)（提升数据效率）
+        batch_size=128,               # ✅ P2: 从256改为128（更多batch）
+        update_frequency=2,           # ✅ P2: 从1改为2（累积更多数据）
         name="ppo-carla-obs30",
         load=load_existing
     )

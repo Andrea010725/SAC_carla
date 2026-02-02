@@ -75,16 +75,29 @@ def gae(rewards, values, gamma: float, lambda_: float, normalize=False):
     return advantages
 
 
-def rewards_to_go(rewards, discount: float, decompose=False):
-    returns = discount_cumsum(rewards, discount=discount)[:-1]
+def rewards_to_go(rewards, discount: float, decompose=False, has_dummy: bool = False):
+    """
+    rewards:
+      - has_dummy=False: rewards shape [T] (真实环境 reward)
+      - has_dummy=True : rewards shape [T+1] (末尾 dummy reward)
+    returns:
+      - [T]
+    """
+    rewards = to_float(rewards)
+    rtg = discount_cumsum(rewards, discount=discount)
+
+    returns = rtg[:-1] if has_dummy else rtg  # ✅ 关键改动：不再无脑[:-1]
 
     if decompose:
-        returns_base, returns_exp = tf.map_fn(fn=decompose_number, elems=to_float(returns),
-                                              dtype=(tf.float32, tf.float32))
-
+        returns_base, returns_exp = tf.map_fn(
+            fn=decompose_number,
+            elems=to_float(returns),
+            dtype=(tf.float32, tf.float32)
+        )
         return tf.stack([returns_base, returns_exp], axis=1), returns
 
     return returns
+
 
 
 def is_image(x) -> bool:
@@ -121,7 +134,14 @@ def polyak_averaging(model: tf.keras.Model, old_weights: list, alpha=0.99):
 
 
 def clip_gradients(gradients: list, norm: float) -> list:
-    return [tf.clip_by_norm(grad, clip_norm=norm) for grad in gradients]
+    out = []
+    for g in gradients:
+        if g is None:
+            out.append(None)
+        else:
+            out.append(tf.clip_by_norm(g, clip_norm=norm))
+    return out
+
 
 
 def accumulate_gradients(grads1: list, grads2: Optional[list] = None) -> list:
@@ -145,12 +165,12 @@ def decompose_number(num: float) -> (float, float):
        - n = fractional_part * 10^exponent
        - e.g. 2.34 could be represented as (0.234, 1) such that 0.234 * 10^1 = 2.34
     """
-    # 🔧 NaN防护：检查输入
+    # �� NaN防护：检查输入
     if np.isnan(num) or np.isinf(num):
         # tf.print("⚠️  decompose_number: 输入是NaN/Inf，返回(0.0, 0.0)")
         return 0.0, 0.0
 
-    # 🔧 NaN防护：限制exponent范围，避免溢出
+    # �� NaN防护：限制exponent范围，避免溢出
     exponent = 0
     max_exponent = 30  # 10^30 已经是非常大的数
 
@@ -250,7 +270,6 @@ def space_to_flat_spec(space: gym.Space, name: str) -> Dict[str, tuple]:
     elif isinstance(space, spaces.Dict):
         for key, value in space.spaces.items():
             space_name = f'{name}_{key}'
-            # ipdb.set_trace()
             result = space_to_flat_spec(space=value, name=space_name)
 
             if isinstance(result, dict):
@@ -282,7 +301,6 @@ def space_to_spec(space: gym.Space) -> Union[tuple, Dict[str, Union[tuple, dict]
 
     spec = dict()
     for name, space in space.spaces.items():
-        # use recursion to handle arbitrary nested Dicts
         spec[name] = space_to_spec(space)
 
     return spec
@@ -292,7 +310,6 @@ def space_to_spec(space: gym.Space) -> Union[tuple, Dict[str, Union[tuple, dict]
 # -- TF utils
 # -------------------------------------------------------------------------------------------------
 
-# TODO: @tf.function
 def to_tensor(x, expand_axis=0):
     if isinstance(x, dict):
         t = dict()
@@ -351,7 +368,6 @@ def tf_chance(seed=None):
     return tf.random.uniform(shape=(1,), minval=0.0, maxval=1.0, seed=seed)
 
 
-# TODO: @tf.function
 def tf_normalize(x, eps=EPSILON):
     """Normalizes some tensor x to 0-mean 1-stddev"""
     x = to_float(x)
@@ -361,7 +377,7 @@ def tf_normalize(x, eps=EPSILON):
 def tf_sp_norm(x, eps=1e-3):
     x = to_float(x)
 
-    # 🔧 NaN防护：检查输入
+    # �� NaN防护：检查输入
     if tf.reduce_any(tf.math.is_nan(x)) or tf.reduce_any(tf.math.is_inf(x)):
         tf.print("⚠️  tf_sp_norm: 检测到NaN/Inf输入，返回零向量")
         return tf.zeros_like(x)
@@ -369,17 +385,16 @@ def tf_sp_norm(x, eps=1e-3):
     positives = x * to_float(x > 0.0)
     negatives = x * to_float(x < 0.0)
 
-    # 🔧 NaN防护：避免除以零
+    # �� NaN防护：避免除以零
     max_val = tf.reduce_max(x)
     min_val = tf.reduce_min(x)
 
-    # 如果max和min都接近0，返回原始x
     if tf.abs(max_val) < eps and tf.abs(min_val) < eps:
         return x
 
     result = (positives / (max_val + eps)) + (negatives / -(min_val - eps))
 
-    # 🔧 NaN防护：检查输出
+    # �� NaN防护：检查输出
     if tf.reduce_any(tf.math.is_nan(result)) or tf.reduce_any(tf.math.is_inf(result)):
         tf.print("⚠️  tf_sp_norm: 输出包含NaN/Inf，返回零向量")
         return tf.zeros_like(x)
@@ -391,7 +406,7 @@ def tf_shuffle_tensors(*tensors, indices=None):
     """Shuffles all the given tensors in the SAME way.
        Source: https://stackoverflow.com/questions/56575877/shuffling-two-tensors-in-the-same-order
     """
-    assert len(*tensors) > 0
+    assert len(tensors) > 0
 
     if indices is None:
         indices = tf.range(start=0, limit=tf.shape(tensors[0])[0], dtype=tf.int32)
@@ -400,9 +415,82 @@ def tf_shuffle_tensors(*tensors, indices=None):
     return [tf.gather(t, indices) for t in tensors]
 
 
-def data_to_batches(tensors: Union[List, Tuple], batch_size: int, shuffle_batches=False, seed=None,
+# ============================================================
+# ✅ 核心修复：对齐 from_tensor_slices 的第0维长度
+# ============================================================
+
+def _first_dim_len(x) -> int:
+    """
+    返回 x 的第0维长度（dict 则取所有 value 的最小值），用于对齐 dataset 输入。
+    这里默认训练是 eager（你现在就是 eager + wandb），因此允许 .numpy()。
+    """
+    if isinstance(x, dict):
+        if len(x) == 0:
+            return 0
+        return min(_first_dim_len(v) for v in x.values())
+
+    if tf.is_tensor(x):
+        if x.shape.rank is not None and x.shape.rank >= 1 and x.shape[0] is not None:
+            return int(x.shape[0])
+        # 动态 shape（eager）
+        return int(tf.shape(x)[0].numpy())
+
+    if isinstance(x, np.ndarray):
+        return int(x.shape[0])
+
+    # list/tuple 或其他序列
+    if hasattr(x, '__len__'):
+        return int(len(x))
+
+    return 0
+
+
+def _slice_first_dim(x, n: int):
+    """把 x 按第0维裁剪到 n（dict 递归裁剪）。"""
+    if isinstance(x, dict):
+        return {k: _slice_first_dim(v, n) for k, v in x.items()}
+
+    # tf.Tensor / np.ndarray / list 均支持 [:n]
+    try:
+        return x[:n]
+    except Exception:
+        return x
+
+
+def _align_tensors_first_dim(tensors):
+    """
+    tensors 可以是 dict / (list|tuple) / 单个 tensor
+    统一裁到共同最小长度 n，避免 from_tensor_slices 报 Dimensions ... not compatible
+    """
+    if isinstance(tensors, dict):
+        lens = [_first_dim_len(v) for v in tensors.values()]
+        n = min(lens) if len(lens) > 0 else 0
+        return {k: _slice_first_dim(v, n) for k, v in tensors.items()}, n, lens
+
+    if isinstance(tensors, (list, tuple)):
+        lens = [_first_dim_len(v) for v in tensors]
+        n = min(lens) if len(lens) > 0 else 0
+        out = type(tensors)(_slice_first_dim(v, n) for v in tensors)
+        return out, n, lens
+
+    # 单个对象
+    n = _first_dim_len(tensors)
+    return _slice_first_dim(tensors, n), n, [n]
+
+
+def data_to_batches(tensors: Union[List, Tuple, Dict], batch_size: int, shuffle_batches=False, seed=None,
                     drop_remainder=False, map_fn=None, prefetch_size=2, num_shards=1, skip=0, shuffle=False):
     """Transform some tensors data into a dataset of mini-batches"""
+
+    # ✅ 核心：强制对齐第0维长度
+    tensors, n, lens = _align_tensors_first_dim(tensors)
+
+    # 如果你想定位是谁不一致，可以临时打开：
+    # if len(set(lens)) > 1:
+    #     print("[data_to_batches] length mismatch:", lens, "-> aligned to", n)
+
+    if isinstance(skip, int) and n > 0 and skip >= n:
+        skip = 0
 
     dataset = tf.data.Dataset.from_tensor_slices(tensors).skip(count=skip)
 
@@ -410,7 +498,6 @@ def data_to_batches(tensors: Union[List, Tuple], batch_size: int, shuffle_batche
         dataset = dataset.shuffle(buffer_size=batch_size, seed=seed, reshuffle_each_iteration=True)
 
     if num_shards > 1:
-        # "observation skip trick" with tf.data.Dataset.shard()
         ds = dataset.shard(num_shards, index=0)
 
         for shard_index in range(1, num_shards):
@@ -420,124 +507,6 @@ def data_to_batches(tensors: Union[List, Tuple], batch_size: int, shuffle_batche
         dataset = ds
 
     if map_fn is not None:
-        # 'map_fn' is mainly used for 'data augmentation'
-        dataset = dataset.map(map_fn, num_parallel_calls=tf.data.experimental.AUTOTUNE,
-                              deterministic=True)
-
-    dataset = dataset.batch(batch_size, drop_remainder=drop_remainder)
-
-    if shuffle_batches:
-        dataset = dataset.shuffle(buffer_size=batch_size, seed=seed)
-
-    return dataset.prefetch(buffer_size=prefetch_size)
-
-def data_to_batches_1(tensors: Union[List, Tuple], batch_size: int, shuffle_batches=False, seed=None,
-                    drop_remainder=False, map_fn=None, prefetch_size=2, num_shards=1, skip=0, shuffle=False):
-    """Transform some tensors data into a dataset of mini-batches"""
-    # ipdb.set_trace()
-    # if isinstance(tensors, dict):
-    # tensors = tuple(tensor for tensor in tensors if hasattr(tensor, 'shape') and tensor.shape[0] > 0)
-#     expected_keys = ["states", "advantages", "log_probabilities", "speed", "similarity"]
-
-#     # 找到第一个非空 tensor 作为填充值的参考
-#     reference_tensor = next((t for t in tensors if t is not None and hasattr(t, 'shape') and t.shape[0] > 0), None)
-
-#     if reference_tensor is None:
-#         raise ValueError("All tensors are empty. Cannot determine shape for zero filling.")
-
-#     # 确保 batch_data 始终包含 5 个 Tensor，缺失的用 tf.zeros_like 填充
-#     batch_data = {
-#         key: tensors[i] if i < len(tensors) and tensors[i] is not None and hasattr(tensors[i], 'shape') and tensors[i].shape[0] > 0 
-#         else tf.zeros_like(reference_tensor)
-#         for i, key in enumerate(expected_keys)
-#     }
-
-    
-# # 重新生成符合 5 维的结构
-#     tensors = tuple(batch_data[key] for key in expected_keys) 
-#      # 
-#     dataset = tf.data.Dataset.from_tensor_slices(tensors).skip(count=skip)
-    # ipdb.set_trace()
-    # 只转换 tensors[0]，保持其他数据不变
-    # 处理 tensors[0]，确保字典中的所有 tensor 都不会是空的
-    # if isinstance(tensors, tuple) and isinstance(tensors[0], dict):
-#     # 处理第一个元素 states，确保其中的每个 tensor 都是有效的
-#         new_tensors_0 = {
-#             key: (tf.zeros_like(t) if tf.size(t) == 0 else t)
-#             for key, t in tensors[0].items()
-#         }
-
-#         # 处理其他的 tensors，确保它们也不会是空的
-#         new_tensors_rest = []
-#         for t in tensors[1:]:
-#             if tf.size(t) == 0:
-#                 # 如果是空张量，使用与第一个有效张量相同形状的零张量填充
-#                 new_tensors_rest.append(tf.zeros_like(new_tensors_0[list(new_tensors_0.keys())[0]]))
-#             else:
-#                 new_tensors_rest.append(t)
-
-#         # 检查 new_tensors_0 和 new_tensors_rest 中的张量维度是否一致
-#         for t in new_tensors_rest:
-#             if tf.size(t) > 0 and tf.shape(t)[0] != tf.shape(new_tensors_0[list(new_tensors_0.keys())[0]])[0]:
-#                 raise ValueError(f"Dimensions {tf.shape(t)} and {tf.shape(new_tensors_0[list(new_tensors_0.keys())[0]])} are not compatible")
-    
-    
-#     if isinstance(tensors, tuple) and isinstance(tensors[0], dict):
-#         new_tensors_0 = {
-#             key: (tf.zeros_like(t) if tf.size(t) == 0 else t)
-#             for key, t in tensors[0].items()
-#         }
-
-#         new_tensors_rest = []
-#         for t in tensors[1:]:
-#             if tf.size(t) == 0:
-#                 new_tensors_rest.append(tf.zeros_like(new_tensors_0[list(new_tensors_0.keys())[0]]))
-#             else:
-#                 new_tensors_rest.append(t)
-
-#     # 重新组合成新的 tensors，保持原有格式
-#     tensors = (new_tensors_0,) + tuple(new_tensors_rest)
-    dataset = tf.data.Dataset.from_tensor_slices(tensors).skip(count=skip)
-
-#     expected_keys = ["states", "advantages", "log_probabilities", "speed", "similarity"]
-
-#     tensor_list = list(tensors)
-
-#     # 找到第一个非空 tensor 作为填充值的参考
-#     reference_tensor = next((t for t in tensor_list if isinstance(t, tf.Tensor) and t.shape[0] > 0), None)
-
-#     if reference_tensor is None:
-#         raise ValueError("All tensors are empty or not tensors. Cannot determine shape for zero filling.")
-
-#     # 🚨 确保 batch_data 里都是 Tensor，不是 dict
-#     batch_data = {
-#         key: (
-#             tf.convert_to_tensor(tensor_list[i])  # ✅ 确保是 Tensor
-#             if i < len(tensor_list) and isinstance(tensor_list[i], tf.Tensor) and tensor_list[i].shape[0] > 0
-#             else tf.zeros_like(reference_tensor)  # ✅ 确保填充值的维度匹配
-#             )
-#         for i, key in enumerate(expected_keys)
-#     }
-
-    
-#     # 让 from_tensor_slices 处理字典，防止 states 变成 (64,)
-#     dataset = tf.data.Dataset.from_tensor_slices(batch_data).skip(count=skip)
-
-    if shuffle:
-        dataset = dataset.shuffle(buffer_size=batch_size, seed=seed, reshuffle_each_iteration=True)
-
-    if num_shards > 1:
-        # "observation skip trick" with tf.data.Dataset.shard()
-        ds = dataset.shard(num_shards, index=0)
-
-        for shard_index in range(1, num_shards):
-            shard = dataset.shard(num_shards, index=shard_index)
-            ds = ds.concatenate(shard)
-
-        dataset = ds
-
-    if map_fn is not None:
-        # 'map_fn' is mainly used for 'data augmentation'
         dataset = dataset.map(map_fn, num_parallel_calls=tf.data.experimental.AUTOTUNE,
                               deterministic=True)
 
@@ -549,7 +518,42 @@ def data_to_batches_1(tensors: Union[List, Tuple], batch_size: int, shuffle_batc
     return dataset.prefetch(buffer_size=prefetch_size)
 
 
-# TODO: @tf.function
+def data_to_batches_1(tensors: Union[List, Tuple, Dict], batch_size: int, shuffle_batches=False, seed=None,
+                      drop_remainder=False, map_fn=None, prefetch_size=2, num_shards=1, skip=0, shuffle=False):
+    """Transform some tensors data into a dataset of mini-batches"""
+
+    # ✅ 同样做对齐（避免你切换用这个函数时又炸）
+    tensors, n, lens = _align_tensors_first_dim(tensors)
+
+    if isinstance(skip, int) and n > 0 and skip >= n:
+        skip = 0
+
+    dataset = tf.data.Dataset.from_tensor_slices(tensors).skip(count=skip)
+
+    if shuffle:
+        dataset = dataset.shuffle(buffer_size=batch_size, seed=seed, reshuffle_each_iteration=True)
+
+    if num_shards > 1:
+        ds = dataset.shard(num_shards, index=0)
+
+        for shard_index in range(1, num_shards):
+            shard = dataset.shard(num_shards, index=shard_index)
+            ds = ds.concatenate(shard)
+
+        dataset = ds
+
+    if map_fn is not None:
+        dataset = dataset.map(map_fn, num_parallel_calls=tf.data.experimental.AUTOTUNE,
+                              deterministic=True)
+
+    dataset = dataset.batch(batch_size, drop_remainder=drop_remainder)
+
+    if shuffle_batches:
+        dataset = dataset.shuffle(buffer_size=batch_size, seed=seed)
+
+    return dataset.prefetch(buffer_size=prefetch_size)
+
+
 def tf_to_scalar_shape(tensor):
     return tf.reshape(tensor, shape=[])
 
@@ -572,7 +576,6 @@ def softplus(value=1.0):
     return activation
 
 
-# @tf.function
 def swish6(x):
     return tf.minimum(tf.nn.swish(x), 6.0)
 
@@ -595,28 +598,19 @@ def batch_norm_relu6(layer: tf.keras.layers.Layer):
 
 @tf.function
 def lisht(x):
-    """Non-Parameteric Linearly Scaled Hyperbolic Tangent Activation Function
-       Sources:
-        - https://www.tensorflow.org/addons/api_docs/python/tfa/activations/lisht
-        - https://arxiv.org/abs/1901.05894
-    """
+    """Non-Parameteric Linearly Scaled Hyperbolic Tangent Activation Function"""
     return tf.multiply(x, tf.nn.tanh(x))
 
 
 @tf.function
 def mish(x):
-    """A Self Regularized Non-Monotonic Neural Activation Function
-       Source:
-        - https://www.tensorflow.org/addons/api_docs/python/tfa/activations/mish
-    """
+    """A Self Regularized Non-Monotonic Neural Activation Function"""
     return tf.multiply(x, tf.nn.tanh(tf.nn.softplus(x)))
 
 
 @tf.function
 def kl_divergence(log_a, log_b):
-    """Kullback-Leibler divergence
-        - Source: https://www.tensorflow.org/api_docs/python/tf/keras/losses/KLD
-    """
+    """Kullback-Leibler divergence"""
     return log_a * (log_a - log_b)
 
 
@@ -690,19 +684,14 @@ def count_traces(traces_dir: str) -> int:
 
 
 def unpack_trace(trace: dict, unpack=True) -> Union[tuple, dict]:
-    """Reads a trace (i.e. a dict-like object created by np.load()) and unpacks it as a tuple
-       (state, action, reward, done).
-       - When `unpack is False` the (processed) trace dict is returned.
-    """
+    """Reads a trace (i.e. a dict-like object created by np.load()) and unpacks it as a tuple"""
     trace_keys = trace.keys()
     trace = {k: trace[k] for k in trace_keys}  # copy
 
     for name in ['state', 'action']:
-        # check if state/action space is simple (array, i.e sum == 1) or complex (dict of arrays)
         if sum(k.startswith(name) for k in trace_keys) == 1:
             continue
 
-        # select keys of the form 'state_xyz', then build a dict(state_xyz=trace['state_xyz'])
         keys = filter(lambda k: k.startswith(name + '_'), trace_keys)
         trace[name] = {k: trace[k] for k in keys}
 
@@ -712,7 +701,6 @@ def unpack_trace(trace: dict, unpack=True) -> Union[tuple, dict]:
     if unpack:
         return trace['state'], trace['action'], to_float(trace['reward']), trace['done']
 
-    # remove fields of the form `state_x`, `action_y`, ...
     for key in trace_keys:
         if 'state' in key or 'action' in key:
             if key != 'state' and key != 'action':
@@ -734,7 +722,6 @@ class Summary:
     def __init__(self, mode='summary', name=None, summary_dir='logs', keys: List[str] = None):
         self.stats = dict()
 
-        # filters what to log
         if isinstance(keys, list):
             self.allowed_keys = {k: True for k in keys}
         else:
@@ -744,7 +731,6 @@ class Summary:
             self.should_log = True
             self.use_summary = True
 
-        # TODO: review the usefulness of the "log" mode
         elif mode == 'log':
             self.should_log = True
             self.use_summary = False
@@ -767,21 +753,31 @@ class Summary:
             if key not in self.stats:
                 self.stats[key] = dict(step=0, list=[])
 
+            # tf tensor: 永远 append（不拆）
             if tf.is_tensor(value):
-                if np.prod(value.shape) > 1:
+                self.stats[key]['list'].append(value)
+                continue
+
+            # numpy array: 永远 append（不拆）
+            if isinstance(value, np.ndarray):
+                self.stats[key]['list'].append(value)
+                continue
+
+            # list/tuple: 如果是纯标量序列，可以 extend；否则 append
+            if isinstance(value, (list, tuple)):
+                if len(value) == 0:
+                    continue
+                if all(np.isscalar(v) for v in value):
                     self.stats[key]['list'].extend(value)
                 else:
                     self.stats[key]['list'].append(value)
+                continue
 
-            elif hasattr(value, '__iter__'):
-                self.stats[key]['list'].extend(value)
-            else:
-                self.stats[key]['list'].append(value)
+            self.stats[key]['list'].append(value)
 
     def should_log_key(self, key: str) -> bool:
         if self.allowed_keys is None:
             return True
-
         return key in self.allowed_keys
 
     def write_summaries(self):
@@ -792,30 +788,74 @@ class Summary:
             for summary_name, data in self.stats.items():
                 step = data['step']
                 values = data['list']
+                if values is None or len(values) == 0:
+                    continue
 
-                if 'weight-' in summary_name or 'bias-' in summary_name:
-                    tf.summary.histogram(name=summary_name, data=values, step=step)
+                imgs = []
+                for v in values:
+                    try:
+                        t = tf.convert_to_tensor(v)
+                    except Exception:
+                        continue
 
-                elif 'image_' in summary_name:
-                    tf.summary.image(name=summary_name, data=tf.concat(values, axis=0), step=step)
+                    r = t.shape.rank
+                    if r is None:
+                        try:
+                            r = len(t.numpy().shape)
+                        except Exception:
+                            continue
 
-                # elif tf.is_tensor(data) and num_dims(data) == 4:
-                #     # array of images
-                #     tf.summary.image(name=summary_name, data=data, step=step)
-                else:
-                    for i, value in enumerate(values):
-                        # TODO: 'np.mean' is a temporary fix...
-                        tf.summary.scalar(name=summary_name, data=np.mean(value), step=step + i)
-                        # tf.summary.scalar(name=summary_name, data=tf.reduce_mean(value), step=step + i)
+                    if r == 4:
+                        imgs.append(t)
+                    elif r == 3:
+                        imgs.append(tf.expand_dims(t, 0))
+                    elif r == 2:
+                        imgs.append(tf.expand_dims(tf.expand_dims(t, 0), -1))
+                    else:
+                        pass
 
-                # clear value_list, update step
+                if len(imgs) > 0:
+                    try:
+                        tf.summary.image(summary_name, tf.concat(imgs, axis=0), step=step)
+                    except Exception as e:
+                        print(f"[Summary] image write failed for {summary_name}: {e}")
+
+                    self.stats[summary_name]['step'] += len(values)
+                    self.stats[summary_name]['list'].clear()
+                    continue
+
+                flat_list = []
+                for v in values:
+                    try:
+                        t = tf.convert_to_tensor(v, dtype=tf.float32)
+                        t = tf.reshape(t, [-1])
+                        flat_list.append(t)
+                    except Exception:
+                        continue
+
+                if len(flat_list) == 0:
+                    self.stats[summary_name]['step'] += len(values)
+                    self.stats[summary_name]['list'].clear()
+                    continue
+
+                x = tf.concat(flat_list, axis=0)
+
+                try:
+                    tf.summary.histogram(summary_name, x, step=step)
+                except Exception as e:
+                    print(f"[Summary] histogram write failed for {summary_name}: {e}")
+
+                try:
+                    tf.summary.scalar(summary_name, tf.reduce_mean(x), step=step)
+                except Exception as e:
+                    print(f"[Summary] scalar write failed for {summary_name}: {e}")
+
                 self.stats[summary_name]['step'] += len(values)
                 self.stats[summary_name]['list'].clear()
 
             self.tf_summary_writer.flush()
 
-    def plot(self, colormap='Set3'):  # Pastel1, Set3, tab20b, tab20c
-        """Colormaps: https://matplotlib.org/tutorials/colors/colormaps.html"""
+    def plot(self, colormap='Set3'):
         num_plots = len(self.stats.keys())
         cmap = plt.get_cmap(name=colormap)
         rows = round(math.sqrt(num_plots))
@@ -838,29 +878,18 @@ class IncrementalStatistics:
         self.count = 0
 
         self.eps = epsilon
-        self.max_count = int(max_count)  # fix: cannot convert 10e8 to EagerTensor of type int32
+        self.max_count = int(max_count)
 
     def update(self, x, normalize=False):
-        old_mean = self.mean
-        new_mean = tf.reduce_mean(x)
-        m = self.count
+        x = to_float(x)
         n = tf.shape(x)[0]
-        c1 = m / (m + n)
-        c2 = n / (m + n)
 
-        # more numerically stable than `c3 = (m * n) / (m + n + eps) ** 2` (no square at the denominator,
-        # does not go to infinite but could became zero when m -> inf, so `m` should be clipped as well)
-        c3 = 1.0 / ((m / n) + 2.0 + (n / m))
-
-        self.mean = c1 * old_mean + c2 * new_mean
-        self.variance = c1 * self.variance + c2 * tf.math.reduce_variance(x) + c3 * (old_mean - new_mean) ** 2 + self.eps
-        self.std = tf.sqrt(self.variance)
-
-        # limit accumulating values to avoid numerical instability
-        self.count = min(self.count + n, self.max_count)
-
-        if normalize:
-            return self.normalize(x)
+        if self.count == 0:
+            self.mean = tf.reduce_mean(x)
+            self.variance = tf.math.reduce_variance(x) + self.eps
+            self.std = tf.sqrt(self.variance)
+            self.count = min(int(n.numpy()), self.max_count) if tf.executing_eagerly() else n
+            return self.normalize(x) if normalize else None
 
     def normalize(self, values, eps=NP_EPS):
         return to_float((values - self.mean) / (self.std + eps))

@@ -6,6 +6,7 @@ from tensorflow.keras.layers import *
 from tensorflow.keras.models import Model
 
 from typing import List, Union, Dict
+tfd = tfp.distributions
 
 from .. import utils
 
@@ -148,6 +149,24 @@ class PPONetwork(Network):
             return list(inputs.values())
         return [inputs]
 
+    def _get_base_normal(self, dist):
+        """
+        dist 可能是 Normal / TransformedDistribution(Normal, ...) / Independent(...) / DistributionLambda返回的对象
+        目标：返回一个有 .loc / .scale 的分布（通常是 Normal）
+        """
+        d = dist
+
+        # 1) 如果是 TransformedDistribution，base 在 d.distribution
+        if isinstance(d, tfd.TransformedDistribution):
+            d = d.distribution
+
+        # 2) 如果是 Independent，base 在 d.distribution
+        if isinstance(d, tfd.Independent):
+            d = d.distribution
+
+        # 3) 兜底：此时 d 应该就是 Normal（至少要有 loc/scale）
+        return d
+
     def _policy_weight_paths(self):
         """
         兼容旧版 agent.weights_path['policy'] 只有一个路径的情况：
@@ -205,7 +224,10 @@ class PPONetwork(Network):
 
         # ========== LON: p(throttle_brake | s, y_ref) ==========
         inputs_list = self._as_input_list(states)
-        dist_lon = lon_net(inputs_list + [y_ref], training=training)
+        if isinstance(states, dict):
+            dist_lon = lon_net({**states, "y_ref": y_ref}, training=training)
+        else:
+            dist_lon = lon_net([states, y_ref], training=training)
 
         lon_logp = dist_lon.log_prob(throttle_brake)
         if tf.rank(lon_logp) > 1:
@@ -230,10 +252,9 @@ class PPONetwork(Network):
         dist_lat = lat_net(inputs, training=False)
 
         if deterministic:
-            base_lat = dist_lat.distribution
-            lat = tf.tanh(base_lat.loc)  # [B,2]
+            lat = dist_lat.mean()
         else:
-            lat = dist_lat.sample()  # [B,2]
+            lat = dist_lat.sample()
 
         steer = lat[:, 0:1]
         y_ref = lat[:, 1:2]
@@ -242,10 +263,9 @@ class PPONetwork(Network):
         dist_lon = lon_net(inputs_list + [y_ref], training=False)
 
         if deterministic:
-            base_lon = dist_lon.distribution
-            throttle = tf.tanh(base_lon.loc)  # [B,1]
+            throttle = dist_lon.mean()
         else:
-            throttle = dist_lon.sample()  # [B,1]
+            throttle = dist_lon.sample()
 
         return tf.concat([throttle, steer, y_ref], axis=1)
 
@@ -291,9 +311,12 @@ class PPONetwork(Network):
         lat_logp = dist_lat.log_prob(lat_sample)
 
         # mean/std（可视化用近似）
-        base_lat = dist_lat.distribution  # Normal
+        base_lat = self._get_base_normal(dist_lat)
+        lat = tf.tanh(base_lat.loc)
         lat_mean_raw = base_lat.loc
         lat_std_raw = base_lat.scale
+
+        # mean 用 tanh 映射只是为了“日志可视化近似”
         lat_mean = tf.tanh(lat_mean_raw)
         lat_std = lat_std_raw
 
@@ -312,27 +335,32 @@ class PPONetwork(Network):
         lon_sample = tf.clip_by_value(lon_sample, -1.0 + eps, 1.0 - eps)
         lon_logp = dist_lon.log_prob(lon_sample)
 
-        base_lon = dist_lon.distribution  # Normal
+        base_lon = self._get_base_normal(dist_lon)
+        throttle = tf.tanh(base_lon.loc)
         lon_mean_raw = base_lon.loc
         lon_std_raw = base_lon.scale
         lon_mean = tf.tanh(lon_mean_raw)
         lon_std = lon_std_raw
 
-        throttle = lon_sample
 
         # 3) 拼最终 action / mean / std / log_prob
         action = tf.concat([throttle, steer, y_ref], axis=1)  # [B,3]
         mean = tf.concat([lon_mean, lat_mean[:, 0:1], lat_mean[:, 1:2]], axis=1)
         std = tf.concat([lon_std, lat_std[:, 0:1], lat_std[:, 1:2]], axis=1)
 
-        # log_prob：统一成 [B,3] 只是为了日志
-        if tf.rank(lat_logp) == 1:
-            lat_logp = tf.stack([lat_logp, lat_logp], axis=1)  # [B,2]
-        if tf.rank(lon_logp) == 1:
-            lon_logp = tf.expand_dims(lon_logp, axis=1)  # [B,1]
-        log_prob = tf.concat([lon_logp, lat_logp[:, 0:1], lat_logp[:, 1:2]], axis=1)  # [B,3]
+        # 计算 joint logp（用于 PPO）
+        # lat_logp_vec: [B]
+        lat_logp_vec = dist_lat.log_prob(lat_sample)
+        if tf.rank(lat_logp_vec) > 1:
+            lat_logp_vec = tf.reduce_sum(lat_logp_vec, axis=-1)
 
-        return action, mean, std, log_prob, value
+        lon_logp_vec = dist_lon.log_prob(lon_sample)
+        if tf.rank(lon_logp_vec) > 1:
+            lon_logp_vec = tf.reduce_sum(lon_logp_vec, axis=-1)
+
+        log_prob_joint = lon_logp_vec + lat_logp_vec  # [B]
+
+        return action, mean, std, log_prob_joint, value
 
     # ----------------- policy/value predict -----------------
     def policy_predict(self, inputs):

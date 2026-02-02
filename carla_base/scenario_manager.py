@@ -12,6 +12,10 @@ import random
 import math
 from typing import Optional, List, Tuple, Dict, Any
 import carla
+import sys
+sys.path.append("/home/ajifang/SAC_carla/carla_base/")
+from tiny_scenarios_obstacle import ahead_obstacle_scenario
+from carla_data_provider import CarlaDataProvider
 
 
 class ScenarioBase:
@@ -96,6 +100,34 @@ class ScenarioBase:
             "description": self.scenario_description,
             "num_actors": len(self.scenario_actors),
         }
+
+    def cleanup(self):
+        """通用清理：销毁本场景创建的所有actors"""
+        # 1) 先把仍在运动的 actor 停住（尤其是walker）
+        for actor in self.scenario_actors:
+            if actor is None:
+                continue
+            try:
+                if actor.type_id.startswith("walker.pedestrian"):
+                    stop_ctrl = carla.WalkerControl()
+                    stop_ctrl.direction = carla.Vector3D(0.0, 0.0, 0.0)
+                    stop_ctrl.speed = 0.0
+                    self.pedestrian.apply_control(stop_ctrl)
+            except:
+                pass
+
+        # 2) destroy（推荐倒序销毁更安全）
+        for actor in reversed(self.scenario_actors):
+            if actor is None:
+                continue
+            try:
+                if actor.is_alive:
+                    actor.destroy()
+            except:
+                pass
+
+        # 3) 清空列表
+        self.scenario_actors.clear()
 
 
 # ============================================================================
@@ -336,7 +368,7 @@ class ConesScenario(ScenarioBase):
         self.scenario_description = "锥桶避让场景"
 
         # 读取配置参数
-        self.cone_num = int(getattr(config, "cone_num", 15))
+        self.cone_num = int(getattr(config, "cone_num", 8))
         self.cone_step_behind = float(getattr(config, "cone_step_behind", 3.0))
         self.cone_step_lateral = float(getattr(config, "cone_step_lateral", 0.4))
         self.cone_z_offset = float(getattr(config, "cone_z_offset", 0.0))
@@ -567,10 +599,19 @@ class ConesScenario(ScenarioBase):
             wp = nexts[0]
             traveled += step
 
-        print(f"[Cones] 自车spawn位置: ({wp.transform.location.x:.1f}, {wp.transform.location.y:.1f})")
+        tf = wp.transform
+
+        # 关键：车辆 spawn 给一个安全高度，避免底盘/地面穿插
+        safe_loc = carla.Location(tf.location.x, tf.location.y, tf.location.z + 0.5)
+
+        # 可选但推荐：清掉 pitch/roll（道路接缝/坡度会让 vehicle spawn 更容易失败）
+        safe_rot = carla.Rotation(pitch=0.0, yaw=tf.rotation.yaw, roll=0.0)
+
+        print(f"[Cones] 自车spawn位置: ({safe_loc.x:.1f}, {safe_loc.y:.1f})")
         print(f"[Cones] 第一个锥桶位置: ({self.first_cone_transform.location.x:.1f}, {self.first_cone_transform.location.y:.1f})")
 
-        return wp.transform
+        return carla.Transform(safe_loc, safe_rot)
+
 
 
 # ============================================================================
@@ -628,9 +669,8 @@ class JaywalkerScenario(ScenarioBase):
         self.scenario_name = "jaywalker"
         self.scenario_description = "鬼探头场景（行人突然横穿）"
 
-        # 读取配置参数
         self.jaywalker_distance = float(getattr(config, "jaywalker_distance", 20.0))
-        self.jaywalker_speed = float(getattr(config, "jaywalker_speed", 2.5))
+        self.jaywalker_speed = float(getattr(config, "jaywalker_speed", 2.0))
         self.jaywalker_trigger_distance = float(getattr(config, "jaywalker_trigger_distance", 15.0))
         self.jaywalker_start_side = str(getattr(config, "jaywalker_start_side", "random"))
         self.use_occlusion_vehicle = bool(getattr(config, "use_occlusion_vehicle", False))
@@ -638,130 +678,352 @@ class JaywalkerScenario(ScenarioBase):
 
         self.ego_spawn_transform: Optional[carla.Transform] = None
         self.pedestrian: Optional[carla.Actor] = None
-        self.pedestrian_controller: Optional[carla.Actor] = None
         self.pedestrian_start_location: Optional[carla.Location] = None
         self.pedestrian_target_location: Optional[carla.Location] = None
         self.triggered: bool = False
 
-    def setup(self) -> bool:
-        """
-        实现鬼探头场景生成
+        self._ped_manual_velocity: bool = True  # ✅ 开启手动速度控制
+        self._ped_reach_eps: float = 0.6  # ✅ 到目标点多少米算到达
+        self._ped_stop_after_reach: bool = True  # ✅ 到达后停止
+        self._ped_vel_vector = None  # ✅ 保存当前速度向量（可选）
 
-        实现步骤：
-        1. 选择合适的道路位置（直道，远离路口）
-        2. 计算行人位置（自车前方指定距离）
-        3. 生成行人在道路一侧
-        4. 创建行人AI控制器
-        5. 计算行人目标位置（道路另一侧）
-        6. （可选）放置遮挡车辆
-        7. 设置自车spawn位置
+        # 记录“碰撞触发点”（用于更精确触发）
+        self.trigger_location: Optional[carla.Location] = None
+
+    # --------------------------
+    # 1) 选直道/远离路口 waypoint
+    # --------------------------
+    def _pick_random_straight_road(self) -> Optional[carla.Waypoint]:
+        candidates = [
+            wp for wp in self.map.generate_waypoints(5.0)
+            if wp.lane_type == carla.LaneType.Driving and (not wp.is_junction)
+        ]
+        if not candidates:
+            return None
+        random.shuffle(candidates)
+
+        # 过滤：前后都离路口远一点（避免你 cones 那种前推进 junction）
+        safe_gap = 25.0  # 你也可以用 config 控制
+        for wp in candidates[:400]:
+            if self._is_near_junction(wp, safe_gap):
+                continue
+            # 直道过滤（yaw变化不大）
+            if not self._is_straight_enough(wp, lookahead=15.0, yaw_thresh=15.0):
+                continue
+            return wp
+
+        return candidates[0]
+
+    def _is_straight_enough(self, wp: carla.Waypoint, lookahead=15.0, yaw_thresh=15.0) -> bool:
+        """判断一段路是否近似直道：前方若干米 yaw 变化不超过阈值"""
+        base_yaw = wp.transform.rotation.yaw
+        cur = wp
+        traveled = 0.0
+        step = 2.0
+        while traveled < lookahead:
+            nxt = cur.next(step)
+            if not nxt:
+                break
+            cur = nxt[0]
+            traveled += step
+            dyaw = abs((cur.transform.rotation.yaw - base_yaw + 180) % 360 - 180)
+            if dyaw > yaw_thresh:
+                return False
+        return True
+
+    def _is_near_junction(self, wp: carla.Waypoint, dist: float = 20.0) -> bool:
+        step = 1.0
+        # 前方
+        cur = wp
+        traveled = 0.0
+        while traveled < dist:
+            nxt = cur.next(step)
+            if not nxt:
+                break
+            cur = nxt[0]
+            traveled += step
+            if cur.is_junction:
+                return True
+        # 后方
+        cur = wp
+        traveled = 0.0
+        while traveled < dist:
+            prv = cur.previous(step)
+            if not prv:
+                break
+            cur = prv[0]
+            traveled += step
+            if cur.is_junction:
+                return True
+        return False
+
+    # --------------------------
+    # 2) 沿车道前进到指定距离
+    # --------------------------
+    def _advance_waypoint(self, start_wp: carla.Waypoint, distance: float) -> Optional[carla.Waypoint]:
+        traveled = 0.0
+        cur = start_wp
+        step = 1.0
+        while traveled < distance and (not cur.is_junction):
+            nxt = cur.next(step)
+            if not nxt:
+                break
+            nxt_wp = nxt[-1]
+            traveled += nxt_wp.transform.location.distance(cur.transform.location)
+            cur = nxt_wp
+        return cur
+
+    # --------------------------
+    # 3) 找 sidewalk waypoint（向左或向右找）
+    # --------------------------
+    def _find_sidewalk_waypoint(self, road_wp: carla.Waypoint, side: str) -> Optional[carla.Waypoint]:
         """
+        side: 'left' or 'right'
+        """
+        cur = road_wp
+        for _ in range(10):
+            if cur.lane_type == carla.LaneType.Sidewalk:
+                return cur
+            nxt = cur.get_left_lane() if side == "left" else cur.get_right_lane()
+            if nxt is None:
+                break
+            cur = nxt
+        return None
+
+    # --------------------------
+    # 4) sidewalk 上生成行人 transform（复用 GhostA 的 get_sidewalk_transform 思路）
+    # --------------------------
+    def _get_sidewalk_transform(self, sidewalk_wp: carla.Waypoint, face_to_road=True, z_offset=0.5) -> carla.Transform:
+        tf = sidewalk_wp.transform
+        rot = tf.rotation
+        # 让行人朝向道路（鬼探头更自然）
+        if face_to_road:
+            rot = carla.Rotation(pitch=0.0, yaw=rot.yaw + 270.0, roll=0.0)
+
+        loc = tf.location
+        loc = carla.Location(loc.x, loc.y, loc.z + z_offset)
+        return carla.Transform(loc, rot)
+
+    def _spawn_pedestrian(self, spawn_tf: carla.Transform) -> Optional[carla.Actor]:
+        lib = self.world.get_blueprint_library()
+
+        walker_bps = lib.filter("walker.pedestrian.*")
+        if not walker_bps:
+            return None
+        walker_bp = random.choice(walker_bps)
+
+        ped = self.world.try_spawn_actor(walker_bp, spawn_tf)
+        if ped is None:
+            return None
+
+        # ✅ 开启物理（可选，建议开）
+        try:
+            ped.set_simulate_physics(True)
+        except:
+            pass
+
+        return ped
+
+    # --------------------------
+    # 6) （可选）生成遮挡车辆
+    # --------------------------
+    def _spawn_occlusion_vehicle(self, base_wp: carla.Waypoint, distance_ahead: float = 0.0) -> Optional[carla.Actor]:
+        lib = self.world.get_blueprint_library()
+        veh_bp = lib.find("vehicle.audi.tt") if lib.find("vehicle.audi.tt") else lib.filter("vehicle.*")[0]
+
+        # 放在“自车车道右侧车道”或“路边”，这里给一个简单实现：放在右侧车道上
+        right_wp = base_wp.get_right_lane()
+        if right_wp is None or right_wp.lane_type != carla.LaneType.Driving:
+            right_wp = base_wp
+
+        occ_wp = self._advance_waypoint(right_wp, distance_ahead) if distance_ahead > 0 else right_wp
+        tf = occ_wp.transform
+
+        # 稍微抬高，避免 spawn fail
+        tf = carla.Transform(tf.location + carla.Location(z=0.5), tf.rotation)
+
+        v = self.world.try_spawn_actor(veh_bp, tf)
+        if v:
+            v.set_autopilot(False)
+        return v
+
+    # --------------------------
+    # setup 主逻辑（实现）
+    # --------------------------
+    def setup(self) -> bool:
         print(f"\n[Jaywalker] 开始生成鬼探头场景...")
         print(f"  - 行人距离: {self.jaywalker_distance}m")
         print(f"  - 行人速度: {self.jaywalker_speed}m/s")
         print(f"  - 触发距离: {self.jaywalker_trigger_distance}m")
         print(f"  - 遮挡车辆: {'是' if self.use_occlusion_vehicle else '否'}")
 
-        # TODO: 实现步骤
-        # 1. 选择起始waypoint
-        # start_wp = self._pick_random_straight_road()
-        # if not start_wp:
-        #     return False
+        # 1) 选直道/远离路口起点
+        start_wp = self._pick_random_straight_road()
+        if not start_wp:
+            print("[Jaywalker] ❌ 找不到合适直道路段")
+            return False
 
-        # 2. 计算行人生成位置
-        # pedestrian_wp = self._advance_waypoint(start_wp, self.jaywalker_distance)
-        # pedestrian_loc = self._calculate_pedestrian_start_location(pedestrian_wp)
+        # 2) 自车 spawn 点（就用 start_wp，建议给 z + 0.5，避免你 cones 那种失败）
+        ego_tf = start_wp.transform
+        ego_tf = carla.Transform(ego_tf.location + carla.Location(z=0.5),
+                                 carla.Rotation(pitch=0.0, yaw=ego_tf.rotation.yaw, roll=0.0))
+        self.ego_spawn_transform = ego_tf
 
-        # 3. 生成行人
-        # self.pedestrian = self._spawn_pedestrian(pedestrian_loc)
-        # if not self.pedestrian:
-        #     return False
+        # ======== 行人从车道线附近横穿（核心修复）========
+        ped_road_wp = self._advance_waypoint(start_wp, self.jaywalker_distance)
+        if not ped_road_wp:
+            print("[Jaywalker] ❌ 无法前进到行人触发位置")
+            return False
+        wp_tf = ped_road_wp.transform
+        right_vec = wp_tf.get_right_vector()
+        half_w = ped_road_wp.lane_width * 0.5
 
-        # 4. 创建行人控制器
-        # self.pedestrian_controller = self._create_pedestrian_controller(self.pedestrian)
-        # if not self.pedestrian_controller:
-        #     return False
+        # 行人离车道线的安全距离（别刚好压在线上）
+        edge_margin = 0.2  # 你可调：0.2~0.5都行
 
-        # 5. 计算目标位置
-        # self.pedestrian_target_location = self._calculate_pedestrian_target_location(pedestrian_wp)
+        # 决定从哪侧出现：left / right
+        if self.jaywalker_start_side == "random":
+            side = random.choice(["left", "right"])
+        else:
+            side = self.jaywalker_start_side.lower()
+            side = side if side in ["left", "right"] else "right"
 
-        # 6. （可选）放置遮挡车辆
-        # if self.use_occlusion_vehicle:
-        #     occlusion_vehicle = self._spawn_occlusion_vehicle(pedestrian_wp)
-        #     if occlusion_vehicle:
-        #         self.scenario_actors.append(occlusion_vehicle)
+        # left: 在左车道线附近 => offset 为负
+        # right: 在右车道线附近 => offset 为正
+        side_sign = 1.0 if side == "left" else -1.0
 
-        # 7. 设置自车spawn位置
-        # self.ego_spawn_transform = start_wp.transform
+        # 起点：在当前车道边界（车道线附近）
+        start_offset = side_sign * (half_w + 0.5)
 
-        # 8. 注册actors
-        # self.scenario_actors.append(self.pedestrian)
-        # self.scenario_actors.append(self.pedestrian_controller)
+        start_loc = carla.Location(
+            x=wp_tf.location.x + right_vec.x * start_offset,
+            y=wp_tf.location.y + right_vec.y * start_offset,
+            z=wp_tf.location.z + 0.5,  # 关键：+0.5 避免贴地spawn失败
+        )
 
-        print(f"[Jaywalker] ⚠️ 场景尚未实现")
-        print(f"\n实现要点：")
-        print(f"  1. 使用 walker.pedestrian.* blueprint 生成行人")
-        print(f"  2. 使用 controller.ai.walker 创建AI控制器")
-        print(f"  3. 行人初始位置：道路一侧（路边）")
-        print(f"  4. 行人目标位置：道路另一侧（路边）")
-        print(f"  5. 触发机制：需要在env.step()中检测自车距离")
-        print(f"  6. 当自车距离 < {self.jaywalker_trigger_distance}m 时，调用:")
-        print(f"     controller.start()")
-        print(f"     controller.go_to_location(target_location)")
-        print(f"     controller.set_max_speed({self.jaywalker_speed})")
+        # 终点：对侧车道线附近
+        target_offset = -start_offset
+        target_loc = carla.Location(
+            x=wp_tf.location.x + right_vec.x * target_offset,
+            y=wp_tf.location.y + right_vec.y * target_offset,
+            z=wp_tf.location.z + 0.5,
+        )
 
-        return False  # 未实现，返回False
+        self.pedestrian_start_location = start_loc
+        self.pedestrian_target_location = target_loc
+
+        # 行人初始朝向：面对横穿方向（可选但推荐）
+        dx = target_loc.x - start_loc.x
+        dy = target_loc.y - start_loc.y
+        yaw = math.degrees(math.atan2(dy, dx))  # 指向目标点
+
+        ped_spawn_tf = carla.Transform(
+            start_loc,
+            carla.Rotation(pitch=0.0, yaw=yaw, roll=0.0)
+        )
+
+        ped = self._spawn_pedestrian(ped_spawn_tf)
+        if ped is None:
+            print("[Jaywalker] ❌ 行人生成失败")
+            return False
+
+        self.pedestrian = ped
+        self.pedestrian_controller = None  # ✅ 明确不用controller
+        self.triggered = False
+
+        # ✅ 注册 actor（只注册行人）
+        self.scenario_actors.append(ped)
+
+        # 同步模式下稳定一下
+        if self.world.get_settings().synchronous_mode:
+            for _ in range(3):
+                self.world.tick()
+
+        print(f"[Jaywalker] ✅ 场景生成成功")
+        print(f"  - ego spawn: ({self.ego_spawn_transform.location.x:.1f}, {self.ego_spawn_transform.location.y:.1f})")
+        print(
+            f"  - ped spawn: ({self.pedestrian_start_location.x:.1f}, {self.pedestrian_start_location.y:.1f}) side={side}")
+        print(f"  - ped target: ({self.pedestrian_target_location.x:.1f}, {self.pedestrian_target_location.y:.1f})")
+
+        return True
 
     def get_spawn_transform(self) -> Optional[carla.Transform]:
-        """返回自车生成位置"""
         return self.ego_spawn_transform
 
+    # --------------------------
     def trigger_pedestrian(self):
-        """
-        触发行人移动（需要在env.step()中调用）
-
-        使用方法：
-        在 carla_env.py 的 step() 方法中添加：
-        ```python
-        if self.scenario_instance and hasattr(self.scenario_instance, 'trigger_pedestrian'):
-            ego_loc = self.ego.get_location()
-            self.scenario_instance.check_and_trigger(ego_loc)
-        ```
-        """
         if self.triggered:
             return
 
-        if self.pedestrian_controller and self.pedestrian_target_location:
-            try:
-                self.pedestrian_controller.start()
-                self.pedestrian_controller.go_to_location(self.pedestrian_target_location)
-                self.pedestrian_controller.set_max_speed(self.jaywalker_speed)
-                self.triggered = True
-                print(f"[Jaywalker] ✅ 行人开始横穿！")
-            except Exception as e:
-                print(f"[Jaywalker] ❌ 触发行人失败: {e}")
+        if not self.pedestrian or not self.pedestrian_target_location:
+            return
+
+        self.triggered = True
+        print(f"[Jaywalker] ✅ 行人开始横穿（manual velocity） speed={self.jaywalker_speed:.2f}")
 
     def check_and_trigger(self, ego_location: carla.Location):
-        """
-        检查自车距离并触发行人
-
-        Args:
-            ego_location: 自车当前位置
-        """
         if self.triggered or not self.pedestrian:
             return
 
-        # 计算距离
         ped_loc = self.pedestrian.get_location()
-        distance = math.hypot(ego_location.x - ped_loc.x, ego_location.y - ped_loc.y)
 
-        # 如果自车接近到触发距离，触发行人
-        if distance < self.jaywalker_trigger_distance:
+        # 这里推荐用“到触发点的距离”而不是到行人距离（更像 GhostA 的 collision_location）
+        if self.trigger_location is not None:
+            d = math.hypot(ego_location.x - self.trigger_location.x, ego_location.y - self.trigger_location.y)
+        else:
+            d = math.hypot(ego_location.x - ped_loc.x, ego_location.y - ped_loc.y)
+
+        if d < self.jaywalker_trigger_distance:
             self.trigger_pedestrian()
+
+    def tick_update(self):
+        """
+        ✅ 每一帧调用一次：用 WalkerControl 推动行人移动（不依赖 AI controller）
+        """
+        if (not self._ped_manual_velocity) or (not self.triggered):
+            return
+        if (self.pedestrian is None) or (self.pedestrian_target_location is None):
+            return
+
+        try:
+            ped_loc = self.pedestrian.get_location()
+            tgt = self.pedestrian_target_location
+
+            dx = tgt.x - ped_loc.x
+            dy = tgt.y - ped_loc.y
+            dist = math.hypot(dx, dy)
+
+            # ✅ 到达目标点：停下
+            if dist < self._ped_reach_eps:
+                stop_ctrl = carla.WalkerControl()
+                stop_ctrl.direction = carla.Vector3D(0.0, 0.0, 0.0)
+                stop_ctrl.speed = 0.0
+                self.pedestrian.apply_control(stop_ctrl)
+                return
+
+            # ✅ 方向单位化
+            ux = dx / (dist + 1e-6)
+            uy = dy / (dist + 1e-6)
+
+            # ✅ 速度下限（避免过慢引发不稳定）
+            speed = max(0.8, float(self.jaywalker_speed))
+
+            ctrl = carla.WalkerControl()
+            ctrl.direction = carla.Vector3D(ux, uy, 0.0)
+            ctrl.speed = speed
+            ctrl.jump = False
+
+            self.pedestrian.apply_control(ctrl)
+
+        except RuntimeError:
+            # actor 无效/被销毁
+            return
+        except Exception as e:
+            print(f"[Jaywalker] ⚠️ tick_update异常: {e}")
 
 
 # ============================================================================
-# 场景4: Trimma场景（待实现）
+# 场景4: Trimma场景
 # ============================================================================
 
 class TrimmaScenario(ScenarioBase):
@@ -769,7 +1031,7 @@ class TrimmaScenario(ScenarioBase):
     Trimma场景（包围突围）
 
     场景描述：
-    - 自车被其他车辆包围（前后左右都有车）
+    - 自车被其他车辆包围（前左右都有车）
     - 周围车辆以不同速度行驶（有的快有的慢）
     - 自车需要找到合适的gap，借道超车或变道
     - 考验自车的变道决策、超车能力和安全性
@@ -787,440 +1049,668 @@ class TrimmaScenario(ScenarioBase):
                   自车
                  (需要超车)
 
-       🚗            🚗             🚗
-       ↑             ↑              ↑
-      中速          后车            慢速
-                   (快速)
-    ```
-
     配置参数：
-    - num_surrounding_vehicles: 周围车辆数量（默认6，前后左右各1-2辆）
-    - front_vehicle_distance: 前车距离（米，默认15.0）
-    - rear_vehicle_distance: 后车距离（米，默认-10.0）
-    - lateral_vehicle_distance: 侧方车距离（米，默认5.0）
-    - vehicle_speed_range: 车速范围（m/s，默认[5.0, 12.0]）
-    - ego_initial_speed: 自车初始速度（m/s，默认8.0）
-    - min_lane_count: 最少车道数（默认3，需要多车道）
-
-    实现要点：
-    1. 地图选择：需要多车道道路（至少3车道）
-    2. 车辆生成：在自车前后左右生成车辆
-    3. 速度设置：使用Traffic Manager设置不同车速
-    4. 车辆控制：使用autopilot模式，保持车道和速度
-    5. 位置计算：
-       - 前车：自车前方15米，同车道
-       - 后车：自车后方10米，同车道
-       - 左车：自车左侧车道，前方5米
-       - 右车：自车右侧车道，后方5米
-    6. 速度分配：
-       - 前车：慢速（阻挡自车）
-       - 后车：快速（施加压力）
-       - 侧车：随机速度（制造gap）
-
-    训练价值：
-    - 测试变道决策能力
-    - 测试超车时机判断
-    - 测试多车交互
-    - 测试安全性（避免碰撞）
-    - 真实场景常见（高速公路、城市快速路）
-
-    难度：⭐⭐⭐⭐ 困难
+    - front_vehicle_distance: 前车距离（米，默认 18.0）
+    - side_vehicle_offset: 左右车相对自车的纵向偏移（米，默认 +3.0）
+        - 3.0 表示左右车在自车前方3米左右（更像夹击）
+        - 0.0 表示左右车和自车并排
+        - -3.0 表示左右车在自车后方3米
+    - min_lane_count: 最少车道数（默认 3，要求左右都存在 Driving Lane）
+    - tm_port: Traffic Manager 端口（默认 8000）
+    - tm_global_distance: TM 安全车距（默认 2.5m）
+    - front_speed_diff_pct: 前车速度差百分比（默认 -20，负数=比限速快）
+    - side_speed_diff_pct: 左右车速度差百分比（默认 +30，正数=比限速慢）
+    - disable_lane_change: 是否禁止周围车辆变道（默认 True）
     """
 
     def __init__(self, world: carla.World, carla_map: carla.Map, config: Any):
         super().__init__(world, carla_map, config)
         self.scenario_name = "trimma"
-        self.scenario_description = "Trimma场景（包围突围）"
+        self.scenario_description = "Trimma场景（左右夹击 + 前车更快）"
 
         # 读取配置参数
-        self.num_surrounding_vehicles = int(getattr(config, "num_surrounding_vehicles", 6))
-        self.front_vehicle_distance = float(getattr(config, "front_vehicle_distance", 15.0))
-        self.rear_vehicle_distance = float(getattr(config, "rear_vehicle_distance", -10.0))
-        self.lateral_vehicle_distance = float(getattr(config, "lateral_vehicle_distance", 5.0))
-        self.vehicle_speed_min = float(getattr(config, "vehicle_speed_min", 5.0))
-        self.vehicle_speed_max = float(getattr(config, "vehicle_speed_max", 12.0))
-        self.ego_initial_speed = float(getattr(config, "ego_initial_speed", 8.0))
+        self.front_vehicle_distance = float(getattr(config, "front_vehicle_distance", 18.0))
+        self.side_vehicle_offset = float(getattr(config, "side_vehicle_offset", 3.0))
         self.min_lane_count = int(getattr(config, "min_lane_count", 3))
+
+        self.tm_port = int(getattr(config, "tm_port", 8000))
+        self.tm_global_distance = float(getattr(config, "tm_global_distance", 2.5))
+
+        # ✅ 速度差：前车更快，左右更慢
+        self.front_speed_diff_pct = float(getattr(config, "front_speed_diff_pct", -60.0))
+        self.side_speed_diff_pct = float(getattr(config, "side_speed_diff_pct", +80.0))
+
+        self.disable_lane_change = bool(getattr(config, "disable_lane_change", True))
 
         self.ego_spawn_transform: Optional[carla.Transform] = None
         self.traffic_manager = None
 
-    def setup(self) -> bool:
-        """
-        实现Trimma场景生成
+        # 记录三辆关键车（便于 debug）
+        self.front_vehicle: Optional[carla.Actor] = None
+        self.left_vehicle: Optional[carla.Actor] = None
+        self.right_vehicle: Optional[carla.Actor] = None
 
-        实现步骤：
-        1. 选择多车道道路（至少3车道）
-        2. 确定自车spawn位置（中间车道）
-        3. 生成前车（同车道，前方15米，慢速）
-        4. 生成后车（同车道，后方10米，快速）
-        5. 生成左侧车辆（左车道，前方5米，随机速度）
-        6. 生成右侧车辆（右车道，后方5米，随机速度）
-        7. 设置所有车辆的autopilot和速度
-        8. 设置自车初始速度
+    # --------------------------
+    # 1) 选择一个“左右都存在 Driving lane”的中心车道 waypoint（保证 >= 3 lanes）
+    # --------------------------
+    def _pick_center_lane_waypoint(self) -> Optional[carla.Waypoint]:
+        candidates = [
+            wp for wp in self.map.generate_waypoints(5.0)
+            if wp.lane_type == carla.LaneType.Driving and (not wp.is_junction)
+        ]
+        if not candidates:
+            return None
+
+        random.shuffle(candidates)
+
+        for wp in candidates[:600]:
+            left_wp = wp.get_left_lane()
+            right_wp = wp.get_right_lane()
+
+            # ✅ 必须左右都存在 Driving lane（至少三车道结构）
+            if left_wp is None or right_wp is None:
+                continue
+            if left_wp.lane_type != carla.LaneType.Driving:
+                continue
+            if right_wp.lane_type != carla.LaneType.Driving:
+                continue
+
+            # 可选：过滤过窄车道
+            if wp.lane_width < 3.0:
+                continue
+
+            # 可选：前后离路口远一点，避免车刚生成就进 junction
+            if self._is_near_junction(wp, dist=25.0):
+                continue
+
+            return wp
+
+        return candidates[0]
+
+    def _is_near_junction(self, wp: carla.Waypoint, dist: float = 20.0) -> bool:
+        step = 1.0
+
+        # 前方
+        cur = wp
+        traveled = 0.0
+        while traveled < dist:
+            nxt = cur.next(step)
+            if not nxt:
+                break
+            cur = nxt[0]
+            traveled += step
+            if cur.is_junction:
+                return True
+
+        # 后方
+        cur = wp
+        traveled = 0.0
+        while traveled < dist:
+            prv = cur.previous(step)
+            if not prv:
+                break
+            cur = prv[0]
+            traveled += step
+            if cur.is_junction:
+                return True
+
+        return False
+
+    # --------------------------
+    # 2) 沿道路前/后移动 waypoint
+    # --------------------------
+    def _move_along_lane(self, start_wp: carla.Waypoint, dist: float) -> Optional[carla.Waypoint]:
         """
-        print(f"\n[Trimma] 开始生成包围突围场景...")
-        print(f"  - 周围车辆数量: {self.num_surrounding_vehicles}")
+        dist > 0 前进；dist < 0 后退
+        """
+        if start_wp is None:
+            return None
+
+        step = 1.0
+        traveled = 0.0
+        cur = start_wp
+
+        target = abs(dist)
+        forward = dist >= 0
+
+        while traveled < target and (not cur.is_junction):
+            nxts = cur.next(step) if forward else cur.previous(step)
+            if not nxts:
+                break
+            nxt_wp = nxts[-1]
+            traveled += nxt_wp.transform.location.distance(cur.transform.location)
+            cur = nxt_wp
+
+        return cur
+
+    # --------------------------
+    # 3) 在某个 waypoint 生成 vehicle（安全 z offset + try 多次）
+    # --------------------------
+    def _spawn_vehicle_at_waypoint(self, wp: carla.Waypoint) -> Optional[carla.Actor]:
+        lib = self.world.get_blueprint_library()
+
+        # 选一个常见车（更容易生成）
+        preferred = ["vehicle.audi.tt", "vehicle.tesla.model3", "vehicle.lincoln.mkz_2020"]
+        bp = None
+        for name in preferred:
+            try:
+                bp = lib.find(name)
+                if bp:
+                    break
+            except:
+                pass
+        if bp is None:
+            bps = lib.filter("vehicle.*")
+            if not bps:
+                return None
+            bp = random.choice(bps)
+
+        tf = wp.transform
+        tf = carla.Transform(tf.location + carla.Location(z=0.5), tf.rotation)
+
+        # try_spawn_actor 可能失败，稍微抬高再试几次
+        for z_try in [0.5, 0.8, 1.0]:
+            tf_try = carla.Transform(wp.transform.location + carla.Location(z=z_try), wp.transform.rotation)
+            actor = self.world.try_spawn_actor(bp, tf_try)
+            if actor is not None:
+                return actor
+
+        return None
+
+    # --------------------------
+    # 4) Traffic Manager 速度/行为设置
+    # --------------------------
+    def _apply_tm_settings(self, veh: carla.Actor, speed_diff_pct: float):
+        """
+        speed_diff_pct:
+        - >0 慢于限速
+        - <0 快于限速
+        """
+        if veh is None or self.traffic_manager is None:
+            return
+
+        try:
+            veh.set_autopilot(True, self.tm_port)
+        except Exception:
+            # 某些版本不需要传 port
+            try:
+                veh.set_autopilot(True)
+            except:
+                return
+
+        # 禁止变道（防止乱跑）
+        if self.disable_lane_change:
+            try:
+                self.traffic_manager.auto_lane_change(veh, False)
+            except:
+                pass
+
+        # 设置跟车距离
+        try:
+            self.traffic_manager.distance_to_leading_vehicle(veh, self.tm_global_distance)
+        except:
+            pass
+
+        # 设置速度差
+        try:
+            self.traffic_manager.vehicle_percentage_speed_difference(veh, speed_diff_pct)
+        except:
+            pass
+
+    # --------------------------
+    # setup 主逻辑（完整实现）
+    # --------------------------
+    def setup(self) -> bool:
+        print(f"\n[Trimma] 开始生成 Trimma 场景（左右慢 + 前车快）...")
         print(f"  - 前车距离: {self.front_vehicle_distance}m")
-        print(f"  - 后车距离: {abs(self.rear_vehicle_distance)}m")
-        print(f"  - 车速范围: {self.vehicle_speed_min}-{self.vehicle_speed_max}m/s")
+        print(f"  - 左右车偏移: {self.side_vehicle_offset}m (相对自车纵向)")
+        print(f"  - 前车速度差: {self.front_speed_diff_pct}% (负=更快)")
+        print(f"  - 左右车速度差: {self.side_speed_diff_pct}% (正=更慢)")
+        print(f"  - 最少车道数: {self.min_lane_count}")
 
-        # TODO: 实现步骤
-        # 1. 选择多车道道路
-        # start_wp = self._pick_multi_lane_road(min_lanes=self.min_lane_count)
-        # if not start_wp:
-        #     print("[Trimma] ❌ 找不到合适的多车道道路")
-        #     return False
-
-        # 2. 确保在中间车道
-        # center_wp = self._get_center_lane(start_wp)
-        # self.ego_spawn_transform = center_wp.transform
-
-        # 3. 获取Traffic Manager
-        # self.traffic_manager = self.world.get_traffic_manager(8000)
-
-        # 4. 生成前车
-        # front_vehicle = self._spawn_vehicle_at_distance(
-        #     center_wp, self.front_vehicle_distance, speed=self.vehicle_speed_min
-        # )
-        # if front_vehicle:
-        #     self.scenario_actors.append(front_vehicle)
-
-        # 5. 生成后车
-        # rear_vehicle = self._spawn_vehicle_at_distance(
-        #     center_wp, self.rear_vehicle_distance, speed=self.vehicle_speed_max
-        # )
-        # if rear_vehicle:
-        #     self.scenario_actors.append(rear_vehicle)
-
-        # 6. 生成左侧车辆
-        # left_wp = center_wp.get_left_lane()
-        # if left_wp and left_wp.lane_type == carla.LaneType.Driving:
-        #     left_vehicle = self._spawn_vehicle_at_distance(
-        #         left_wp, self.lateral_vehicle_distance, speed=random.uniform(...)
-        #     )
-        #     if left_vehicle:
-        #         self.scenario_actors.append(left_vehicle)
-
-        # 7. 生成右侧车辆
-        # right_wp = center_wp.get_right_lane()
-        # if right_wp and right_wp.lane_type == carla.LaneType.Driving:
-        #     right_vehicle = self._spawn_vehicle_at_distance(
-        #         right_wp, -self.lateral_vehicle_distance, speed=random.uniform(...)
-        #     )
-        #     if right_vehicle:
-        #         self.scenario_actors.append(right_vehicle)
-
-        # 8. 设置所有车辆autopilot
-        # for vehicle in self.scenario_actors:
-        #     vehicle.set_autopilot(True, self.traffic_manager.get_port())
-        #     # 设置车速
-        #     self.traffic_manager.vehicle_percentage_speed_difference(vehicle, speed_diff)
-
-        print(f"[Trimma] ⚠️ 场景尚未实现")
-        print(f"\n实现要点：")
-        print(f"  1. 选择多车道道路（至少{self.min_lane_count}车道）")
-        print(f"  2. 使用 waypoint.get_left_lane() 和 get_right_lane() 获取相邻车道")
-        print(f"  3. 使用 waypoint.next(distance) 计算前方位置")
-        print(f"  4. 使用 waypoint.previous(distance) 计算后方位置")
-        print(f"  5. 生成车辆后设置 autopilot:")
-        print(f"     vehicle.set_autopilot(True, tm_port)")
-        print(f"  6. 使用 Traffic Manager 控制车速:")
-        print(f"     tm.vehicle_percentage_speed_difference(vehicle, percentage)")
-        print(f"     percentage > 0: 慢于限速")
-        print(f"     percentage < 0: 快于限速")
-        print(f"  7. 车辆布局:")
-        print(f"     - 前车: 同车道，前方{self.front_vehicle_distance}m，慢速")
-        print(f"     - 后车: 同车道，后方{abs(self.rear_vehicle_distance)}m，快速")
-        print(f"     - 左车: 左车道，前方{self.lateral_vehicle_distance}m")
-        print(f"     - 右车: 右车道，后方{self.lateral_vehicle_distance}m")
-
-        return False  # 未实现，返回False
-
-    def get_spawn_transform(self) -> Optional[carla.Transform]:
-        """返回自车生成位置"""
-        return self.ego_spawn_transform
-
-
-# ============================================================================
-# 场景5: 施工+变道高交通流（待实现）
-# ============================================================================
-
-class ConstructionLaneChangeScenario(ScenarioBase):
-    """
-    施工+变道高交通流场景
-
-    场景描述：
-    - 前方车道有施工区域（锥桶/路障）
-    - 自车需要变道避让
-    - 相邻车道有高密度交通流
-    - 需要找到合适的gap进行变道
-
-    配置参数（待定义）：
-    - construction_distance: 施工区域距离（米）
-    - construction_length: 施工区域长度（米）
-    - traffic_density: 交通流密度（车辆/100米）
-    - traffic_speed: 交通流速度（m/s）
-    - min_gap_for_lane_change: 最小变道gap（米）
-
-    TODO: 实现场景生成逻辑
-    """
-
-    def __init__(self, world: carla.World, carla_map: carla.Map, config: Any):
-        super().__init__(world, carla_map, config)
-        self.scenario_name = "construction_lane_change"
-        self.scenario_description = "施工+变道高交通流场景"
-
-        # TODO: 读取配置参数
-        self.construction_distance = float(getattr(config, "construction_distance", 30.0))
-        self.construction_length = float(getattr(config, "construction_length", 20.0))
-        self.traffic_density = float(getattr(config, "traffic_density", 3.0))
-        # ... 其他参数
-
-        self.ego_spawn_transform: Optional[carla.Transform] = None
-
-    def setup(self) -> bool:
-        """
-        TODO: 实现施工+变道场景生成
-
-        实现步骤：
-        1. 选择有多车道的道路
-        2. 在自车前方放置施工区域（锥桶/路障）
-        3. 在相邻车道生成交通流车辆
-        4. 设置车辆AI控制器（保持速度和车距）
-        5. 设置自车生成位置
-        """
-        print(f"\n[ConstructionLaneChange] ⚠️ 场景尚未实现")
-        print(f"  - 施工区域距离: {self.construction_distance}m")
-        print(f"  - 施工区域长度: {self.construction_length}m")
-        print(f"  - 交通流密度: {self.traffic_density} 车/100m")
-
-        # TODO: 实现场景生成逻辑
-        # self._place_construction_zone(...)
-        # self._spawn_traffic_flow(...)
-
-        return False  # 未实现，返回False
-
-    def get_spawn_transform(self) -> Optional[carla.Transform]:
-        """返回自车生成位置"""
-        return self.ego_spawn_transform
-
-
-# ============================================================================
-# 场景6: 行人过马路场景（从 new_scenarios/pedestrian_crossing.py 转换）
-# ============================================================================
-
-class PedestrianCrossingScenario(ScenarioBase):
-    """
-    行人过马路场景
-
-    场景描述：
-    - 在自车前方的人行横道上生成多个行人
-    - 行人从道路一侧横穿到另一侧
-    - 自车需要减速避让行人
-    - 考验自车的行人检测和紧急制动能力
-
-    场景布局：
-    ```
-    [人行道]  |  [车道]  |  [人行道]
-         🚶   |          |
-         →→→→→|→→→→→→→→→|  (行人横穿)
-              |          |
-              |    🚗    |  (自车接近)
-              |    ↑     |
-    ```
-
-    配置参数：
-    - pedestrian_distance: 行人位置距离自车spawn点（米，默认25.0）
-    - num_pedestrians: 行人数量（默认3）
-    - pedestrian_speed: 行人速度（m/s，默认1.5）
-    - pedestrian_spacing: 行人间距（米，默认2.0）
-
-    训练价值：
-    - 测试行人检测能力
-    - 测试紧急制动能力
-    - 测试速度控制
-    - 真实场景常见（城市道路）
-
-    难度：⭐⭐ 简单
-    """
-
-    def __init__(self, world: carla.World, carla_map: carla.Map, config: Any):
-        super().__init__(world, carla_map, config)
-        self.scenario_name = "pedestrian_crossing"
-        self.scenario_description = "行人过马路场景"
-
-        # 读取配置参数
-        self.pedestrian_distance = float(getattr(config, "pedestrian_distance", 25.0))
-        self.num_pedestrians = int(getattr(config, "num_pedestrians", 3))
-        self.pedestrian_speed = float(getattr(config, "pedestrian_speed", 1.5))
-        self.pedestrian_spacing = float(getattr(config, "pedestrian_spacing", 2.0))
-
-        # 内部状态
-        self.ego_spawn_transform: Optional[carla.Transform] = None
-        self.pedestrian_controllers: List[carla.Actor] = []
-
-    def setup(self) -> bool:
-        """生成行人过马路场景"""
-        print(f"\n[PedestrianCrossing] 开始生成场景...")
-        print(f"  - 行人数量: {self.num_pedestrians}")
-        print(f"  - 行人距离: {self.pedestrian_distance}m")
-        print(f"  - 行人速度: {self.pedestrian_speed}m/s")
-
-        # 1. 选择spawn点
-        spawns = self.map.get_spawn_points()
-        if not spawns:
-            print("[PedestrianCrossing] ❌ 地图没有spawn点")
+        # 1) 选中心车道 waypoint（确保左右都有 Driving）
+        center_wp = self._pick_center_lane_waypoint()
+        if not center_wp:
+            print("[Trimma] ❌ 找不到满足条件的多车道中心 waypoint")
             return False
 
-        self.ego_spawn_transform = random.choice(spawns)
+        left_wp = center_wp.get_left_lane()
+        right_wp = center_wp.get_right_lane()
+        if left_wp is None or right_wp is None:
+            print("[Trimma] ❌ 中心 waypoint 左右车道不存在")
+            return False
+        if left_wp.lane_type != carla.LaneType.Driving or right_wp.lane_type != carla.LaneType.Driving:
+            print("[Trimma] ❌ 左右车道不是 Driving lane")
+            return False
 
-        # 2. 获取waypoint
-        start_wp = self.map.get_waypoint(
-            self.ego_spawn_transform.location,
-            project_to_road=True,
-            lane_type=carla.LaneType.Driving
+        # 2) ego spawn（中间车道）
+        ego_tf = center_wp.transform
+        ego_tf = carla.Transform(
+            ego_tf.location + carla.Location(z=0.5),
+            carla.Rotation(pitch=0.0, yaw=ego_tf.rotation.yaw, roll=0.0)
         )
+        self.ego_spawn_transform = ego_tf
 
-        if not start_wp:
-            print("[PedestrianCrossing] ❌ 无法获取waypoint")
+        # 3) 获取 Traffic Manager（稳健写法）
+        self.traffic_manager = None
+        try:
+            # 有的版本是 client.get_trafficmanager，这里只能尽量兼容
+            self.traffic_manager = self.world.get_traffic_manager()  # 如果你环境支持
+        except:
+            pass
+
+        if self.traffic_manager is None:
+            # 兜底：自己连一个 client 拿 tm
+            try:
+                client = carla.Client("localhost", 2000)
+                client.set_timeout(5.0)
+                self.traffic_manager = client.get_trafficmanager(self.tm_port)
+            except Exception as e:
+                print(f"[Trimma] ⚠️ 获取 Traffic Manager 失败：{e}")
+                self.traffic_manager = None
+
+        if self.traffic_manager is None:
+            print("[Trimma] ❌ 没有 Traffic Manager，无法设置速度与 autopilot")
             return False
 
-        print(f"  - 起始位置: ({start_wp.transform.location.x:.1f}, "
-              f"{start_wp.transform.location.y:.1f})")
+        # 确保 tm 端口一致
+        try:
+            self.traffic_manager.set_synchronous_mode(self.world.get_settings().synchronous_mode)
+        except:
+            pass
 
-        # 3. 前进到人行横道位置
-        crossing_wp = self._advance_waypoint(start_wp, self.pedestrian_distance)
+        # 4) 生成前车（同车道，前方 dist）
+        front_wp = self._move_along_lane(center_wp, self.front_vehicle_distance)
+        if not front_wp:
+            print("[Trimma] ❌ 找不到前车 waypoint")
+            return False
 
-        # 4. 生成行人
-        pedestrians_spawned = 0
-        for i in range(self.num_pedestrians):
-            # 计算行人位置（沿着人行横道分布）
-            offset = (i - self.num_pedestrians / 2) * self.pedestrian_spacing
-            pedestrian, controller = self._spawn_pedestrian(crossing_wp, offset)
+        front_vehicle = self._spawn_vehicle_at_waypoint(front_wp)
+        if not front_vehicle:
+            print("[Trimma] ❌ 前车生成失败")
+            return False
 
-            if pedestrian and controller:
-                self.scenario_actors.append(pedestrian)
-                self.pedestrian_controllers.append(controller)
-                pedestrians_spawned += 1
+        self.front_vehicle = front_vehicle
+        self.scenario_actors.append(front_vehicle)
 
-        # 5. 等待物理稳定
+        # 5) 生成左车（左车道，略微前方/并排）
+        left_base_wp = self._move_along_lane(left_wp, self.side_vehicle_offset)
+        if not left_base_wp:
+            print("[Trimma] ❌ 找不到左车 waypoint")
+            return False
+
+        left_vehicle = self._spawn_vehicle_at_waypoint(left_base_wp)
+        if not left_vehicle:
+            print("[Trimma] ❌ 左车生成失败")
+            return False
+
+        self.left_vehicle = left_vehicle
+        self.scenario_actors.append(left_vehicle)
+
+        # 6) 生成右车（右车道，略微前方/并排）
+        right_base_wp = self._move_along_lane(right_wp, self.side_vehicle_offset)
+        if not right_base_wp:
+            print("[Trimma] ❌ 找不到右车 waypoint")
+            return False
+
+        right_vehicle = self._spawn_vehicle_at_waypoint(right_base_wp)
+        if not right_vehicle:
+            print("[Trimma] ❌ 右车生成失败")
+            return False
+
+        self.right_vehicle = right_vehicle
+        self.scenario_actors.append(right_vehicle)
+
+        # 7) 设置 TM 行为与速度：前车快，左右慢
+        self._apply_tm_settings(front_vehicle, self.front_speed_diff_pct)
+        self._apply_tm_settings(left_vehicle, self.side_speed_diff_pct)
+        self._apply_tm_settings(right_vehicle, self.side_speed_diff_pct)
+
+        # 同步模式下 tick 稳定一下
         if self.world.get_settings().synchronous_mode:
             for _ in range(3):
                 self.world.tick()
 
-        print(f"[PedestrianCrossing] ✅ 成功生成 {pedestrians_spawned} 个行人")
-        return pedestrians_spawned > 0
+        # 8) 打印信息
+        ego_loc = self.ego_spawn_transform.location
+        f_loc = front_vehicle.get_location()
+        l_loc = left_vehicle.get_location()
+        r_loc = right_vehicle.get_location()
+
+        print("[Trimma] ✅ 场景生成成功")
+        print(f"  - Ego  : ({ego_loc.x:.1f}, {ego_loc.y:.1f})")
+        print(f"  - Front: ({f_loc.x:.1f}, {f_loc.y:.1f}) speed_diff={self.front_speed_diff_pct}%")
+        print(f"  - Left : ({l_loc.x:.1f}, {l_loc.y:.1f}) speed_diff={self.side_speed_diff_pct}%")
+        print(f"  - Right: ({r_loc.x:.1f}, {r_loc.y:.1f}) speed_diff={self.side_speed_diff_pct}%")
+
+        return True
 
     def get_spawn_transform(self) -> Optional[carla.Transform]:
         """返回自车生成位置"""
         return self.ego_spawn_transform
 
-    def _advance_waypoint(self, wp: carla.Waypoint, distance: float) -> carla.Waypoint:
-        """前进指定距离"""
+# ============================================================================
+# 场景5: 施工
+# ============================================================================
+
+class ConstructionLaneChangeScenario(ScenarioBase):
+    """
+        施工封道 + 高密度交通流变道场景
+
+        场景设计：
+        - 自车所在车道前方生成施工封道区域（锥桶/水马/杂物/施工人员）
+        - 当前车道被迫不可通行 => 自车必须向相邻车道变道绕行
+        - 相邻车道存在高密度交通流（gap 小，不容易插入）
+        - 训练自车的“找 gap + 安全变道 + 避让施工区”的综合能力
+
+        配置参数：
+        - construction_distance: 施工区域距离自车多远开始（米，默认30）
+        - construction_length: 施工区域长度（米，默认20）   # 这里主要用于交通流生成范围
+        - traffic_density: 相邻车道交通密度（辆/100m，默认3）
+        - traffic_speed: 交通流速度（m/s，默认8.0）
+        - min_gap_for_lane_change: 最小变道 gap（米，默认12.0）  # 这里只做记录/调试，实际是否变道由你的planner完成
+        - construction_type: 施工类型（construction1 / construction2，默认construction1）
+        - flow_range: 在施工区前后各生成多少米的交通流（默认80m）
+        """
+
+    def __init__(self, world: carla.World, carla_map: carla.Map, config: Any):
+        super().__init__(world, carla_map, config)
+        self.scenario_name = "construction_lane_change"
+        self.scenario_description = "施工封道 + 高密度交通流变道场景"
+
+        self.construction_distance = float(getattr(config, "construction_distance", 30.0))
+        self.construction_length = float(getattr(config, "construction_length", 20.0))
+        self.traffic_density = float(getattr(config, "traffic_density", 3.0))  # 车/100m
+        self.traffic_speed = float(getattr(config, "traffic_speed", 8.0))  # m/s
+        self.min_gap_for_lane_change = float(getattr(config, "min_gap_for_lane_change", 12.0))
+        self.flow_range = float(getattr(config, "flow_range", 80.0))
+
+        # 施工生成器配置
+        self.construction_type = str(getattr(config, "construction_type", "construction1"))
+
+        self.ego_spawn_transform: Optional[carla.Transform] = None
+        self.traffic_manager = None
+        self.tm_port = int(getattr(config, "tm_port", 8000))
+
+        # 记录关键点（可用于 debug / trigger）
+        self.construction_location: Optional[carla.Location] = None
+        self.adjacent_lane_id: Optional[int] = None
+
+    # ---------------------------------------------------------
+    # 选一条“直道 + 至少2车道 + 远离路口”的起点 waypoint
+    # ---------------------------------------------------------
+    def _pick_multi_lane_straight_road(self) -> Optional[carla.Waypoint]:
+        candidates = [
+            wp for wp in self.map.generate_waypoints(5.0)
+            if wp.lane_type == carla.LaneType.Driving and (not wp.is_junction)
+        ]
+        if not candidates:
+            return None
+
+        random.shuffle(candidates)
+
+        def is_near_junction(wp: carla.Waypoint, dist=30.0) -> bool:
+            step = 1.0
+            cur = wp
+            traveled = 0.0
+            while traveled < dist:
+                nxt = cur.next(step)
+                if not nxt:
+                    break
+                cur = nxt[0]
+                traveled += step
+                if cur.is_junction:
+                    return True
+            cur = wp
+            traveled = 0.0
+            while traveled < dist:
+                prv = cur.previous(step)
+                if not prv:
+                    break
+                cur = prv[0]
+                traveled += step
+                if cur.is_junction:
+                    return True
+            return False
+
+        def has_adjacent_lane(wp: carla.Waypoint) -> bool:
+            l = wp.get_left_lane()
+            r = wp.get_right_lane()
+            ok_l = l is not None and l.lane_type == carla.LaneType.Driving
+            ok_r = r is not None and r.lane_type == carla.LaneType.Driving
+            return ok_l or ok_r
+
+        # 找一条：有相邻车道 + 不靠路口
+        for wp in candidates[:600]:
+            if is_near_junction(wp, 35.0):
+                continue
+            if not has_adjacent_lane(wp):
+                continue
+            return wp
+
+        # 实在找不到就退化
+        for wp in candidates:
+            if has_adjacent_lane(wp):
+                return wp
+        return candidates[0]
+
+    # ---------------------------------------------------------
+    # 沿当前车道前进一定距离（用于找施工位置）
+    # ---------------------------------------------------------
+    def _advance_waypoint(self, start_wp: carla.Waypoint, distance: float) -> Optional[carla.Waypoint]:
         traveled = 0.0
-        step = 2.0
-        while traveled < distance:
-            nxt = wp.next(step)
+        cur = start_wp
+        step = 1.0
+        while traveled < distance and (not cur.is_junction):
+            nxt = cur.next(step)
             if not nxt:
                 break
-            wp = nxt[0]
-            traveled += step
-        return wp
+            nxt_wp = nxt[-1]
+            traveled += nxt_wp.transform.location.distance(cur.transform.location)
+            cur = nxt_wp
+        return cur
 
-    def _spawn_pedestrian(
-        self,
-        wp: carla.Waypoint,
-        longitudinal_offset: float
-    ) -> Tuple[Optional[carla.Actor], Optional[carla.Actor]]:
+    # ---------------------------------------------------------
+    # 在相邻车道生成高密度交通流
+    # ---------------------------------------------------------
+    def _spawn_dense_traffic_flow(self, lane_wp: carla.Waypoint, center_wp: carla.Waypoint):
         """
-        生成单个行人及其控制器
-
-        Args:
-            wp: 人行横道位置
-            longitudinal_offset: 纵向偏移（沿道路方向）
-
-        Returns:
-            Tuple[pedestrian, controller]: 行人和控制器，失败返回 (None, None)
+        在 lane_wp 这条车道上，围绕 center_wp 位置前后刷车：
+        - 密度：traffic_density (辆/100m)
+        - 范围：flow_range（前后各 flow_range 米）
         """
+        # 间距 = 100 / density
+        spacing = max(6.0, 100.0 / max(0.5, self.traffic_density))  # 最小不要太小，避免 spawn 失败
+        num_each_side = int(self.flow_range / spacing)
+
         lib = self.world.get_blueprint_library()
+        vehicle_bps = lib.filter("vehicle.*")
 
-        # 获取行人 blueprint
-        pedestrian_bps = lib.filter("walker.pedestrian.*")
-        if not pedestrian_bps:
-            print("[PedestrianCrossing] ❌ 找不到行人blueprint")
-            return None, None
+        def try_spawn_at_wp(wp: carla.Waypoint):
+            bp = random.choice(vehicle_bps)
+            tf = wp.transform
+            tf = carla.Transform(tf.location + carla.Location(z=0.5), tf.rotation)  # 防止贴地 spawn fail
+            v = self.world.try_spawn_actor(bp, tf)
+            return v
 
-        # 随机选择行人类型
-        pedestrian_bp = random.choice(pedestrian_bps)
+        spawned: List[carla.Actor] = []
 
-        # 计算生成位置（道路右侧人行道）
-        lane_width = wp.lane_width
-        sidewalk_offset = lane_width * 0.5 + 1.5  # 人行道距离车道中心
+        # 中心点先来一辆（可选）
+        center_vehicle = try_spawn_at_wp(center_wp)
+        if center_vehicle:
+            spawned.append(center_vehicle)
 
-        # 获取右侧向量
-        right_vec = wp.transform.rotation.get_right_vector()
-        forward_vec = wp.transform.rotation.get_forward_vector()
+        # 前方刷车
+        cur = center_wp
+        for _ in range(num_each_side):
+            nxt = cur.next(spacing)
+            if not nxt:
+                break
+            cur = nxt[0]
+            v = try_spawn_at_wp(cur)
+            if v:
+                spawned.append(v)
 
-        # 计算spawn位置
-        spawn_loc = carla.Location(
-            x=wp.transform.location.x + right_vec.x * sidewalk_offset + forward_vec.x * longitudinal_offset,
-            y=wp.transform.location.y + right_vec.y * sidewalk_offset + forward_vec.y * longitudinal_offset,
-            z=wp.transform.location.z + 1.0
-        )
-        spawn_tf = carla.Transform(spawn_loc, wp.transform.rotation)
+        # 后方刷车
+        cur = center_wp
+        for _ in range(num_each_side):
+            prv = cur.previous(spacing)
+            if not prv:
+                break
+            cur = prv[0]
+            v = try_spawn_at_wp(cur)
+            if v:
+                spawned.append(v)
 
-        # 生成行人
-        pedestrian = self.world.try_spawn_actor(pedestrian_bp, spawn_tf)
-        if not pedestrian:
-            # 尝试更高的位置
-            spawn_loc.z += 0.5
-            spawn_tf = carla.Transform(spawn_loc, wp.transform.rotation)
-            pedestrian = self.world.try_spawn_actor(pedestrian_bp, spawn_tf)
+        # 设置 TM 控制（速度固定、禁止变道）
+        if self.traffic_manager:
+            for v in spawned:
+                try:
+                    v.set_autopilot(True, self.tm_port)
+                    self.traffic_manager.auto_lane_change(v, False)
 
-        if not pedestrian:
-            return None, None
+                    # TM 的 set_desired_speed 单位是 km/h
+                    speed_kmh = float(self.traffic_speed) * 3.6
+                    self.traffic_manager.set_desired_speed(v, speed_kmh)
 
-        # 创建行人AI控制器
-        controller_bp = lib.find("controller.ai.walker")
-        controller = self.world.try_spawn_actor(controller_bp, carla.Transform(), pedestrian)
+                    # 保持车距（稍微小一点更“难插入”）
+                    self.traffic_manager.distance_to_leading_vehicle(v, 4.0)
+                except Exception as e:
+                    print(f"[ConstructionLaneChange] ⚠️ traffic flow TM设置失败: {e}")
 
-        if not controller:
-            pedestrian.destroy()
-            return None, None
+        return spawned
 
-        # 计算目标位置（道路左侧人行道）
-        target_loc = carla.Location(
-            x=wp.transform.location.x - right_vec.x * sidewalk_offset + forward_vec.x * longitudinal_offset,
-            y=wp.transform.location.y - right_vec.y * sidewalk_offset + forward_vec.y * longitudinal_offset,
-            z=wp.transform.location.z
-        )
+    # ---------------------------------------------------------
+    # setup 主逻辑
+    # ---------------------------------------------------------
+    def setup(self) -> bool:
+        print(f"\n[ConstructionLaneChange] 开始生成施工变道场景...")
+        print(f"  - 施工距离: {self.construction_distance}m")
+        print(f"  - 施工长度: {self.construction_length}m")
+        print(f"  - 交通密度: {self.traffic_density} 辆/100m")
+        print(f"  - 交通速度: {self.traffic_speed} m/s")
+        print(f"  - 最小可插入gap(参考): {self.min_gap_for_lane_change}m")
+        print(f"  - 施工类型: {self.construction_type}")
 
-        # 启动行人移动
-        controller.start()
-        controller.go_to_location(target_loc)
-        controller.set_max_speed(self.pedestrian_speed)
+        # 1) 选择合适道路
+        start_wp = self._pick_multi_lane_straight_road()
+        if not start_wp:
+            print("[ConstructionLaneChange] ❌ 找不到合适道路")
+            return False
 
-        ped_loc = pedestrian.get_location()
-        print(f"  - 行人生成: ID={pedestrian.id}, 位置=({ped_loc.x:.1f}, {ped_loc.y:.1f})")
+        # 2) 自车 spawn
+        ego_tf = start_wp.transform
+        ego_tf = carla.Transform(ego_tf.location + carla.Location(z=0.5), ego_tf.rotation)
+        self.ego_spawn_transform = ego_tf
 
-        return pedestrian, controller
+        # 3) 获取 traffic manager（用 client 强制一致）
+        try:
+            client = carla.Client("localhost", 2000)
+            client.set_timeout(5.0)
+            self.traffic_manager = client.get_trafficmanager(self.tm_port)
+            try:
+                self.traffic_manager.set_synchronous_mode(self.world.get_settings().synchronous_mode)
+            except:
+                pass
+        except Exception as e:
+            print(f"[ConstructionLaneChange] ⚠️ 获取TrafficManager失败: {e}")
+            self.traffic_manager = None
+
+        # 4) 找施工位置 waypoint（在自车前方 construction_distance）
+        construction_wp = self._advance_waypoint(start_wp, self.construction_distance)
+        if not construction_wp:
+            print("[ConstructionLaneChange] ❌ 无法定位施工位置 waypoint")
+            return False
+
+        # 5) 施工区生成（复用你的 ahead_obstacle_scenario）
+        #    注意：你的施工生成器不返回 actor 列表，所以我们用“前后 actor diff”自动收集
+        before_ids = set([a.id for a in self.world.get_actors()])
+
+        scene_cfg = {
+            "num_cones": int(max(5, self.construction_length / 3.0)),  # 粗略：长度越长 cones 越多
+            "cone_interval": 3,
+            "num_garbage": 30,
+            "num_workers": 3,
+        }
+        gen_cfg = {"gen_cfg": self.construction_type}
+
+        try:
+            CarlaDataProvider.set_world(self.world)
+            self.construction_location = ahead_obstacle_scenario(
+                self.world,
+                construction_wp,
+                actor_list=[],
+                actor_desc=[],
+                scene_cfg=scene_cfg,
+                gen_cfg=gen_cfg
+            )
+        except Exception as e:
+            print(f"[ConstructionLaneChange] ❌ 施工区生成失败: {e}")
+            return False
+
+        # 施工生成后，检查 static.prop 和 walker 是否存在
+        all_actors = self.world.get_actors()
+        props = [a for a in all_actors if a.type_id.startswith("static.prop")]
+        walkers = [a for a in all_actors if a.type_id.startswith("walker.pedestrian")]
+
+        print("[DEBUG] static.prop count =", len(props))
+        print("[DEBUG] walkers count =", len(walkers))
+
+        # 打印离施工点最近的 10 个 static.prop
+        if self.construction_location:
+            props_sorted = sorted(
+                props,
+                key=lambda a: a.get_location().distance(self.construction_location)
+            )
+            for a in props_sorted[:10]:
+                d = a.get_location().distance(self.construction_location)
+                print(f"[DEBUG] prop near construction: {a.type_id} id={a.id} dist={d:.1f}")
+
+        after_actors = self.world.get_actors()
+        new_actors = [a for a in after_actors if a.id not in before_ids]
+
+        # 记录这些新 actor，便于 cleanup
+        self.scenario_actors.extend(new_actors)
+
+        print(f"[ConstructionLaneChange] ✅ 施工区生成完成，新actor数量: {len(new_actors)}")
+        if self.construction_location:
+            print(
+                f"[ConstructionLaneChange] 施工位置: ({self.construction_location.x:.1f}, {self.construction_location.y:.1f})")
+
+        # 同步模式稳定几帧
+        if self.world.get_settings().synchronous_mode:
+            for _ in range(5):
+                self.world.tick()
+
+        print(f"[ConstructionLaneChange] ✅ 场景生成成功")
+        print(f"  - ego spawn: ({self.ego_spawn_transform.location.x:.1f}, {self.ego_spawn_transform.location.y:.1f})")
+        return True
+
+    def get_spawn_transform(self) -> Optional[carla.Transform]:
+        return self.ego_spawn_transform
 
     def cleanup(self):
-        """清理场景"""
-        # 先停止并清理控制器
-        for controller in self.pedestrian_controllers:
-            if controller is not None:
-                try:
-                    controller.stop()
-                    controller.destroy()
-                except Exception:
-                    pass
-        self.pedestrian_controllers.clear()
+        """
+        清理施工场景生成的所有actor（cones/水马/垃圾/行人/车流车辆等）
+        """
+        # 先停 TM 控制车辆（可选）
+        for a in self.scenario_actors:
+            try:
+                if a.type_id.startswith("vehicle"):
+                    a.set_autopilot(False)
+            except:
+                pass
 
-        # 再清理行人
-        super().cleanup()
-
+        # 统一销毁
+        for a in self.scenario_actors:
+            try:
+                a.destroy()
+            except:
+                pass
+        self.scenario_actors = []
+        self.ego_spawn_transform = None
+        self.construction_location = None
+        self.adjacent_lane_id = None
 
 # ============================================================================
 # 场景7: 车门突然打开场景（从 new_scenarios/vehicle_opens_door.py 转换）
@@ -1228,35 +1718,12 @@ class PedestrianCrossingScenario(ScenarioBase):
 
 class VehicleOpensDoorScenario(ScenarioBase):
     """
-    车门突然打开场景
+    车门突然打开场景（修正版）
 
-    场景描述：
-    - 在自车前方路边停放一辆车
-    - 当自车接近时，停放车辆突然打开车门
-    - 自车需要紧急避让或变道
-    - 考验自车的紧急避让能力和变道决策
-
-    场景布局：
-    ```
-    [路边]  |  [车道]  |
-       🚗   |          |  (停放车辆，车门打开)
-       🚪→  |          |
-            |    🚗    |  (自车接近)
-            |    ↑     |
-    ```
-
-    配置参数：
-    - door_vehicle_distance: 停放车辆距离（米，默认30.0）
-    - door_trigger_distance: 触发距离（米，默认15.0）
-    - door_side: 车门侧（"left"/"right"/"random"，默认"random"）
-
-    训练价值：
-    - 测试紧急避让能力
-    - 测试变道决策
-    - 测试障碍物检测
-    - 真实场景常见（城市道路）
-
-    难度：⭐⭐⭐ 中等
+    修复点：
+    1) 停放车必须在“车道右侧路边”（相对于 parked_wp 的车道坐标系，而不是 ego yaw）
+    2) 只选择支持 open_door 的车型；否则你触发了也看不到门动画
+    3) 触发逻辑增加可观测 debug，避免你以为触发了但其实没进分支
     """
 
     def __init__(self, world: carla.World, carla_map: carla.Map, config: Any):
@@ -1264,134 +1731,96 @@ class VehicleOpensDoorScenario(ScenarioBase):
         self.scenario_name = "vehicle_opens_door"
         self.scenario_description = "车门突然打开场景"
 
-        # 读取配置参数
         self.door_vehicle_distance = float(getattr(config, "door_vehicle_distance", 30.0))
         self.door_trigger_distance = float(getattr(config, "door_trigger_distance", 15.0))
-        self.door_side = str(getattr(config, "door_side", "random"))
 
-        # 内部状态
+        # 你想要“右前方路边”，默认直接设 right（别用 random）
+        self.door_side = str(getattr(config, "door_side", "right")).lower()
+        if self.door_side not in ["left", "right", "random"]:
+            self.door_side = "right"
+
+        # 触发检查频率（默认每步都允许尝试）
+        self._door_attempt_cooldown_steps = int(getattr(config, "door_attempt_cooldown_steps", 1))
+        self._door_attempt_step_counter = 0
+
         self.ego_spawn_transform: Optional[carla.Transform] = None
         self.parked_vehicle: Optional[carla.Actor] = None
+
         self.door_opened: bool = False
+        self._actual_side: str = "right"
+        self._door_to_open = None  # carla.VehicleDoor enum
 
     def setup(self) -> bool:
-        """生成车门突然打开场景"""
         print(f"\n[VehicleOpensDoor] 开始生成场景...")
         print(f"  - 停放车辆距离: {self.door_vehicle_distance}m")
         print(f"  - 触发距离: {self.door_trigger_distance}m")
-        print(f"  - 车门侧: {self.door_side}")
+        print(f"  - 车门侧/停车侧: {self.door_side}")
 
         # ✅ 优先使用 XML 预定义位置（仅当地图匹配时）
         use_xml = False
         try:
             from .scenario_xml_parser import get_predefined_spawn_for_scenario
-            map_name = self.map.name.split('/')[-1]  # 提取地图名称
-
-            predefined_spawn = get_predefined_spawn_for_scenario(
-                "vehicle_opens_door",
-                map_name
-            )
-
+            map_name = self.map.name.split('/')[-1]
+            predefined_spawn = get_predefined_spawn_for_scenario("vehicle_opens_door", map_name)
             if predefined_spawn:
                 self.ego_spawn_transform = predefined_spawn
                 print(f"  - ✅ 使用 XML 预定义位置（地图: {map_name}）")
                 use_xml = True
-
-                # 使用预定义位置时，直接在附近生成停放车辆
-                start_wp = self.map.get_waypoint(
-                    predefined_spawn.location,
-                    project_to_road=True,
-                    lane_type=carla.LaneType.Driving
-                )
-
-                if start_wp:
-                    # 在前方生成停放车辆
-                    parked_wp = self._advance_waypoint(start_wp, self.door_vehicle_distance)
-
-                    # 确定车门侧
-                    if self.door_side == "random":
-                        actual_side = random.choice(["left", "right"])
-                    else:
-                        actual_side = self.door_side
-
-                    # 生成停放车辆
-                    self.parked_vehicle = self._spawn_parked_vehicle(parked_wp, actual_side)
-
-                    if self.parked_vehicle:
-                        self.scenario_actors.append(self.parked_vehicle)
-
-                        # 等待物理稳定
-                        if self.world.get_settings().synchronous_mode:
-                            for _ in range(3):
-                                self.world.tick()
-
-                        print(f"[VehicleOpensDoor] ✅ 场景生成成功（使用 XML 位置）")
-                        return True
-                    else:
-                        print(f"  - ⚠️ XML 位置车辆生成失败，尝试随机位置")
-                        use_xml = False
         except Exception as e:
             print(f"  - ⚠️ 无法使用 XML 位置: {e}")
             use_xml = False
 
-        # ❌ 如果 XML 位置不可用或失败，使用随机位置
         if not use_xml:
-            print(f"  - 使用随机 spawn 点")
-
-            # 1. 选择spawn点
             spawns = self.map.get_spawn_points()
             if not spawns:
                 print("[VehicleOpensDoor] ❌ 地图没有spawn点")
                 return False
-
             self.ego_spawn_transform = random.choice(spawns)
+            print("  - 使用随机 spawn 点")
 
-            # 2. 获取waypoint
-            start_wp = self.map.get_waypoint(
-                self.ego_spawn_transform.location,
-                project_to_road=True,
-                lane_type=carla.LaneType.Driving
-            )
+        # road waypoint
+        start_wp = self.map.get_waypoint(
+            self.ego_spawn_transform.location,
+            project_to_road=True,
+            lane_type=carla.LaneType.Driving
+        )
+        if not start_wp:
+            print("[VehicleOpensDoor] ❌ 无法获取 start waypoint")
+            return False
 
-            if not start_wp:
-                print("[VehicleOpensDoor] ❌ 无法获取waypoint")
-                return False
+        print(f"  - 起始位置: ({start_wp.transform.location.x:.1f}, {start_wp.transform.location.y:.1f})")
 
-            print(f"  - 起始位置: ({start_wp.transform.location.x:.1f}, "
-                  f"{start_wp.transform.location.y:.1f})")
+        parked_wp = self._advance_waypoint(start_wp, self.door_vehicle_distance)
 
-            # 3. 前进到停放车辆位置
-            parked_wp = self._advance_waypoint(start_wp, self.door_vehicle_distance)
+        # 决定 side
+        if self.door_side == "random":
+            self._actual_side = random.choice(["left", "right"])
+        else:
+            self._actual_side = self.door_side
 
-            # 4. 确定车门侧
-            if self.door_side == "random":
-                actual_side = random.choice(["left", "right"])
-            else:
-                actual_side = self.door_side
+        # 生成停放车（强制在车道 side 上 & 必须支持开门）
+        v = self._spawn_parked_vehicle_strict(
+            parked_wp=parked_wp,
+            side=self._actual_side
+        )
+        if not v:
+            print("[VehicleOpensDoor] ❌ 停放车辆生成失败（可能该路段太窄或附近碰撞体太多）")
+            return False
 
-            # 5. 生成停放车辆
-            self.parked_vehicle = self._spawn_parked_vehicle(parked_wp, actual_side)
+        self.parked_vehicle = v
+        self.scenario_actors.append(self.parked_vehicle)
 
-            if not self.parked_vehicle:
-                print("[VehicleOpensDoor] ❌ 停放车辆生成失败")
-                return False
+        if self.world.get_settings().synchronous_mode:
+            for _ in range(3):
+                self.world.tick()
 
-            self.scenario_actors.append(self.parked_vehicle)
-
-            # 6. 等待物理稳定
-            if self.world.get_settings().synchronous_mode:
-                for _ in range(3):
-                    self.world.tick()
-
-            print(f"[VehicleOpensDoor] ✅ 场景生成成功")
-            return True
+        print("[VehicleOpensDoor] ✅ 场景生成成功")
+        return True
 
     def get_spawn_transform(self) -> Optional[carla.Transform]:
-        """返回自车生成位置"""
         return self.ego_spawn_transform
 
     def _advance_waypoint(self, wp: carla.Waypoint, distance: float) -> carla.Waypoint:
-        """前进指定距离"""
         traveled = 0.0
         step = 2.0
         while traveled < distance:
@@ -1402,126 +1831,202 @@ class VehicleOpensDoorScenario(ScenarioBase):
             traveled += step
         return wp
 
-    def _spawn_parked_vehicle(
-        self,
-        wp: carla.Waypoint,
-        side: str
-    ) -> Optional[carla.Actor]:
-        """
-        生成停放车辆
-
-        Args:
-            wp: 停放位置
-            side: 车门侧（"left"/"right"）
-
-        Returns:
-            carla.Actor: 停放车辆，失败返回None
-        """
+    # -----------------------------
+    # 核心：强制右侧/左侧 + 必须支持开门
+    # -----------------------------
+    def _spawn_parked_vehicle_strict(self, parked_wp: carla.Waypoint, side: str) -> Optional[carla.Actor]:
         lib = self.world.get_blueprint_library()
 
-        # 获取车辆blueprints（使用更常见的车型）
-        vehicle_bps = lib.filter("vehicle.*")
-
-        # 优先使用小型车辆（更容易生成）
-        preferred_models = [
-            "vehicle.tesla.model3",
+        # 优先挑“更可能支持开门”的车型（减少试错次数）
+        preferred = [
+            "vehicle.audi.tt",
             "vehicle.audi.a2",
-            "vehicle.toyota.prius",
-            "vehicle.nissan.micra",
+            "vehicle.bmw.grandtourer",
+            "vehicle.mercedes.coupe",
+            "vehicle.lincoln.mkz_2020",
+            "vehicle.dodge.charger_2020",
         ]
+        candidates = []
+        for m in preferred:
+            bp = lib.find(m)
+            if bp:
+                candidates.append(bp)
 
-        preferred_bps = []
-        for model in preferred_models:
-            try:
-                bp = lib.find(model)
-                if bp:
-                    preferred_bps.append(bp)
-            except:
-                pass
+        if not candidates:
+            candidates = list(lib.filter("vehicle.*"))
 
-        if not preferred_bps:
-            # 如果找不到首选车型，使用所有车辆
-            preferred_bps = [bp for bp in vehicle_bps]
-
-        if not preferred_bps:
-            print(f"  - ❌ 找不到可用的车辆blueprint")
+        if not candidates:
             return None
 
-        vehicle_bp = random.choice(preferred_bps)
+        # 车道坐标系：必须用 parked_wp 的 right_vec
+        lane_right = parked_wp.transform.get_right_vector()
+        road_center = parked_wp.transform.location
 
-        # 尝试多个位置生成车辆
-        for attempt in range(5):
-            # 计算停放位置（靠近路边）
-            lane_width = wp.lane_width
-            # 尝试不同的偏移量
-            offset_multiplier = 0.3 + (attempt * 0.1)  # 0.3, 0.4, 0.5, 0.6, 0.7
-            offset = lane_width * offset_multiplier
+        want_right = (side == "right")
 
-            right_vec = wp.transform.rotation.get_right_vector()
-            if side == "left":
-                offset *= -1
+        def side_ok(v_loc: carla.Location) -> bool:
+            dx = v_loc.x - road_center.x
+            dy = v_loc.y - road_center.y
+            dot = dx * lane_right.x + dy * lane_right.y
+            # dot>0 表示在“车道右侧”
+            is_right = (dot > 0)
+            return (is_right == want_right)
 
-            # 尝试不同的高度
-            z_offset = 0.5 + (attempt * 0.3)  # 0.5, 0.8, 1.1, 1.4, 1.7
+        # 在多车型 + 多偏移尝试里，找一个：1) 生成成功 2) side 正确 3) 支持开门
+        random.shuffle(candidates)
 
-            spawn_loc = carla.Location(
-                x=wp.transform.location.x + right_vec.x * offset,
-                y=wp.transform.location.y + right_vec.y * offset,
-                z=wp.transform.location.z + z_offset
-            )
-            spawn_tf = carla.Transform(spawn_loc, wp.transform.rotation)
+        for bp in candidates[:12]:
+            for attempt in range(12):
+                lane_width = parked_wp.lane_width
 
-            # 尝试生成车辆
-            vehicle = self.world.try_spawn_actor(vehicle_bp, spawn_tf)
+                # 把车推向路边：0.7~1.8 倍 lane_width
+                offset = lane_width * (0.7 + 0.1 * attempt)
+                if side == "left":
+                    offset *= -1
 
-            if vehicle:
-                # 设置为静止
-                vehicle.set_simulate_physics(False)
-                v_loc = vehicle.get_location()
-                print(f"  - 停放车辆生成: ID={vehicle.id}, 位置=({v_loc.x:.1f}, {v_loc.y:.1f}), 侧={side}, 尝试={attempt+1}")
-                return vehicle
-            else:
-                if attempt < 4:
-                    print(f"  - 尝试 {attempt+1}/5 失败，调整位置...")
+                base = parked_wp.transform.location
+                spawn_loc = carla.Location(
+                    x=base.x + lane_right.x * offset,
+                    y=base.y + lane_right.y * offset,
+                    z=base.z + 0.8
+                )
+                spawn_tf = carla.Transform(spawn_loc, parked_wp.transform.rotation)
 
-        print(f"  - ❌ 停放车辆生成失败（尝试了5次）")
+                v = self.world.try_spawn_actor(bp, spawn_tf)
+                if not v:
+                    continue
+
+                # side 校验（不对就销毁重试）
+                v_loc = v.get_location()
+                if not side_ok(v_loc):
+                    try:
+                        v.destroy()
+                    except Exception:
+                        pass
+                    continue
+
+                # 停车状态：物理开 + 手刹锁死（更可能看到门动画）
+                try:
+                    v.set_simulate_physics(True)
+                    v.apply_control(carla.VehicleControl(throttle=0.0, brake=1.0, hand_brake=True))
+                    v.set_target_velocity(carla.Vector3D(0.0, 0.0, 0.0))
+                    v.set_target_angular_velocity(carla.Vector3D(0.0, 0.0, 0.0))
+                except Exception:
+                    pass
+
+                # ✅ 探测是否支持开门（不支持就换车）
+                door_enum = self._probe_vehicle_door_support(v, side)
+                if door_enum is None:
+                    try:
+                        v.destroy()
+                    except Exception:
+                        pass
+                    continue
+
+                self._door_to_open = door_enum
+                print(
+                    f"  - 停放车辆生成: {v.type_id} ID={v.id}, side={side}, "
+                    f"pos=({v_loc.x:.1f},{v_loc.y:.1f}), door_enum={door_enum}"
+                )
+                return v
+
         return None
 
+    def _probe_vehicle_door_support(self, vehicle: carla.Actor, side: str):
+        """
+        返回一个可用的 VehicleDoor（比如 FR/RR 或 FL/RL）
+        方式：open_door -> tick -> close_door（立刻关回去）
+        """
+        # API 检查
+        if not hasattr(carla, "VehicleDoor"):
+            print("[VehicleOpensDoor] ⚠️ 当前 CARLA API 没有 VehicleDoor，无法开门动画")
+            return None
+        if not hasattr(vehicle, "open_door"):
+            return None
+
+        # 右侧优先开前门 FR（开门更明显）
+        if side == "right":
+            door_list = [carla.VehicleDoor.FR, carla.VehicleDoor.RR]
+        else:
+            door_list = [carla.VehicleDoor.FL, carla.VehicleDoor.RL]
+
+        for d in door_list:
+            try:
+                vehicle.open_door(d)
+                if self.world.get_settings().synchronous_mode:
+                    self.world.tick()
+                # 能关更好，保持初始状态
+                if hasattr(vehicle, "close_door"):
+                    vehicle.close_door(d)
+                    if self.world.get_settings().synchronous_mode:
+                        self.world.tick()
+                return d
+            except Exception:
+                continue
+
+        return None
+
+    # -----------------------------
+    # 触发开门（你在 env.step 每步调用）
+    # -----------------------------
     def check_and_open_door(self, ego_location: carla.Location):
-        """
-        检查自车距离并打开车门（需要在env.step()中调用）
-
-        Args:
-            ego_location: 自车当前位置
-
-        使用方法：
-        在 carla_env.py 的 step() 方法中添加：
-        ```python
-        if self.scenario_instance and hasattr(self.scenario_instance, 'check_and_open_door'):
-            ego_loc = self.ego.get_location()
-            self.scenario_instance.check_and_open_door(ego_loc)
-        ```
-        """
-        if self.door_opened or not self.parked_vehicle:
+        if not self.parked_vehicle:
+            return
+        if self.door_opened:
             return
 
-        # 计算距离
-        vehicle_loc = self.parked_vehicle.get_location()
-        distance = math.hypot(ego_location.x - vehicle_loc.x, ego_location.y - vehicle_loc.y)
+        self._door_attempt_step_counter += 1
+        if self._door_attempt_step_counter < self._door_attempt_cooldown_steps:
+            return
+        self._door_attempt_step_counter = 0
 
-        # 如果自车接近到触发距离，打开车门
-        if distance < self.door_trigger_distance:
+        v_loc = self.parked_vehicle.get_location()
+        distance = math.hypot(ego_location.x - v_loc.x, ego_location.y - v_loc.y)
+
+        # ✅ 调试：你可以确认是否真的进入触发判定
+        if distance < self.door_trigger_distance + 2.0:
+            print(f"[VehicleOpensDoor] debug: dist={distance:.2f}, trigger={self.door_trigger_distance:.2f}, opened={self.door_opened}")
+
+        if distance >= self.door_trigger_distance:
+            return
+
+        print(f"[VehicleOpensDoor] ✅ 触发条件满足：dist={distance:.2f} < trigger={self.door_trigger_distance:.2f}")
+
+        # 触发开门
+        try:
+            if self._door_to_open is None:
+                print("[VehicleOpensDoor] ⚠️ 没有可用 door_enum（车型可能不支持），无法开门")
+                return
+
+            # 再确保停车状态
             try:
-                # 打开车门（CARLA 0.9.15 支持）
-                # 注意：这是一个简化实现，实际车门打开需要使用 VehicleDoor 枚举
-                # 由于轻量级实现的限制，我们通过设置车辆为可见来模拟车门打开
-                self.door_opened = True
-                print(f"[VehicleOpensDoor] ✅ 车门打开！距离={distance:.1f}m")
-            except Exception as e:
-                print(f"[VehicleOpensDoor] ⚠️ 车门打开失败: {e}")
+                self.parked_vehicle.set_simulate_physics(True)
+                self.parked_vehicle.apply_control(carla.VehicleControl(throttle=0.0, brake=1.0, hand_brake=True))
+                self.parked_vehicle.set_target_velocity(carla.Vector3D(0.0, 0.0, 0.0))
+            except Exception:
+                pass
+
+            self.parked_vehicle.open_door(self._door_to_open)
+
+            # tick 一下让动画刷新
+            if self.world.get_settings().synchronous_mode:
+                self.world.tick()
+
+            self.door_opened = True
+            print(f"[VehicleOpensDoor] ✅ 车门已打开：door={self._door_to_open}")
+
+        except Exception as e:
+            # 不要置 door_opened=True，让后续还能重试
+            print(f"[VehicleOpensDoor] ⚠️ 开门失败（将继续尝试）：{e}")
+
+    def cleanup(self):
+        self.door_opened = False
+        self._door_to_open = None
+        self._door_attempt_step_counter = 0
+        super().cleanup()
 
 
-# ============================================================================
+# ===============================================================
 # 场景8: 切入场景（从 new_scenarios/cut_in.py 转换）
 # ============================================================================
 
@@ -1990,7 +2495,6 @@ class ScenarioFactory:
         "trimma": TrimmaScenario,
         "construction_lane_change": ConstructionLaneChangeScenario,
         # ✅ 新增场景（已实现）
-        "pedestrian_crossing": PedestrianCrossingScenario,
         "vehicle_opens_door": VehicleOpensDoorScenario,
         "cut_in": CutInScenario,
         "parking_exit": ParkingExitScenario,

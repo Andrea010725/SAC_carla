@@ -5,6 +5,7 @@ import json
 import random
 import numpy as np
 import tensorflow as tf
+import traceback
 
 from .. import utils
 from typing import List, Union
@@ -59,17 +60,43 @@ class Agent:
         self.statistics = utils.Summary(mode=log_mode, name=name, keys=summary_keys)
 
     def set_random_seed(self, seed):
-        """Sets the random seed for tensorflow, numpy, python's random, and the environment"""
-        if seed is not None:
-            assert 0 <= seed < 2**32
+        if seed is None:
+            return
+        assert 0 <= seed < 2 ** 32
 
-            tf.random.set_seed(seed)
-            np.random.seed(seed)
-            random.seed(seed)
+        tf.random.set_seed(seed)
+        np.random.seed(seed)
+        random.seed(seed)
 
-            self.env.seed(seed)
-            self.seed = seed
-            print(f'Random seed {seed} set.')
+        # 兼容不同 env 接口
+        try:
+            self.env.reset(seed=seed)
+        except TypeError:
+            pass
+        except Exception:
+            pass
+
+        if hasattr(self.env, "seed"):
+            try:
+                self.env.seed(seed)
+            except Exception:
+                pass
+
+        # 空间也一起 seed（很多 env 用这个）
+        if hasattr(self.env, "action_space") and hasattr(self.env.action_space, "seed"):
+            try:
+                self.env.action_space.seed(seed)
+            except Exception:
+                pass
+
+        if hasattr(self.env, "observation_space") and hasattr(self.env.observation_space, "seed"):
+            try:
+                self.env.observation_space.seed(seed)
+            except Exception:
+                pass
+
+        self.seed = seed
+        print(f'Random seed {seed} set.')
 
     def act(self, state, *args, **kwargs):
         raise NotImplementedError
@@ -103,7 +130,8 @@ class Agent:
             self.reset()
             episode_reward = 0.0
 
-            state = self.env.reset()
+            out = self.env.reset()
+            state = out[0] if isinstance(out, tuple) and len(out) >= 1 else out
             state = utils.to_tensor(state)
 
             # TODO: temporary fix (shouldn't work for deeper nesting...)
@@ -166,8 +194,14 @@ class Agent:
     def write_summaries(self):
         try:
             self.statistics.write_summaries()
-        except Exception:
-            print('[write_summaries] error.')
+        except Exception as e:
+            print('[write_summaries] error:', repr(e))
+            traceback.print_exc()
+            # （可选）把当前已经累计的 keys 打出来，定位是哪类数据导致的
+            try:
+                print('[write_summaries] keys:', list(self.statistics.stats.keys()))
+            except Exception:
+                pass
 
     def summary(self):
         """Networks summary"""

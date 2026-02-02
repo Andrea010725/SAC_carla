@@ -57,20 +57,21 @@ class Config:
         self.planner_mode = "RL"
 
         # ===== Scenario =====
-        self.scenario = "parked_obstacles"
+        self.scenario = "cones"  # 默认场景改为cones
         self.spectator_mode = "none"
 
-        # ✅ 为了让 y_ref 真的"有用"，建议打开一点点随机性（否则它学不到分岔决策）
+        # ✅ 4场景训练：cones, jaywalker, trimma, construction_lane_change
         self.random_scenario = True
         self.scenario_pool = [
-            "parked_obstacles",
-            "cones",
-            # ✅ 新增场景（已实现）
-            "pedestrian_crossing",
-            "vehicle_opens_door",
-            "cut_in",
-            "parking_exit",
+            "cones",                      # 锥桶避让
+            "jaywalker",                  # 鬼探头（行人横穿）
+            "trimma",                     # 包围突围（左右夹击）
+            "construction_lane_change",   # 施工变道
         ]
+
+        # ===== y_ref 配置（修复P1级问题：增强y_ref信号）=====
+        self.use_yref_mapping = True
+        self.yref_steer_gain = 0.15  # ✅ 从0.03改为0.15 (15%影响，原来只有3%)
 
         # ===== Parked Obstacles 场景配置 =====
         self.num_parked_cars = 2

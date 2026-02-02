@@ -108,6 +108,12 @@ class PPOAgent(Agent):
         # TRD (Temporal Return Decomposition) loss coefficient
         self.trd_loss_coef = kwargs.get('trd_loss_coef', 0.01)
 
+        # TRD schedule
+        self.trd_coef_max = float(kwargs.get("trd_loss_coef", 0.01))
+        self.trd_warmup_updates = int(kwargs.get("trd_warmup_updates", 20))  # 前20次update不训练TRD
+        self.trd_ramp_updates = int(kwargs.get("trd_ramp_updates", 80))  # 再用80次线性爬升到max
+        self.update_step = tf.Variable(0, dtype=tf.int64, trainable=False)
+
         if seed_regularization:
             def _seed_regularization():
                 seed = random.randint(a=0, b=2 ** 32 - 1)
@@ -118,9 +124,6 @@ class PPOAgent(Agent):
         else:
             self.seed_regularization = lambda: None
 
-        # Entropy regularization
-        # entropy_regularization = 1e-3  #             5e-4
-        self.entropy_strength = DynamicParameter.create(value=entropy_regularization)
         # Entropy regularization
         # self.entropy_strength = DynamicParameter.create(value=float(entropy_regularization))
         self.entropy_strength = DynamicParameter.create(value=float(entropy_regularization))
@@ -326,15 +329,8 @@ class PPOAgent(Agent):
                     policy_grads = policy_grads['policy']
 
                 # 注意：policy_grads 里可能有 None
-                grads_norm = []
-                for g in policy_grads:
-                    if g is None:
-                        grads_norm.append(tf.constant(0.0, dtype=tf.float32))
-                    else:
-                        grads_norm.append(tf.norm(g))
-
-                self.log(loss_total=total_loss, lr_policy=self.policy_lr.value,
-                         gradients_norm_policy=grads_norm)
+                global_norm = tf.linalg.global_norm([g for g in policy_grads if g is not None])
+                self.log(grad_norm_policy=global_norm)
 
         # Value network optimization:
         for _ in range(self.optimization_steps['value']):
@@ -364,6 +360,8 @@ class PPOAgent(Agent):
             self.dump_trd_example(filename="trd_debug.txt")
         except Exception as e:
             print(f"dump_trd_example failed: {e}")
+
+        self.update_step.assign_add(1)
 
     # =========================
     # ✅ FIX: policy grads 必须对 (policy_lat + policy_lon) 求梯度
@@ -448,9 +446,14 @@ class PPOAgent(Agent):
 
         return gradients
 
-    def value_batch_tensors(self) -> Union[tuple, dict]:
-        """Defines which data to use in `get_value_batches()`"""
-        return self.memory.states, self.memory.returns, self.memory.trd_targets
+    def value_batch_tensors(self):
+        trd = self.memory.trd_targets
+        if trd is None:
+            # 用 0 占位，shape 需要和 value 网络输出的 trd_pred 对齐（比如 [T, B]）
+            T = tf.shape(self.memory.returns)[0]
+            B = getattr(self.network, "trd_bins", 10) + 1
+            trd = tf.zeros([T, B], dtype=tf.float32)
+        return self.memory.states, self.memory.returns, trd
 
     def policy_batch_tensors(self) -> Union[tuple, dict]:
         """Defines which data to use in `get_policy_batches()`"""
@@ -471,41 +474,40 @@ class PPOAgent(Agent):
 
     # TRD
     @tf.function
+    @tf.function
     def value_objective(self, batch):
-        # 解包: states, returns, trd_targets
         states, returns, trd_targets = batch[:3]
-
-        # 同时拿到 value (base,exp) 和 TRD 预测向量
         values, trd_pred = self.network.value_and_trd(states, training=True)
 
-        # ===== 原来的 value loss (保持不动) =====
         base_loss = tf.reduce_mean(losses.MSE(y_true=returns[:, 0], y_pred=values[:, 0]))
         exp_loss = tf.reduce_mean(losses.MSE(y_true=returns[:, 1], y_pred=values[:, 1]))
         value_loss = 0.5 * (0.25 * base_loss + exp_loss / (self.network.exp_scale ** 2))
 
-        # ===== 新增: TRD loss =====
-        # ===== TRD loss（安全：trd_targets 可能为 None）=====
+        # ---- TRD coef schedule (warmup + ramp) ----
+        step = tf.cast(self.update_step, tf.float32)
+        warm = tf.cast(self.trd_warmup_updates, tf.float32)
+        ramp = tf.cast(self.trd_ramp_updates, tf.float32)
+        maxc = tf.constant(self.trd_coef_max, tf.float32)
+
+        # warmup: coef=0
+        # ramp: coef = maxc * clip((step-warm)/ramp, 0..1)
+        prog = tf.where(ramp > 0.0, (step - warm) / ramp, 1.0)
+        prog = tf.clip_by_value(prog, 0.0, 1.0)
+        coef = maxc * prog
+
+        # ---- TRD loss ----
         if (trd_targets is None) or (not tf.is_tensor(trd_targets)):
-            # 没有 TRD targets：只做 value_loss
-            trd_loss = tf.constant(0.0, dtype=tf.float32)
+            trd_loss = tf.constant(0.0, tf.float32)
             total_loss = value_loss
         else:
-            # 防御：shape 不一致时裁到最小 batch
-            b1 = tf.shape(trd_pred)[0]
-            b2 = tf.shape(trd_targets)[0]
-            b = tf.minimum(b1, b2)
-            trd_pred_ = trd_pred[:b]
-            trd_targets_ = trd_targets[:b]
-            trd_loss = tf.reduce_mean(tf.square(trd_pred_ - trd_targets_))
-            total_loss = value_loss + self.trd_loss_coef * trd_loss
+            b = tf.minimum(tf.shape(trd_pred)[0], tf.shape(trd_targets)[0])
+            trd_loss = tf.reduce_mean(tf.square(trd_pred[:b] - trd_targets[:b]))
+            total_loss = value_loss + coef * trd_loss
 
-
-        # 可选 log
         self.log(loss_value_base=base_loss,
                  loss_value_exp=exp_loss,
                  loss_trd=trd_loss,
-                 trd_loss_coef=self.trd_loss_coef)
-
+                 trd_loss_coef=coef)
 
         return total_loss
 
@@ -770,7 +772,7 @@ class PPOAgent(Agent):
         self.memory.end_trajectory(last_value)
 
         # 1) returns
-        returns = self.memory.compute_returns(discount=self.gamma, append=append)
+        returns_scalar, returns_decomp = self.memory.compute_returns(discount=self.gamma, append=append)
 
         # 2) TRD targets
         if hasattr(self.memory, "compute_trd_targets"):
@@ -786,43 +788,51 @@ class PPOAgent(Agent):
         )
 
         # =========================
-        # ✅ 绝对鲁棒对齐（彻底杜绝 [T] vs [T±1]）
+        # ✅ 绝对鲁棒对齐（加入 states/logp 的长度）
         # =========================
-        # actions 是真实 transition 数
-        T_actions = tf.shape(self.memory.actions)[0]  # tensor
 
-        # returns: [Tr]（标量 returns）
-        returns = tf.convert_to_tensor(returns, dtype=tf.float32)
-        Tr = tf.shape(returns)[0]
+        # 1) states length
+        if self.memory.simple_state:
+            T_states = tf.shape(self.memory.states)[0]
+        else:
+            # dict state: 取最小长度
+            T_states = tf.reduce_min(
+                tf.stack([tf.shape(v)[0] for v in self.memory.states.values()])
+            )
 
-        # values_full: 你 compute_advantages 返回的 values_full（通常 [Tv]）
+        # 2) actions/logp length
+        T_actions = tf.shape(self.memory.actions)[0]
+        T_logp    = tf.shape(self.memory.log_probabilities)[0]
+
+        # 3) returns 用 returns_scalar（别用未定义的 returns）
+        returns_scalar = tf.convert_to_tensor(returns_scalar, dtype=tf.float32)
+        Tr = tf.shape(returns_scalar)[0]
+
+        # 4) values / adv
         values_full = tf.convert_to_tensor(values, dtype=tf.float32)
-        Tv = tf.shape(values_full)[0]
-
-        # values_t：真实步对应的 value（去掉 bootstrap 末尾那个）
-        # 注意：如果 values_full 本来就没 bootstrap，这里也不会崩（会变成 [Tv-1]）
-        values_t = values_full[:-1]
+        values_t = values_full[:-1]  # 去掉 bootstrap
         Tv_t = tf.shape(values_t)[0]
 
-        # advantages: [Ta]（通常应为 T_actions）
         advantages = tf.convert_to_tensor(advantages, dtype=tf.float32)
         Ta = tf.shape(advantages)[0]
 
-        # 取所有关键量的最小长度 L
-        L = tf.reduce_min(tf.stack([T_actions, Tr, Tv_t, Ta]))
+        # ✅ L = 所有关键量的最小长度（把 states/logp 也算进去）
+        L = tf.reduce_min(tf.stack([T_states, T_actions, T_logp, Tr, Tv_t, Ta]))
 
-        # 统一裁剪到 L
-        returns = returns[:L]
-        values_t = values_t[:L]
-        advantages = advantages[:L]
+        # ---- 统一裁剪到 L ----
+        if self.memory.simple_state:
+            self.memory.states = self.memory.states[:L]
+        else:
+            self.memory.states = {k: v[:L] for k, v in self.memory.states.items()}
 
-        # memory 内部也统一裁剪（防止 tf.data.Dataset.from_tensor_slices 再次炸）
-        self.memory.states = self.memory.states[:L] if self.memory.simple_state else {
-            k: v[:L] for k, v in self.memory.states.items()
-        }
         self.memory.actions = self.memory.actions[:L]
         self.memory.log_probabilities = self.memory.log_probabilities[:L]
 
+        values_t = values_t[:L]
+        advantages = advantages[:L]
+        returns_scalar = returns_scalar[:L]
+
+        # 这些如果存在也裁
         if self.memory.returns is not None:
             self.memory.returns = self.memory.returns[:L]
         if self.memory.advantages is not None:
@@ -830,34 +840,32 @@ class PPOAgent(Agent):
         if getattr(self.memory, "trd_targets", None) is not None:
             self.memory.trd_targets = self.memory.trd_targets[:L]
 
-        # 这里 rewards/values 保留原长度也行，但为了后续 append 索引不乱，建议也裁一下：
-        # rewards 一般是 [L+1]（含 dummy），values 一般也是 [L+1]（含 bootstrap）
+        # rewards/values 一般是 L+1（含 bootstrap/dummy），裁成 L+1 更安全
         if tf.shape(self.memory.rewards)[0] > L + 1:
             self.memory.rewards = self.memory.rewards[:L + 1]
         if tf.shape(self.memory.values)[0] > L + 1:
             self.memory.values = self.memory.values[:L + 1]
 
-        # debug：你可以暂时打印一次，确认不再 T±1
         print("[ALIGN]",
               "L=", int(L.numpy()),
+              "states=", int(T_states.numpy()),
               "actions=", int(T_actions.numpy()),
+              "logp=", int(T_logp.numpy()),
               "returns=", int(Tr.numpy()),
-              "values_full=", int(Tv.numpy()),
               "values_t=", int(Tv_t.numpy()),
-              "adv=", int(Ta.numpy())
+              "adv=", int(Ta.numpy()))
 
-              )
 
         # ✅ returns - values_t 绝不会再 shape mismatch
         self.log(
-            returns=returns,
+            returns=returns_scalar,
             advantages=advantages,
             values=values_t,
-            returns_minus_values=returns - values_t,
-            returns_base=self.memory.returns[:, 0] if self.memory.returns is not None else None,
-            returns_exp=self.memory.returns[:, 1] if self.memory.returns is not None else None,
-            values_base=self.memory.values[:-1, 0] if tf.shape(self.memory.values)[0] >= 2 else None,
-            values_exp=self.memory.values[:-1, 1] if tf.shape(self.memory.values)[0] >= 2 else None,
+            returns_minus_values=returns_scalar- values_t,
+            returns_base=self.memory.returns[:L, 0] if self.memory.returns is not None else None,
+            returns_exp=self.memory.returns[:L, 1] if self.memory.returns is not None else None,
+            values_base=self.memory.values[:L, 0] if tf.shape(self.memory.values)[0] >= L + 1 else None,
+            values_exp = self.memory.values[:L, 1] if tf.shape(self.memory.values)[0] >= L + 1 else None,
             advantages_normalized=self.memory.advantages,
         )
 
@@ -866,6 +874,8 @@ class PPOAgent(Agent):
             self.dump_trd_example(filename="trd_debug.txt", max_steps=50)
         except Exception as e:
             print(f"[TRD] dump_trd_example failed: {e}")
+
+        self.memory.update_index(append=append)
 
     def record(self, episode: int):
         self.memory.serialize(episode, save_path=self.traces_dir)
@@ -993,6 +1003,8 @@ class PPOMemory:
         self.returns = None
         self.advantages = None
 
+        self.returns_scalar = None  # [T]
+
         # TRD
         self.trd_targets = None
 
@@ -1018,13 +1030,20 @@ class PPOMemory:
 
     def append(self, state, action, reward, value, log_prob):
         if self.simple_state:
-            self.states = tf.concat([self.states, state], axis=0)
+            s = tf.convert_to_tensor(state, dtype=tf.float32)
+            if s.shape.rank == len(self.states.shape) - 1:  # 缺 batch
+                s = tf.expand_dims(s, axis=0)
+            self.states = tf.concat([self.states, s], axis=0)
+
         else:
             assert isinstance(state, dict)
             for k, v in state.items():
                 self.states[k] = tf.concat([self.states[k], v], axis=0)
 
-        self.actions = tf.concat([self.actions, tf.cast(action, dtype=tf.float32)], axis=0)
+        a = tf.convert_to_tensor(action, dtype=tf.float32)
+        a = tf.reshape(a, [-1, self.actions.shape[1]])  # [-1, A]
+        self.actions = tf.concat([self.actions, a], axis=0)
+
         self.rewards = tf.concat([self.rewards, [reward]], axis=0)
         self.values = tf.concat([self.values, value], axis=0)
         # self.log_probabilities = tf.concat([self.log_probabilities, log_prob], axis=0)
@@ -1112,27 +1131,25 @@ class PPOMemory:
         return self.trd_targets
 
     def compute_returns(self, discount: float, append=False):
-        """
-        以 actions 的长度 T 为准，计算 exactly T 个 return。
-        不再假设 rewards 最后一定有 dummy。
-        """
-        T = int(self.actions.shape[0])  # 真实步数
+        T = int(self.actions.shape[0])
+        rewards_seq = self.rewards[self.index:]
+        rewards_env = rewards_seq[:T]
 
-        rewards_seq = self.rewards[self.index:]  # 可能是 T 或 T+1
-        rewards_env = rewards_seq[:T]  # 强制取前 T 个作为环境 reward
+        returns_scalar = utils.rewards_to_go(rewards_env, discount=discount)
+        returns_scalar = utils.to_float(returns_scalar)  # [T]
 
-        returns = utils.rewards_to_go(rewards_env, discount=discount)
-        returns = utils.to_float(returns)
-
-        new_returns = tf.map_fn(fn=utils.decompose_number, elems=returns, dtype=(tf.float32, tf.float32))
+        new_returns = tf.map_fn(fn=utils.decompose_number, elems=returns_scalar,
+                                dtype=(tf.float32, tf.float32))
         new_returns = tf.stack(new_returns, axis=1)  # [T,2]
 
         if (self.returns is None) or (not append):
             self.returns = new_returns
+            self.returns_scalar = returns_scalar
         else:
             self.returns = tf.concat([self.returns, new_returns], axis=0)
+            self.returns_scalar = tf.concat([self.returns_scalar, returns_scalar], axis=0)
 
-        return returns  # [T]
+        return returns_scalar, new_returns
 
     def compute_advantages(self, gamma: float, lambda_: float, scale=2.0, append=False):
         """
@@ -1184,7 +1201,6 @@ class PPOMemory:
     def serialize(self, episode: int, save_path: str):
         filename = f'trace-{episode}-{time.strftime("%Y%m%d-%H%M%S")}.npz'
         trace_path = os.path.join(save_path, filename)
-        update_old_policy
         buffer = dict(reward=self.rewards, action=self.actions, value=self.values, log_prob=self.log_probabilities)
 
         if self.simple_state:
@@ -1195,181 +1211,3 @@ class PPOMemory:
 
         np.savez_compressed(file=trace_path, **buffer)
         print(f'Traces "{filename}" saved.')
-
-
-class PPOTrainer:
-    """Proximal Policy Optimization (PPO) trainer implementation."""
-
-    def __init__(self, agent, env):
-        self.agent = agent
-        self.env = env
-        self.logger = logging.getLogger(__name__)
-
-    def _process_save_frequency(self, save_every: Union[bool, str, int], episodes: int) -> int:
-        if not save_every:
-            return episodes + 1
-        if save_every is True:
-            return 1
-        if save_every == 'end':
-            return episodes
-        assert episodes % save_every == 0
-        return save_every
-
-    def _process_render_frequency(self, render_every: Union[bool, int], episodes: int) -> int:
-        return episodes + 1 if render_every is False else 1
-
-    def _preprocess_state(self, state: Union[Dict, Any]) -> Dict:
-        if isinstance(state, dict):
-            return {f'state_{k}': v for k, v in state.items()}
-        return state
-
-    # ✅ FIX: 返回 ActionData，而不是 tuple
-    def _collect_trajectory(self, state: Dict, timestep: int, render: bool) -> ActionData:
-        if render:
-            self.env.render()
-
-        state = self._preprocess_state(state)
-        state = utils.to_tensor(state)
-
-        if (timestep + 1) % 10 == 0 and isinstance(state, dict) and 'state_image' in state:
-            self.agent.log(image_state=state['state_image'])
-
-        action, mean, std, log_prob, value = self.agent.predict(state)
-        action_env = self.agent.convert_action(action)
-
-        return ActionData(
-            action=action,
-            action_env=action_env,
-            mean=mean,
-            std=std,
-            value=value,
-            log_prob=log_prob
-        )
-
-    def _run_episode(self, episode: int, config: TrainingConfig) -> float:
-        self._initialize_episode()
-        state = self._setup_environment()
-        episode_stats = self._create_episode_stats()
-
-        for timestep in range(1, config.timesteps + 1):
-            transition_data = self._execute_timestep(
-                state=state,
-                timestep=timestep,
-                should_render=episode % config.render_every == 0
-            )
-
-            episode_stats.update(transition_data.reward)
-
-            if self._should_terminate_episode(transition_data, timestep, config):
-                self._handle_episode_termination(
-                    episode=episode,
-                    stats=episode_stats,
-                    final_state=transition_data.next_state,
-                    is_done=transition_data.done
-                )
-                break
-
-            state = transition_data.next_state
-
-        return episode_stats.total_reward
-
-    def _initialize_episode(self) -> None:
-        self.agent.seed_regularization()
-        self.agent.on_episode_start()
-        self.agent.reset()
-
-    def _setup_environment(self) -> Dict:
-        return self.env.reset()
-
-    def _create_episode_stats(self) -> EpisodeStats:
-        return EpisodeStats(start_time=time.time())
-
-    def _execute_timestep(self, state: Dict, timestep: int, should_render: bool) -> TransitionData:
-        action_data = self._collect_trajectory(state, timestep, should_render)
-        next_state, reward, done = self._step_environment(action_data.action_env)
-
-        self._log_transition(action_data, reward)
-
-        # 确保 memory 已初始化
-        if self.agent.memory is None:
-            self.agent.memory = self.agent.get_memory()
-
-        self.agent.memory.append(
-            state=utils.to_tensor(self._preprocess_state(state)),
-            action=action_data.action,
-            reward=reward,
-            value=action_data.value,
-            log_prob=action_data.log_prob
-        )
-
-        return TransitionData(
-            next_state=next_state,
-            reward=reward,
-            done=done,
-            action_data=action_data
-        )
-
-    def _step_environment(self, action_env) -> Tuple[Dict, float, bool]:
-        total_reward = 0.0
-        next_state = None
-        done = False
-
-        for _ in range(self.agent.repeat_action):
-            next_state, reward, done, _ = self.env.step(action_env)
-            total_reward += reward
-            if done:
-                break
-
-        return next_state, total_reward, done
-
-    def _log_transition(self, action_data: ActionData, reward: float) -> None:
-        self.agent.log(
-            actions=action_data.action,
-            action_env=action_data.action_env,
-            rewards=reward,
-            distribution_mean=action_data.mean,
-            distribution_std=action_data.std
-        )
-
-    def _should_terminate_episode(self, transition_data: TransitionData, timestep: int, config: TrainingConfig) -> bool:
-        return transition_data.done or (timestep == config.timesteps)
-
-    def _handle_episode_termination(self, episode: int, stats: EpisodeStats, final_state: Dict, is_done: bool) -> None:
-        # 这里如果你有 self._handle_episode_end，可以接上；否则保持空实现即可
-        pass
-
-    def learn(self, config: TrainingConfig):
-        assert config.episodes % self.agent.update_frequency == 0
-
-        config.save_every = self._process_save_frequency(config.save_every, config.episodes)
-        config.render_every = self._process_render_frequency(config.render_every, config.episodes)
-
-        try:
-            self.agent.memory = self.agent.get_memory()
-
-            for episode in range(1, config.episodes + 1):
-                episode_reward = self._run_episode(episode, config)
-
-                if episode % self.agent.update_frequency == 0:
-                    self.agent.update()
-                    self.agent.memory.delete()
-                    self.agent.memory = self.agent.get_memory()
-                elif self.agent.update_frequency > 1:
-                    self.agent.memory.rewards = self.agent.memory.rewards[:-1]
-                    self.agent.memory.values = self.agent.memory.values[:-1]
-
-                self.agent.log(episode_rewards=episode_reward)
-                self.agent.write_summaries()
-
-                if self.agent.should_record:
-                    self.agent.record(episode)
-
-                self.agent.on_episode_end()
-
-                if episode % config.save_every == 0:
-                    self.agent.save()
-
-        finally:
-            if config.close:
-                self.logger.info('Closing environment...')
-                self.env.close()

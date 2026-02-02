@@ -541,6 +541,8 @@ class CarlaEnv(gym.Env):
         # --------- 2) steer：env 不再做 y_ref 映射，只执行最终 steer ---------
         steer_raw = float(np.clip(a1, -1.0, 1.0))  # 这里 steer_raw 就是 applied steer
         steer = steer_raw
+        if self.use_yref_in_steer:
+            steer = float(np.clip(steer_raw + self.yref_steer_gain * y_ref, -1, 1))
 
         # y_ref 仍然读出来，但只用于日志（不用于控制）
         y_ref = float(np.clip(a2, -1.0, 1.0))
@@ -573,6 +575,9 @@ class CarlaEnv(gym.Env):
         next_obs = self._get_state_obs()
 
         self.last_obs = next_obs
+        # 在调用 _get_reward() 之前就预告本步是否将触发 time limit
+        will_timeout = (self.episode_steps + 1 >= self.max_episode_steps)
+        self.timeout_flag = bool(will_timeout)
 
         # env 内部 reward / done_reason（collision/offroad/no_progress 等）都由 _get_reward 给
         reward_env, done_env, info = self._get_reward()
@@ -594,6 +599,10 @@ class CarlaEnv(gym.Env):
         # --------- 5) time limit（仅截断语义，不惩罚）---------
         self.episode_steps += 1
         timeout = (self.episode_steps >= self.max_episode_steps)  # 字段名 timeout 保留给日志
+        self.timeout_flag = bool(timeout)  # ✅ 新增
+
+        # reset() 里：初始化时
+        self.timeout_flag = False  # ✅ 新增
         done = bool(done_env or timeout)
 
         # --------- 6) done_reason 语义修正 ----------
@@ -629,9 +638,9 @@ class CarlaEnv(gym.Env):
         info["applied_steer"] = float(steer)
 
         # env 不再使用 y_ref 映射
-        info["yref_used"] = 0.0
         info["yref_steer_gain"] = float(self.yref_steer_gain)
-        info["steer_delta_from_yref"] = 0.0
+        info["yref_used"] = 1.0 if self.use_yref_in_steer else 0.0
+        info["steer_delta_from_yref"] = float(steer - steer_raw)
 
         if self.use_yref_in_steer:
             info["steer_delta_from_yref"] = float(steer - steer_raw)
@@ -1530,7 +1539,10 @@ class CarlaEnv(gym.Env):
 
             # ✅ 用点乘得到 ego-frame 的前向/横向
             rel_x = dx * float(ego_fwd.x) + dy * float(ego_fwd.y)
-            rel_y = dx * float(ego_right.x) + dy * float(ego_right.y)
+
+            # left vector = -right vector
+            ego_left = carla.Vector3D(x=-ego_right.x, y=-ego_right.y, z=-ego_right.z)
+            rel_y = dx * ego_left.x + dy * ego_left.y  # 左为正
 
             items.append((dist, rel_x, rel_y))
 
@@ -1594,151 +1606,131 @@ class CarlaEnv(gym.Env):
         import numpy as np
 
         # ============================================================
-        # ✅ 稳定版奖励函数（可直接替换）
-        # 改动要点：
-        # 1) progress 用 ego forward（不再用 waypoint forward）
-        # 2) obstacle shaping 逻辑补齐并修复：AVOID_RANGE/SAFE_DIST/LAT_TOL 等常量 + bug fix
-        # 3) 修复 gate / ^ / 未定义变量等问题
+        # ✅ Safety-first Reward (更稳定/更少组件版)
+        # 目标：先学会不碰撞、不出界，低速稳定穿过四个场景
         # ============================================================
 
-        # ----------------- terminal -----------------
-        K_COLLISION_TERMINAL = 25.0
-        K_OFFROAD_TERMINAL = 6.0
-        K_NO_PROGRESS_TERMINAL = 6.0
-        NO_PROGRESS_LIMIT = 300
+        # ----------------- terminal penalties -----------------
+        K_COLLISION_TERMINAL = 150.0
+        K_OFFROAD_TERMINAL = 100.0
+        K_NO_PROGRESS_TERM = 50.0
+        NO_PROGRESS_LIMIT = 220
 
-        # ----------------- progress -----------------
-        USE_FORWARD_PROGRESS = True  # ✅ 你想要 ego_forward / velocity_forward 就用 True
-        K_PROGRESS = 0.80
-        PROGRESS_CLIP = 0.40
+        # ----------------- progress (门控后才给) -----------------
+        K_PROGRESS = 0.45
+        PROG_CLIP = 0.25
+        PROG_EMA_A = 0.10
 
-        # ----------------- speed -----------------
-        TARGET_SPEED = 4.0
-        K_SPEED = 0.25
+        # ----------------- speed (先低速通过) -----------------
+        TARGET_SPEED = 2.5  # 更保守
+        V_MAX = 4.5  # 绝对上限（超过就罚）
+        OVERSPEED_START = 3.6  # 轻微超速开始罚
+        K_SPEED = 0.12
+        K_OVERSPEED = 0.18
 
-        # 全局超速惩罚
-        K_OVERSPEED_GLOBAL = 0.25
-        OVERSPEED_START = 4.8
+        # ----------------- lane keeping -----------------
+        K_LANE = 0.65
+        SOFT_START_RATIO = 0.50
+        K_OFFROAD_SOFT = 3.0
 
-        # ----------------- lane / danger -----------------
-        LANE_DEV_MAX = 2.0
-        K_LANE = 0.18
-        W_LANE_FINAL = 0.14
+        # ----------------- danger (提前触发+量级更大) -----------------
+        DANGER_START = 0.25
+        K_DANGER = 1.20
+        DANGER_CLIP = 2.0
 
-        K_DANGER = 0.55
-        DANGER_START_RATIO = 0.50
-        DANGER_CLIP = 0.8
-
-        # ----------------- offroad soft -----------------
-        K_OFFROAD_SOFT = 0.9
-        OFFROAD_SOFT_START_RATIO = 0.72
-
-        # ----------------- smooth / magnitude -----------------
-        K_MAG = 0.008
-        K_SMOOTH = 0.04
-        SMOOTH_ONLY_ABOVE_SPEED = 1.0
-        SMOOTH_CLIP_MIN = -0.12
-
-        # ----------------- steer penalties -----------------
-        K_STEER_SPEED = 0.20
-        STEER_SPEED_START = 3.5
-
-        K_STEER_THROTTLE = 0.15
-        STEER_THROTTLE_STEER_TH = 0.35
-
-        # ----------------- idle / no progress -----------------
-        PROGRESS_EMA_ALPHA = 0.08
-        NO_PROGRESS_FWD_THRESH = 0.01
-        NO_PROGRESS_SPEED_THRESH = 0.35
-        K_IDLE_STEP = 0.015
-
-        # ----------------- obstacle parsing config -----------------
-        HAVE_OBSTACLE_OBS = bool(getattr(self, "obs_use_obstacles", False))
+        # ----------------- obstacle shaping (更早更强) -----------------
+        HAVE_OBS = bool(getattr(self, "obs_use_obstacles", False))
         K_OBS = int(getattr(self, "obs_obstacle_k", 5))
         R_OBS = float(getattr(self, "obs_obstacle_range", 50.0))
         USE_LANE_FEAT = bool(getattr(self, "obs_use_lane", True))
         LANE_DIM = 6 if USE_LANE_FEAT else 0
 
-        # ----------------- obstacle shaping constants (✅ 你找的就是这部分) -----------------
-        AVOID_RANGE = 30.0  # 前方多少米开始产生“避障压力”
-        SAFE_DIST = 18.0  # ✅ 你想提前到 15~18m，就改这里（比如 15.0 / 16.0 / 18.0）
-        LAT_TOL = 2.5  # 横向门控宽度（车道内才强惩罚）
+        AVOID_FWD = 50.0  # 前向门控距离
+        SAFE_DIST = 26.0  # 更早进入“危险区”
+        LAT_TOL = 4.5
+        W_OBS_CLEAR = 4.0  # 近距强惩罚（主导）
+        W_OBS_SPEED = 1.0  # 近障碍限速惩罚
+        V_CAP_NEAR = 2.0  # 近障碍目标速度上限（低速绕行）
 
-        V_CAP = 2.8  # 有障碍时的限速上限
-        W_OBS_CLEAR = 0.55
-        W_OBS_SEP = 0.25
-        W_OBS_STUCK = 0.04
-        W_OBS_SPEED = 1.00
-
-        OFFROAD_MARGIN = 1.0
-        OBSTACLE_OFFROAD_EXTRA = 1.2
-
-        W_WP_FINAL = 1.0
-        W_SPEED_FINAL = 0.6
+        # ----------------- alive / success -----------------
+        R_ALIVE = 0.01
+        SUCCESS_BONUS = 80.0
 
         # ----------------- terminal flags -----------------
         collision_flag = bool(getattr(self, "collision", False))
         done = False
         done_reason = "running"
 
+        ego = getattr(self, "ego", None)
+        world = getattr(self, "world", None)
+        m = getattr(self, "map", None)
+
+        if ego is None or world is None or m is None:
+            return 0.0, False, {"done": 0.0, "done_reason": "no_ego"}
+
         # ----------------- ego states -----------------
-        vel = self.ego.get_velocity()
+        vel = ego.get_velocity()
         speed = float(math.sqrt(vel.x ** 2 + vel.y ** 2 + vel.z ** 2))
 
-        loc = self.ego.get_location()
-        wp = self.map.get_waypoint(loc, project_to_road=True)
+        loc = ego.get_location()
+        wp = m.get_waypoint(loc, project_to_road=True)
 
-        lane_deviation = float(
-            math.hypot(loc.x - wp.transform.location.x, loc.y - wp.transform.location.y)
-        )
+        lane_width = float(getattr(wp, "lane_width", 3.5))
+        lane_center = wp.transform.location
+        lane_dev = float(math.hypot(loc.x - lane_center.x, loc.y - lane_center.y))
 
-        # ----------------- progress -----------------
-        progress_fwd = 0.0
-        delta_dist = 0.0
-
-        if USE_FORWARD_PROGRESS:
-            if getattr(self, "prev_loc", None) is None:
-                self.prev_loc = loc
-
-            # ✅ 用 ego 的 forward，不用 waypoint 的 forward
-            ego_tf = self.ego.get_transform()
-            ego_fwd = ego_tf.get_forward_vector()
-
-            dx = float(loc.x - self.prev_loc.x)
-            dy = float(loc.y - self.prev_loc.y)
-
-            # ego forward 投影进度（本质就是 velocity_forward 的离散版）
-            progress_fwd = dx * float(ego_fwd.x) + dy * float(ego_fwd.y)
-            progress_fwd = float(np.clip(progress_fwd, -PROGRESS_CLIP, PROGRESS_CLIP))
-
+        # ----------------- progress (ego-forward projection) -----------------
+        if getattr(self, "prev_loc", None) is None:
             self.prev_loc = loc
 
-            r_progress = K_PROGRESS * progress_fwd
-            progress_signal = float(progress_fwd)
+        ego_tf = ego.get_transform()
+        fwd = ego_tf.get_forward_vector()
 
-        else:
-            # 旧版本：靠 waypoint 距离变化算进度
-            if getattr(self, "target_wp", None) is None:
-                self.target_wp = wp
-                self.prev_wp_dist = None
+        dx = float(loc.x - self.prev_loc.x)
+        dy = float(loc.y - self.prev_loc.y)
+        prog_fwd = dx * float(fwd.x) + dy * float(fwd.y)
+        prog_fwd = float(np.clip(prog_fwd, -PROG_CLIP, PROG_CLIP))
+        self.prev_loc = loc
 
-            target_loc = self.target_wp.transform.location
-            dist_to_wp = float(math.hypot(loc.x - target_loc.x, loc.y - target_loc.y))
+        # EMA for idle
+        if not hasattr(self, "progress_ema"):
+            self.progress_ema = 0.0
+        self.progress_ema = (1.0 - PROG_EMA_A) * float(self.progress_ema) + PROG_EMA_A * float(prog_fwd)
 
-            if getattr(self, "prev_wp_dist", None) is None:
-                delta_dist = 0.0
-            else:
-                delta_dist = float(self.prev_wp_dist - dist_to_wp)
+        if not hasattr(self, "no_progress_steps"):
+            self.no_progress_steps = 0
+        is_idle = (abs(self.progress_ema) < 0.01) and (speed < 0.35)
+        self.no_progress_steps = self.no_progress_steps + 1 if is_idle else 0
 
-            self.prev_wp_dist = dist_to_wp
-            delta_dist = float(np.clip(delta_dist, -1.0, 1.0))
+        r_no_progress_term = 0.0
+        if self.no_progress_steps > int(NO_PROGRESS_LIMIT):
+            done = True
+            done_reason = "no_progress"
+            r_no_progress_term = -K_NO_PROGRESS_TERM
 
-            r_progress = 1.0 * delta_dist
-            progress_signal = float(delta_dist)
+        # ----------------- lane/offroad -----------------
+        offroad_thresh = 0.5 * lane_width + 1.0
+        lane_ratio = lane_dev / max(offroad_thresh, 1e-6)
+        offroad = bool(lane_dev > offroad_thresh)
 
-        r_wp = float(r_progress)
+        # soft offroad penalty (提前拉回)
+        r_offroad_soft = 0.0
+        soft_start = SOFT_START_RATIO * offroad_thresh
+        if lane_dev > soft_start:
+            x = (lane_dev - soft_start) / max(offroad_thresh - soft_start, 1e-6)
+            x = float(np.clip(x, 0.0, 2.0))
+            r_offroad_soft = -K_OFFROAD_SOFT * float(x * x)
 
-        # ----------------- obstacle parse -----------------
+        # lane dense penalty
+        r_lane = -K_LANE * float(np.clip(lane_ratio, 0.0, 2.0) ** 2)
+
+        # danger: 提前触发 + 与速度耦合（更强）
+        danger_excess = max(0.0, lane_ratio - DANGER_START)
+        speed_ratio = float(np.clip(speed / max(TARGET_SPEED, 1e-6), 0.0, 2.0))
+        r_danger = -K_DANGER * float(danger_excess ** 2) * speed_ratio
+        r_danger = float(np.clip(r_danger, -DANGER_CLIP, 0.0))
+
+        # ----------------- nearest obstacle (obs优先 + fallback) -----------------
         nearest_dist = None
         nearest_fwd = None
         nearest_lat = None
@@ -1746,68 +1738,44 @@ class CarlaEnv(gym.Env):
 
         obs_vec = getattr(self, "last_obs", None)
 
-        def _fallback_nearest_obstacle_world():
-            """如果 obs 里没有有效障碍，就用 world actor 做 fallback（只取前方障碍）。"""
+        def _fallback_nearest_world():
             try:
-                ego_tf2 = self.ego.get_transform()
-                ego_loc = ego_tf2.location
-                fwd_v = ego_tf2.get_forward_vector()
-                right_v = ego_tf2.get_right_vector()
+                tf2 = ego.get_transform()
+                e_loc = tf2.location
+                e_fwd = tf2.get_forward_vector()
+                e_right = tf2.get_right_vector()
             except Exception:
                 return None, None, None
 
-            candidates = []
+            best = None
             for a in getattr(self, "obstacle_actors", []):
                 if a is None:
                     continue
                 try:
-                    if a.id != self.ego.id:
-                        candidates.append(a)
-                except Exception:
-                    continue
-
-            if bool(getattr(self, "traffic", False)):
-                try:
-                    for a in self.world.get_actors().filter("vehicle.*"):
-                        if a.id != self.ego.id:
-                            candidates.append(a)
-                except Exception:
-                    pass
-
-            best = None
-            for a in candidates:
-                try:
                     a_loc = a.get_location()
                 except Exception:
                     continue
-
-                dx = float(a_loc.x - ego_loc.x)
-                dy = float(a_loc.y - ego_loc.y)
-                dist = float(math.hypot(dx, dy))
-
-                if dist > R_OBS or dist < 1e-6:
+                dx_ = float(a_loc.x - e_loc.x)
+                dy_ = float(a_loc.y - e_loc.y)
+                dist_ = float(math.hypot(dx_, dy_))
+                if dist_ < 1e-3 or dist_ > R_OBS:
                     continue
-
-                fwdp = dx * float(fwd_v.x) + dy * float(fwd_v.y)
-                latp = dx * float(right_v.x) + dy * float(right_v.y)
-
-                # ✅ 前方过滤
+                fwdp = dx_ * float(e_fwd.x) + dy_ * float(e_fwd.y)
                 if fwdp <= 0.0:
                     continue
-
-                if (best is None) or (dist < best[0]):
-                    best = (dist, fwdp, latp)
+                latp = dx_ * float(e_right.x) + dy_ * float(e_right.y)
+                if (best is None) or (dist_ < best[0]):
+                    best = (dist_, fwdp, latp)
 
             if best is None:
                 return None, None, None
-
             return best[0], best[1], best[2]
 
-        # ---- 从 obs 中解析 nearest obstacle（优先） ----
-        if HAVE_OBSTACLE_OBS and (obs_vec is not None) and (len(obs_vec) >= 9 + LANE_DIM + K_OBS * 3):
-            obs_vec = np.asarray(obs_vec, dtype=np.float32).reshape(-1)
+        # 从 obs 解析（保持兼容）
+        if HAVE_OBS and (obs_vec is not None) and (len(obs_vec) >= 9 + LANE_DIM + K_OBS * 3):
+            x = np.asarray(obs_vec, dtype=np.float32).reshape(-1)
             start = 9 + LANE_DIM
-            block = obs_vec[start:start + K_OBS * 3].reshape(K_OBS, 3)
+            block = x[start:start + K_OBS * 3].reshape(K_OBS, 3)
 
             valid = block[:, 2] > 1e-6
             if np.any(valid):
@@ -1815,200 +1783,88 @@ class CarlaEnv(gym.Env):
                 rely_n = block[valid, 1]
                 dist_n = block[valid, 2]
 
-                # 归一化 -> 米
                 relx = relx_n * R_OBS
                 rely = rely_n * R_OBS
                 dist = dist_n * R_OBS
 
-                ego_tf = self.ego.get_transform()
-                ego_fwd = ego_tf.get_forward_vector()
-                ego_right = ego_tf.get_right_vector()
-
                 yaw = math.radians(float(ego_tf.rotation.yaw))
                 cy, sy = math.cos(yaw), math.sin(yaw)
-
-                # ego坐标系 -> world 平面增量
                 dx_w = relx * cy - rely * sy
                 dy_w = relx * sy + rely * cy
 
-                # 投影到 ego前向/右向（实现“前方过滤”）
-                fwd_proj = dx_w * float(ego_fwd.x) + dy_w * float(ego_fwd.y)
-                lat_proj = dx_w * float(ego_right.x) + dy_w * float(ego_right.y)
+                right = ego_tf.get_right_vector()
+                fwd_proj = dx_w * float(fwd.x) + dy_w * float(fwd.y)
+                lat_proj = dx_w * float(right.x) + dy_w * float(right.y)
 
-                front_mask = fwd_proj > 0.0
-                if np.any(front_mask):
-                    dist2 = dist[front_mask]
-                    fwd2 = fwd_proj[front_mask]
-                    lat2 = lat_proj[front_mask]
-
+                front = fwd_proj > 0.0
+                if np.any(front):
+                    dist2 = dist[front]
+                    fwd2 = fwd_proj[front]
+                    lat2 = lat_proj[front]
                     j = int(np.argmin(dist2))
                     nearest_dist = float(dist2[j])
                     nearest_fwd = float(fwd2[j])
                     nearest_lat = float(lat2[j])
                 else:
-                    nearest_dist, nearest_fwd, nearest_lat = _fallback_nearest_obstacle_world()
+                    nearest_dist, nearest_fwd, nearest_lat = _fallback_nearest_world()
             else:
-                nearest_dist, nearest_fwd, nearest_lat = _fallback_nearest_obstacle_world()
+                nearest_dist, nearest_fwd, nearest_lat = _fallback_nearest_world()
         else:
-            nearest_dist, nearest_fwd, nearest_lat = _fallback_nearest_obstacle_world()
+            nearest_dist, nearest_fwd, nearest_lat = _fallback_nearest_world()
 
-        # ----------------- obstacle shaping -----------------
-        r_obstacle_clear = 0.0
-        r_obstacle_sep = 0.0
-        r_obstacle_stuck = 0.0
-        r_obstacle_speed = 0.0
+        # ----------------- obstacle penalties (删掉 r_obs_sep，避免刷奖励抖动) -----------------
+        r_obs_clear = 0.0
+        r_obs_speed = 0.0
 
         if (nearest_dist is not None) and (nearest_fwd is not None):
-
-            # 前方距离门控：越靠近越大
-            g = (AVOID_RANGE - float(nearest_fwd)) / max(AVOID_RANGE, 1e-6)
+            # 前向门控：越近越强
+            g = (AVOID_FWD - float(nearest_fwd)) / max(AVOID_FWD, 1e-6)
             g = float(np.clip(g, 0.0, 1.0))
 
-            # 横向门控：越在车道内越大
+            # 横向门控：别太严
             lat_gate = 1.0
             if nearest_lat is not None:
-                lat_gate = float(np.clip(1.0 - abs(nearest_lat) / max(LAT_TOL, 1e-6), 0.0, 1.0))
+                lat_gate = float(np.clip(1.0 - abs(float(nearest_lat)) / max(LAT_TOL, 1e-6), 0.0, 1.0))
 
             obstacle_gate = g * lat_gate
 
-            # ✅ SAFE_DIST 内给强惩罚（注意 **2）
+            # 进入 SAFE_DIST：平方强惩罚（主导安全）
             if nearest_dist < SAFE_DIST:
                 x = (SAFE_DIST - float(nearest_dist)) / max(SAFE_DIST, 1e-6)
-                r_obstacle_clear = -W_OBS_CLEAR * obstacle_gate * float(x ** 2)
+                r_obs_clear = -W_OBS_CLEAR * obstacle_gate * float(x * x)
 
-            # 分离奖励：越拉开距离越好
-            prev = getattr(self, "prev_min_obstacle_dist", None)
-            if prev is None:
-                self.prev_min_obstacle_dist = float(nearest_dist)
-            else:
-                delta = float(nearest_dist - prev)
-                delta = float(np.clip(delta, -2.0, 2.0))
-                r_obstacle_sep = W_OBS_SEP * obstacle_gate * (delta / max(AVOID_RANGE, 1e-6))
-                self.prev_min_obstacle_dist = float(nearest_dist)
-
-            # 卡住惩罚
-            if (obstacle_gate > 0.3) and (speed < 0.3) and (abs(progress_signal) < 1e-3):
-                r_obstacle_stuck = -W_OBS_STUCK
-
-            # 障碍限速惩罚
+            # 近障碍限速：超过 V_CAP_NEAR 就罚
             if obstacle_gate > 0.05:
-                over = max(0.0, speed - V_CAP)
-                r_obstacle_speed = -W_OBS_SPEED * obstacle_gate * float(over / max(V_CAP, 1e-6))
+                over = max(0.0, speed - V_CAP_NEAR)
+                r_obs_speed = -W_OBS_SPEED * obstacle_gate * float((over / max(V_CAP_NEAR, 1e-6)) ** 2)
 
-        # ----------------- lane width / offroad -----------------
-        lane_width = float(getattr(wp, "lane_width", 3.5))
-        offroad_thresh = 0.5 * lane_width + OFFROAD_MARGIN + OBSTACLE_OFFROAD_EXTRA * float(obstacle_gate)
-        offroad = bool(lane_deviation > offroad_thresh)
-
-        # ✅ 出界前软惩罚
-        r_offroad_soft = 0.0
-        soft_start = OFFROAD_SOFT_START_RATIO * offroad_thresh
-        if lane_deviation > soft_start:
-            x = (lane_deviation - soft_start) / max(offroad_thresh - soft_start, 1e-6)
-            x = float(np.clip(x, 0.0, 1.5))
-            r_offroad_soft = -K_OFFROAD_SOFT * float(x ** 2)
-
-        # ----------------- speed reward + overspeed penalty -----------------
+        # ----------------- speed reward (强门控：危险时不给“快”) -----------------
+        # 只鼓励低速接近 TARGET_SPEED
         err = abs(speed - TARGET_SPEED) / max(TARGET_SPEED, 1e-3)
         speed_score = float(np.clip(1.0 - err, 0.0, 1.0))
         r_speed = K_SPEED * speed_score
 
-        # 近障碍时速度正奖励快速归零
-        r_speed *= float((1.0 - 0.9 * obstacle_gate) * (1.0 - obstacle_gate))
+        # 门控：偏离车道/近障碍 -> 速度奖励迅速变小
+        # （这比你原来门控更“硬”，更利于先学安全）
+        safety_gate = float(np.clip(1.0 - 1.2 * lane_ratio, 0.0, 1.0))
+        safety_gate *= float(np.clip(1.0 - 1.5 * obstacle_gate, 0.0, 1.0))
+        r_speed *= safety_gate
 
-        # 全局超速惩罚（二次增长）
-        r_overspeed_global = 0.0
+        # overspeed penalty：只保留一条，更干净
+        r_overspeed = 0.0
         if speed > OVERSPEED_START:
             over = (speed - OVERSPEED_START) / max(OVERSPEED_START, 1e-6)
-            r_overspeed_global = -K_OVERSPEED_GLOBAL * float(over ** 2)
+            r_overspeed = -K_OVERSPEED * float(over * over)
+        if speed > V_MAX:
+            # 超过硬上限再加一层（防止失控）
+            r_overspeed -= 0.5 * float(((speed - V_MAX) / max(V_MAX, 1e-6)) ** 2)
 
-        # 未知障碍保守控速（可选）
-        r_unknown_obstacle_guard = 0.0
-        if (nearest_dist is None) and (speed > (TARGET_SPEED + 0.8)):
-            r_unknown_obstacle_guard = -0.05 * float((speed - (TARGET_SPEED + 0.8)) ** 2)
+        # ----------------- progress (强门控：危险时不奖励“冲”) -----------------
+        # 关键：progress 只有在“比较安全”的时候才给，避免为了进度硬撞
+        r_progress = K_PROGRESS * prog_fwd
+        r_progress *= safety_gate
 
-        # ----------------- lane keeping penalty -----------------
-        lane_dev_clip = min(lane_deviation, LANE_DEV_MAX)
-        r_lane = -K_LANE * lane_dev_clip
-        r_lane *= float(1.0 - 0.5 * obstacle_gate)
-
-        # ----------------- danger penalty -----------------
-        lane_ratio = lane_deviation / max(offroad_thresh, 1e-6)
-        danger_excess = max(0.0, lane_ratio - DANGER_START_RATIO)
-        speed_ratio = speed / max(TARGET_SPEED, 1e-3)
-        r_danger = -K_DANGER * (danger_excess ** 2) * float(np.clip(speed_ratio, 0.0, 2.0))
-        r_danger = float(np.clip(r_danger, -DANGER_CLIP, 0.0))
-        r_danger *= float(1.0 - 0.7 * obstacle_gate)
-
-        # ----------------- smoothness & magnitude + steer penalties -----------------
-        lc = getattr(self, "last_control", None)
-        th = float(getattr(lc, "throttle", 0.0)) if lc is not None else 0.0
-
-        r_smooth = 0.0
-        r_mag = 0.0
-        r_steer_speed = 0.0
-        r_steer_throttle = 0.0
-
-        st = 0.0
-        br = 0.0
-
-        if lc is not None:
-            br = float(getattr(lc, "brake", 0.0))
-            st = float(getattr(lc, "steer", 0.0))
-
-            r_mag = -K_MAG * (abs(st) + abs(th) + abs(br))
-
-            # 高速大转角惩罚： (v/v0)^2 * steer^2
-            if speed > STEER_SPEED_START:
-                ratio = speed / max(STEER_SPEED_START, 1e-6)
-                r_steer_speed = -K_STEER_SPEED * float(ratio ** 2) * float(st ** 2)
-
-            # 大舵角还给油：额外惩罚
-            if abs(st) > STEER_THROTTLE_STEER_TH and th > 0.2:
-                r_steer_throttle = -K_STEER_THROTTLE * float(abs(st) - STEER_THROTTLE_STEER_TH) * float(th)
-
-            # smoothness
-            if (getattr(self, "prev_control_for_smooth", None) is not None) and (speed > SMOOTH_ONLY_ABOVE_SPEED):
-                pc = self.prev_control_for_smooth
-                d_th = abs(th - float(getattr(pc, "throttle", 0.0)))
-                d_br = abs(br - float(getattr(pc, "brake", 0.0)))
-                d_st = abs(st - float(getattr(pc, "steer", 0.0)))
-
-                r_smooth = -K_SMOOTH * (2.0 * d_st + d_th + d_br)
-                r_smooth = max(SMOOTH_CLIP_MIN, float(r_smooth))
-
-            self.prev_control_for_smooth = lc
-
-        # ✅ progress 稳定门控：蛇形/大舵角时降低 r_wp
-        stability = float(np.clip(1.0 - 0.7 * abs(st), 0.25, 1.0))
-        r_wp *= stability
-
-        # ----------------- idle / no progress (EMA) -----------------
-        if not hasattr(self, "progress_ema"):
-            self.progress_ema = 0.0
-
-        self.progress_ema = (1.0 - PROGRESS_EMA_ALPHA) * float(self.progress_ema) + PROGRESS_EMA_ALPHA * float(
-            progress_signal)
-
-        is_idle = (abs(self.progress_ema) < NO_PROGRESS_FWD_THRESH) and (speed < NO_PROGRESS_SPEED_THRESH)
-
-        if not hasattr(self, "no_progress_steps"):
-            self.no_progress_steps = 0
-
-        if is_idle:
-            self.no_progress_steps += 1
-        else:
-            self.no_progress_steps = 0
-
-        r_idle = -K_IDLE_STEP if is_idle else 0.0
-
-        r_no_progress_terminal = 0.0
-        if self.no_progress_steps > int(NO_PROGRESS_LIMIT):
-            done = True
-            done_reason = "no_progress"
-            r_no_progress_terminal = -K_NO_PROGRESS_TERMINAL
-
-        # ----------------- terminal penalties -----------------
+        # ----------------- terminal checks -----------------
         r_collision = 0.0
         if collision_flag:
             done = True
@@ -2021,111 +1877,54 @@ class CarlaEnv(gym.Env):
             done_reason = "offroad"
             r_offroad = -K_OFFROAD_TERMINAL
 
-        # ----------------- RewardMonitor (optional) -----------------
-        base_reward = 0.0
-        rm_info = {}
-        if getattr(self, "reward_monitor", None) is not None and lc is not None:
-            planner_id_map = {"RULE": 0, "IL": 1, "RL": 2}
-            planner_id = planner_id_map.get(getattr(self, "planner_mode", "RL"), 2)
+        # ----------------- alive + success -----------------
+        r_alive = R_ALIVE if not done else 0.0
 
-            rm_total, comps = self.reward_monitor.update(
-                control=lc,
-                planner_id=planner_id,
-                collision_flag=collision_flag,
-                done=done,
-            )
-            rm_total = float(rm_total)
-            rm_total_clipped = float(np.clip(rm_total, -10.0, 10.0))
-            base_reward = 0.02 * rm_total_clipped
+        r_success = 0.0
+        timeout_flag = bool(getattr(self, "timeout_flag", False))
+        if timeout_flag and (not collision_flag) and (not offroad):
+            r_success = SUCCESS_BONUS
 
-            rm_info = {
-                "reward_components": comps.to_dict(),
-                "planner_id": planner_id,
-                "rm_total": float(rm_total),
-                "rm_total_clipped": float(rm_total_clipped),
-            }
-
-        # ----------------- alive bonus -----------------
-        r_alive = 0.01 if not done else 0.0
-
-        # ----------------- final weights -----------------
+        # ----------------- total reward -----------------
         components = {
-            "base_reward": float(base_reward),
-
-            "r_wp": W_WP_FINAL * float(r_wp),
-            "r_speed": W_SPEED_FINAL * float(r_speed),
-            "r_lane": W_LANE_FINAL * float(r_lane),
-
+            "r_progress": float(r_progress),
+            "r_speed": float(r_speed),
+            "r_lane": float(r_lane),
             "r_danger": float(r_danger),
-            "r_mag": float(r_mag),
-            "r_smooth": float(r_smooth),
-
-            "r_steer_speed": float(r_steer_speed),
-            "r_steer_throttle": float(r_steer_throttle),
-            "r_overspeed_global": float(r_overspeed_global),
             "r_offroad_soft": float(r_offroad_soft),
-            "r_unknown_obstacle_guard": float(r_unknown_obstacle_guard),
-
-            "r_idle": float(r_idle),
-            "r_no_progress_terminal": float(r_no_progress_terminal),
+            "r_obs_clear": float(r_obs_clear),
+            "r_obs_speed": float(r_obs_speed),
+            "r_overspeed": float(r_overspeed),
+            "r_no_progress_terminal": float(r_no_progress_term),
             "r_offroad": float(r_offroad),
             "r_collision": float(r_collision),
             "r_alive": float(r_alive),
-
-            "r_obstacle_clear": float(r_obstacle_clear),
-            "r_obstacle_sep": float(r_obstacle_sep),
-            "r_obstacle_stuck": float(r_obstacle_stuck),
-            "r_obstacle_speed": float(r_obstacle_speed),
-
-            "r_yref": 0.0,
+            "r_success": float(r_success),
         }
 
         total_reward = float(sum(components.values()))
         self.last_reward_components = components.copy()
 
-        # ----------------- info (debug对齐用) -----------------
+        # ----------------- info -----------------
         info = {
-            **rm_info,
-
             "done": float(done),
             "done_reason": done_reason,
             "collision": float(collision_flag),
-
             "speed": float(speed),
-            "lane_deviation": float(lane_deviation),
-            "offroad": float(offroad),
-            "offroad_thresh": float(offroad_thresh),
+            "lane_deviation": float(lane_dev),
             "lane_width": float(lane_width),
-
-            "no_progress_steps": float(self.no_progress_steps),
-            "progress_forward": float(progress_fwd),
-            "delta_dist": float(delta_dist),
-            "progress_signal": float(progress_signal),
+            "offroad_thresh": float(offroad_thresh),
+            "lane_ratio": float(lane_ratio),
+            "offroad": float(offroad),
+            "progress_fwd": float(prog_fwd),
             "progress_ema": float(getattr(self, "progress_ema", 0.0)),
-
+            "no_progress_steps": float(getattr(self, "no_progress_steps", 0)),
             "nearest_obstacle_dist": float(nearest_dist) if nearest_dist is not None else -1.0,
             "nearest_obstacle_fwd": float(nearest_fwd) if nearest_fwd is not None else 0.0,
             "nearest_obstacle_lat": float(nearest_lat) if nearest_lat is not None else 0.0,
             "obstacle_gate": float(obstacle_gate),
-
-            "have_obstacle_obs": float(HAVE_OBSTACLE_OBS),
-            "obs_len": float(len(getattr(self, "last_obs", []))) if getattr(self, "last_obs",
-                                                                            None) is not None else -1.0,
-
-            "r_collision": float(r_collision),
-            "r_offroad": float(r_offroad),
-            "r_offroad_soft": float(r_offroad_soft),
-
-            "r_steer_speed": float(r_steer_speed),
-            "r_steer_throttle": float(r_steer_throttle),
-            "r_overspeed_global": float(r_overspeed_global),
-            "r_unknown_obstacle_guard": float(r_unknown_obstacle_guard),
+            "safety_gate": float(safety_gate),
         }
-
-        if lc is not None:
-            info["control_throttle"] = float(getattr(lc, "throttle", 0.0))
-            info["control_brake"] = float(getattr(lc, "brake", 0.0))
-            info["control_steer"] = float(getattr(lc, "steer", 0.0))
 
         # reset collision latch
         self.collision = False
