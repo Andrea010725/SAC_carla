@@ -215,11 +215,40 @@ class CarlaEnv(gym.Env):
         self.font_big = None
         self.clock = None
         if self.render_display:
-            pygame.init()
-            self.screen = pygame.display.set_mode((400, 300), pygame.HWSURFACE | pygame.DOUBLEBUF)
-            self.font_big = get_font(size=24)
-            self.font_small = get_font(size=14)
-            self.clock = pygame.time.Clock()
+            # ✅ 尝试使用真实显示，如果失败则回退到虚拟模式
+            try:
+                # 首先尝试使用 x11 显示（真实窗口）
+                if 'SDL_VIDEODRIVER' in os.environ:
+                    del os.environ['SDL_VIDEODRIVER']
+
+                # 先初始化 pygame
+                pygame.init()
+
+                # 尝试创建窗口（使用更安全的标志）
+                self.screen = pygame.display.set_mode((800, 600), pygame.SWSURFACE)
+                self.font_big = get_font(size=24)
+                self.font_small = get_font(size=14)
+                self.clock = pygame.time.Clock()
+                print("[CarlaEnv] ✅ Pygame显示已启用（真实窗口模式）")
+            except Exception as e:
+                # 如果真实显示失败，回退到虚拟模式
+                print(f"[CarlaEnv] ⚠️ 无法创建真实窗口: {e}")
+                print("[CarlaEnv] 回退到虚拟显示模式...")
+
+                # 清理之前的 pygame 初始化
+                try:
+                    pygame.quit()
+                except:
+                    pass
+
+                # 使用虚拟显示驱动
+                os.environ['SDL_VIDEODRIVER'] = 'dummy'
+                pygame.init()
+                self.screen = pygame.display.set_mode((400, 300), pygame.SWSURFACE)
+                self.font_big = get_font(size=24)
+                self.font_small = get_font(size=14)
+                self.clock = pygame.time.Clock()
+                print("[CarlaEnv] ✅ Pygame显示已启用（虚拟模式）")
 
         # Matplotlib for reward visualization
         self.reward_fig = None

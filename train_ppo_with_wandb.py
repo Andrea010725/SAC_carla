@@ -774,7 +774,7 @@ def train_ppo():
         # "parking_exit",          # ⚠️ 暂时禁用：需要进一步测试
     ]  # 场景池（3个稳定场景）
 
-    config.render = True  # ✅ 开启可视化
+    config.render = True  # ✅ 开启pygame可视化
     config.spectator_mode = "chase"  # ✅ 开启第三人称跟随视角
     config.wandb_step_log_interval = 10
     config.observations_type = "state_lane_obstacles"
