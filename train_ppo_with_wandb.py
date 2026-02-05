@@ -92,7 +92,10 @@ class CarlaGymEnv(gym.Env):
     def __init__(self, config, logger=None, wandb_run=None):
         super().__init__()
         self.config = config
-        self.carla_env = CarlaEnv(config, 2000, 8000)
+        # ✅ 端口使用配置，避免硬编码导致多实例/端口冲突
+        carla_port = int(getattr(config, "carla_port", 2000))
+        tm_port = int(getattr(config, "carla_tm_port", 8000))
+        self.carla_env = CarlaEnv(config, carla_port, tm_port)
         self.logger = logger
         self.wandb_run = wandb_run
 
@@ -763,6 +766,11 @@ def train_ppo():
 
     config = Config()
 
+    # ✅ 端口显式设置：保持与旧脚本一致（原来固定 2000/8000）
+    # 如果你的 TM/Server 端口不同，直接改这里即可
+    config.carla_port = 2000
+    config.carla_tm_port = 8000
+
     # ✅ 启用随机场景训练
     config.random_scenario = True  # 开启随机场景
     config.scenario_pool = [
@@ -774,12 +782,26 @@ def train_ppo():
         # "parking_exit",          # ⚠️ 暂时禁用：需要进一步测试
     ]  # 场景池（3个稳定场景）
 
-    config.render = True  # ✅ 开启pygame可视化
-    config.spectator_mode = "chase"  # ✅ 开启第三人称跟随视角
+    # ✅ 训练阶段关闭可视化（减少CARLA渲染负载，降低断连/内存占用）
+    # 评估阶段再打开 render + spectator_mode 即可
+    config.render = False
+    config.spectator_mode = "none"
+
+    # ✅ 训练阶段关闭调试绘制（debug线段也会增加server负载）
+    config.enable_debug_drawing = False
+    config.debug_draw_interval = 50  # 即使打开也降低频率
+    config.draw_detection_range = False
+    config.draw_ego_direction = False
+    config.draw_obstacle_boxes = False
+    config.draw_lane_center = False
     config.wandb_step_log_interval = 10
     config.observations_type = "state_lane_obstacles"
     config.obs_obstacle_k = 5
     config.obs_obstacle_range = 50.0
+
+    # ✅ 统一episode步长：训练timesteps 与 env.max_episode_steps 对齐
+    # 防止time_limit截断导致统计/收敛判断偏移
+    config.max_episode_steps = 512
 
     # Parked obstacles场景参数
     config.num_parked_cars = 4
@@ -894,7 +916,8 @@ def train_ppo():
             agent, env, logger,
             wandb_run=wandb_run,
             episodes=300,
-            timesteps=512,
+            # ✅ 和 env.max_episode_steps 保持一致，避免time_limit截断影响统计
+            timesteps=int(getattr(config, "max_episode_steps", 512)),
             save_every=100
         )
     except KeyboardInterrupt:

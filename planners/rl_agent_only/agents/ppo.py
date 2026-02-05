@@ -1181,7 +1181,11 @@ class PPOMemory:
             return values_full, adv
 
         advantages = utils.gae(rewards, values=values_full, gamma=gamma, lambda_=lambda_, normalize=False)  # [T]
-        new_advantages = utils.tf_sp_norm(advantages) * scale
+        # ✅ 只做尺度放大，不在这里做归一化
+        # 原来这里 + policy_objective 再标准化会导致“双重归一化”，
+        # 使优势过小、梯度变弱，容易卡平台不收敛。
+        # 统一在 policy_objective 里做一次标准化即可。
+        new_advantages = advantages * scale
 
         if (self.advantages is None) or (not append):
             self.advantages = new_advantages

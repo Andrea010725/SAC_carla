@@ -21,6 +21,9 @@ class CarlaSyncMode:
 
         fps = kwargs.get("fps", 20)
         self.delta_seconds = 1.0 / float(fps)
+        # ✅ 训练时可关闭渲染，显著降低 CARLA 内存与显存压力
+        # 由外部传入 no_rendering_mode=True 时启用
+        self.no_rendering_mode = bool(kwargs.get("no_rendering_mode", False))
 
         self.frame = None
         self._settings = None
@@ -41,7 +44,9 @@ class CarlaSyncMode:
         new_settings = self.world.get_settings()
         new_settings.synchronous_mode = True
         new_settings.fixed_delta_seconds = self.delta_seconds
-        new_settings.no_rendering_mode = False  # 确保渲染开启
+        # ✅ 根据训练/评估模式决定是否渲染
+        # 训练时建议 no_rendering_mode=True，减少断连
+        new_settings.no_rendering_mode = self.no_rendering_mode
 
         # apply_settings returns frame id
         self.frame = self.world.apply_settings(new_settings)

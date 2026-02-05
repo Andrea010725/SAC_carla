@@ -324,6 +324,8 @@ class CarlaEnv(gym.Env):
         s = self.world.get_settings()
         s.synchronous_mode = True
         s.fixed_delta_seconds = fixed_dt
+        # ✅ 训练阶段关闭渲染：降低内存占用，减少CARLA断连
+        s.no_rendering_mode = (not self.render_display)
         self.world.apply_settings(s)
 
     def _load_map_if_needed(self, town: str):
@@ -472,10 +474,20 @@ class CarlaEnv(gym.Env):
             self._actors.append(self.collision_sensor)
 
         fps = int(round(1.0 / self.fixed_dt))
+        # ✅ 同步模式：训练时可关闭渲染，减少内存占用与断连风险
         if self.render_display and self.camera_display is not None:
-            self.sync_mode = CarlaSyncMode(self.world, self.camera_display, fps=fps)
+            self.sync_mode = CarlaSyncMode(
+                self.world,
+                self.camera_display,
+                fps=fps,
+                no_rendering_mode=(not self.render_display),
+            )
         else:
-            self.sync_mode = CarlaSyncMode(self.world, fps=fps)
+            self.sync_mode = CarlaSyncMode(
+                self.world,
+                fps=fps,
+                no_rendering_mode=(not self.render_display),
+            )
 
         # 初始控制：刹停一帧，确保稳定
         # ✅ 增加重试机制，防止 RPC 超时

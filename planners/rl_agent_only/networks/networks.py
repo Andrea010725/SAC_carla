@@ -336,7 +336,12 @@ class PPONetwork(Network):
         lon_logp = dist_lon.log_prob(lon_sample)
 
         base_lon = self._get_base_normal(dist_lon)
-        throttle = tf.tanh(base_lon.loc)
+        # ✅ 关键修复：执行动作必须与 log_prob 对齐
+        # 原来这里用的是 tanh(mu)，但 log_prob 用的是采样值 lon_sample，
+        # 会导致 PPO 比率失真，训练容易卡平台/不收敛。
+        # 这里改为：动作使用采样值（与 log_prob 一致），
+        # 均值仅用于日志可视化。
+        throttle_action = lon_sample
         lon_mean_raw = base_lon.loc
         lon_std_raw = base_lon.scale
         lon_mean = tf.tanh(lon_mean_raw)
@@ -344,7 +349,7 @@ class PPONetwork(Network):
 
 
         # 3) 拼最终 action / mean / std / log_prob
-        action = tf.concat([throttle, steer, y_ref], axis=1)  # [B,3]
+        action = tf.concat([throttle_action, steer, y_ref], axis=1)  # [B,3]
         mean = tf.concat([lon_mean, lat_mean[:, 0:1], lat_mean[:, 1:2]], axis=1)
         std = tf.concat([lon_std, lat_std[:, 0:1], lat_std[:, 1:2]], axis=1)
 
