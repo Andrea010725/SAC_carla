@@ -429,10 +429,11 @@ class PPONetwork(Network):
         return self.policy_layers(inputs, **kwargs)
 
     # ----------------- dist builders -----------------
-    def _squashed_gaussian_dist_layer(self, layer, out_dim, name_prefix, min_scale=1e-3):
+    def _squashed_gaussian_dist_layer(self, layer, out_dim, name_prefix, min_scale=0.05):
         mu = Dense(out_dim, activation='linear', name=f'{name_prefix}_mu')(layer)
 
-        # 用 raw_scale -> softplus -> scale，避免 scale=0 导致 entropy=0
+        # ✅ 用 raw_scale -> softplus -> scale，避免 scale=0 导致 entropy=0
+        # ✅ 提高 min_scale，防止策略过早塌缩到“几乎确定性”
         raw_scale = Dense(out_dim, activation='linear', name=f'{name_prefix}_raw_scale')(layer)
         raw_scale = tf.clip_by_value(raw_scale, -5.0, 2.0)  # 大幅限制 std
         scale = tf.nn.softplus(raw_scale) + min_scale

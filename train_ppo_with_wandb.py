@@ -74,6 +74,49 @@ class RunningMeanStd:
         return (x - self.mean) / np.sqrt(self.var + 1e-8)
 
 
+# ============================================================
+# ✅ 训练课程策略（Curriculum Learning）
+# 目标：先学“能走、少撞”，再逐步增加场景难度
+# ============================================================
+def apply_curriculum(episode: int, env: "CarlaGymEnv"):
+    cfg = env.config
+
+    # --- Stage 1: 只练 cones，数量少，先稳定学会“走直线 + 不碰撞” ---
+    if episode <= 80:
+        cfg.scenario_pool = ["cones"]
+        cfg.cone_num = 8
+        cfg.num_parked_cars = 2
+        cfg.use_yref_in_steer = False
+        cfg.yref_steer_gain = 0.0
+
+    # --- Stage 2: cones + parked_obstacles，逐步增加障碍密度 ---
+    elif episode <= 160:
+        cfg.scenario_pool = ["cones", "parked_obstacles"]
+        cfg.cone_num = 12
+        cfg.num_parked_cars = 3
+        cfg.use_yref_in_steer = False
+        cfg.yref_steer_gain = 0.0
+
+    # --- Stage 3: 加入行人场景（jaywalker/trimma） ---
+    else:
+        cfg.scenario_pool = ["cones", "parked_obstacles", "jaywalker", "trimma"]
+        cfg.cone_num = 15
+        cfg.num_parked_cars = 4
+        cfg.use_yref_in_steer = True
+        cfg.yref_steer_gain = 0.03
+
+
+# ============================================================
+# ✅ 熵系数调度：先探索，后收敛
+# ============================================================
+def update_entropy_coeff(episode: int, agent, start: float = 0.12, end: float = 0.03, decay_ep: int = 200):
+    if not hasattr(agent, "entropy_strength"):
+        return
+    frac = min(1.0, float(episode) / float(decay_ep))
+    coeff = start + (end - start) * frac
+    if hasattr(agent.entropy_strength, "value"):
+        agent.entropy_strength.value = float(coeff)
+
 class CarlaGymEnv(gym.Env):
     """
     CARLA Gym wrapper for PPO
@@ -111,9 +154,12 @@ class CarlaGymEnv(gym.Env):
 
         self.max_episode_steps = int(getattr(config, "max_episode_steps", 512))
 
-        # ===== ✅ y_ref 开关交给 CarlaEnv（字段名对齐）=====
-        self.carla_env.use_yref_in_steer = bool(getattr(config, "use_yref_mapping", True))  # False
-        self.carla_env.yref_steer_gain = float(getattr(config, "yref_gain", 0.03))
+        # ===== ✅ y_ref 开关交给 CarlaEnv（字段名兼容旧/新配置）=====
+        # 优先使用 use_yref_in_steer / yref_steer_gain，若没有则兼容旧字段
+        use_yref_flag = getattr(config, "use_yref_in_steer", getattr(config, "use_yref_mapping", True))
+        yref_gain = getattr(config, "yref_steer_gain", getattr(config, "yref_gain", 0.03))
+        self.carla_env.use_yref_in_steer = bool(use_yref_flag)
+        self.carla_env.yref_steer_gain = float(yref_gain)
 
         # y_ref 惩罚：wrapper层加（也可以以后下放到 CarlaEnv）
         self.yref_penalty = float(getattr(config, "yref_penalty", 0.0))
@@ -336,8 +382,9 @@ def train_with_logging(agent, env, logger, wandb_run=None, episodes=300, timeste
     update_count = 0
 
     # ============================================================
-    # ✅ Early Stop / Convergence 规则（你可以按需要微调阈值）
+    # ✅ Early Stop / Convergence 规则（可通过 config.enable_early_stop 关闭）
     # ============================================================
+    enable_early_stop = bool(getattr(getattr(env, "config", None), "enable_early_stop", True))
     W = 20  # 滑动窗口长度（建议 20~50）
     MIN_EP = 30  # 至少跑到这个 episode 才开始早停判断
 
@@ -380,6 +427,22 @@ def train_with_logging(agent, env, logger, wandb_run=None, episodes=300, timeste
         episode_std_mean_count = 0
 
         logger.start_episode(episode)
+
+        # ============================================================
+        # ✅ 课程学习：动态调整场景 + y_ref 难度
+        # ============================================================
+        try:
+            apply_curriculum(episode, env)
+        except Exception as e:
+            print(f"[Curriculum] ⚠️ apply_curriculum failed: {e}")
+
+        # ============================================================
+        # ✅ 熵系数调度：先探索，后收敛
+        # ============================================================
+        try:
+            update_entropy_coeff(episode, agent)
+        except Exception as e:
+            print(f"[EntropySchedule] ⚠️ update_entropy_coeff failed: {e}")
 
         agent.seed_regularization()
         agent.on_episode_start()
@@ -450,9 +513,8 @@ def train_with_logging(agent, env, logger, wandb_run=None, episodes=300, timeste
             for k in episode_reward_components.keys():
                 episode_reward_components[k] += float(env.step_reward_components.get(k, 0.0))
 
-            # 速度统计
-            if isinstance(next_state, (list, tuple, np.ndarray)) and len(next_state) > 8:
-                episode_speed_sum += float(next_state[8])
+            # 速度统计：优先使用 info 中的真实速度（obs 已被归一化）
+            episode_speed_sum += float(last_info.get("speed", 0.0))
 
             # 碰撞统计
             if last_info.get("collision", 0.0):
@@ -546,6 +608,9 @@ def train_with_logging(agent, env, logger, wandb_run=None, episodes=300, timeste
         elif agent.update_frequency > 1:
             agent.memory.rewards = agent.memory.rewards[:-1]
             agent.memory.values = agent.memory.values[:-1]
+            # ✅ 重要：去掉 dummy 后同步 index，避免下一回合切片错位
+            if hasattr(agent.memory, "index"):
+                agent.memory.index = max(0, agent.memory.index - 1)
 
         logger.log_training_metrics(
             policy_loss=policy_loss_tracker,
@@ -667,7 +732,7 @@ def train_with_logging(agent, env, logger, wandb_run=None, episodes=300, timeste
         # ============================================================
         # ✅ Early Stop 触发：收敛 / 平台期 / 崩溃
         # ============================================================
-        if episode >= MIN_EP and len(dq_success) == W:
+        if enable_early_stop and episode >= MIN_EP and len(dq_success) == W:
             if stable_good_count >= NEED_STABLE_WINDOWS:
                 print(
                     f"\n✅ EarlyStop: CONVERGED. "
@@ -718,7 +783,7 @@ def train_ppo():
                     "gamma": 0.99,
                     "lambda": 0.95,
                     "clip_ratio": 0.2,           # 修正：与agent一致
-                    "entropy_reg": 0.05,         # 修正：与agent一致
+                    "entropy_reg": 0.12,         # ✅ 提高探索起点，后续会线性衰减
                     "batch_size": 128,           # 修正：从256改为128
                     "update_frequency": 2,       # 新增：与agent一致
                     "optimization_steps": (10, 10),  # 新增：与agent一致
@@ -733,8 +798,11 @@ def train_ppo():
                     "action_bias_decay": 0.999,
 
                     # ✅ 两版本开关
-                    "use_yref_mapping": True,   # True: steer_raw + k*y_ref; False: steer_raw
+                    # 兼容旧字段 + 新字段（训练中会用 curriculum 动态开关）
+                    "use_yref_mapping": True,   # 兼容旧字段
+                    "use_yref_in_steer": True,  # 新字段
                     "yref_gain": 0.03,
+                    "yref_steer_gain": 0.03,
                     "yref_penalty": 0.05,
 
                     "log_steer_saturation": True,
@@ -773,14 +841,25 @@ def train_ppo():
 
     # ✅ 启用随机场景训练
     config.random_scenario = True  # 开启随机场景
+    # ✅ 只保留当前 ScenarioFactory 真正支持的场景
+    # pedestrian_crossing 目前未注册，会走 fallback 导致“无障碍”场景，容易误判收敛
     config.scenario_pool = [
         "parked_obstacles",
         "cones",
-        "pedestrian_crossing",   # ✅ 新增：行人过马路（稳定）
-        # "vehicle_opens_door",    # ⚠️ 暂时禁用：Town05 没有 XML 预定义位置
-        # "cut_in",                # ⚠️ 暂时禁用：需要进一步测试
-        # "parking_exit",          # ⚠️ 暂时禁用：需要进一步测试
-    ]  # 场景池（3个稳定场景）
+        # "jaywalker",             # 如果已验证再打开
+        # "trimma",
+        # "construction_lane_change",
+        # "vehicle_opens_door",
+        # "cut_in",
+        # "parking_exit",
+    ]
+
+    # ✅ y_ref 新字段默认值（训练中会被 curriculum 动态覆盖）
+    config.use_yref_in_steer = True
+    config.yref_steer_gain = 0.03
+    # 兼容旧字段
+    config.use_yref_mapping = True
+    config.yref_gain = 0.03
 
     # ✅ 训练阶段关闭可视化（减少CARLA渲染负载，降低断连/内存占用）
     # 评估阶段再打开 render + spectator_mode 即可
@@ -803,6 +882,10 @@ def train_ppo():
     # 防止time_limit截断导致统计/收敛判断偏移
     config.max_episode_steps = 512
 
+    # ✅ 关闭 early-stop（先保证稳定训练）
+    # 如果你想恢复早停，把这个改回 True
+    config.enable_early_stop = False
+
     # Parked obstacles场景参数
     config.num_parked_cars = 4
     config.parked_car_spacing = 8.0
@@ -823,8 +906,14 @@ def train_ppo():
         config.action_bias_strength = float(cfg.get("action_bias_strength", 0.7))
         config.action_bias_decay = float(cfg.get("action_bias_decay", 0.999))
 
-        config.use_yref_mapping = bool(cfg.get("use_yref_mapping", True))
-        config.yref_gain = float(cfg.get("yref_gain", 0.03))
+        # ✅ y_ref 新旧字段统一：训练内部都用 use_yref_in_steer / yref_steer_gain
+        _use_yref = bool(cfg.get("use_yref_in_steer", cfg.get("use_yref_mapping", True)))
+        _yref_gain = float(cfg.get("yref_steer_gain", cfg.get("yref_gain", 0.03)))
+        config.use_yref_in_steer = _use_yref
+        config.yref_steer_gain = _yref_gain
+        # 兼容旧字段（防止其他模块仍在读取旧名）
+        config.use_yref_mapping = _use_yref
+        config.yref_gain = _yref_gain
         config.yref_penalty = float(cfg.get("yref_penalty", 0.0))
         config.log_steer_saturation = bool(cfg.get("log_steer_saturation", True))
         config.steer_sat_threshold = float(cfg.get("steer_sat_threshold", 0.999))
@@ -836,6 +925,9 @@ def train_ppo():
         config.action_bias_strength = 0.7
         config.action_bias_decay = 0.999
 
+        # ✅ y_ref 新旧字段统一
+        config.use_yref_in_steer = True
+        config.yref_steer_gain = 0.03
         config.use_yref_mapping = True
         config.yref_gain = 0.03
         config.yref_penalty = 0.0
@@ -845,7 +937,7 @@ def train_ppo():
     # ===== 根据版本自动设置 yref_penalty =====
     # 不映射版：给一个小惩罚把 y_ref 压到 0
     # 映射版：不惩罚（或很小）
-    if config.use_yref_mapping:
+    if bool(getattr(config, "use_yref_in_steer", config.use_yref_mapping)):
         config.yref_penalty = 0.0  # 或 0.01（看你是否希望更平滑）
     else:
         config.yref_penalty = 0.05  # 推荐从 0.05 开始（范围 0.02~0.1）
@@ -864,8 +956,10 @@ def train_ppo():
     print("✅ 日志记录器创建成功")
 
     print("\n[DEBUG] Config y_ref switch:")
-    print("  use_yref_mapping =", getattr(config, "use_yref_mapping", None))
-    print("  yref_gain        =", getattr(config, "yref_gain", None))
+    print("  use_yref_in_steer =", getattr(config, "use_yref_in_steer", None))
+    print("  yref_steer_gain   =", getattr(config, "yref_steer_gain", None))
+    print("  use_yref_mapping  =", getattr(config, "use_yref_mapping", None))
+    print("  yref_gain         =", getattr(config, "yref_gain", None))
     print("  yref_penalty     =", getattr(config, "yref_penalty", None))
 
     print("\n[2] 创建CARLA Gym环境...")
@@ -897,7 +991,8 @@ def train_ppo():
         gamma=0.99,
         lambda_=0.95,
         clip_ratio=0.2,              # ✅ P2: 从0.15改为0.2（标准PPO值）
-        entropy_regularization=0.05,  # ✅ P1: 从0.01改为0.05（增加探索）
+        # ✅ 提高熵正则，配合线性衰减（先探索、后收敛）
+        entropy_regularization=0.12,
         optimization_steps=(10, 10),  # ✅ P2: 从(5,5)改为(10,10)（提升数据效率）
         batch_size=128,               # ✅ P2: 从256改为128（更多batch）
         update_frequency=2,           # ✅ P2: 从1改为2（累积更多数据）

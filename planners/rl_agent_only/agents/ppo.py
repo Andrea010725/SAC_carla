@@ -105,6 +105,9 @@ class PPOAgent(Agent):
         self.repeat_action = repeat_action
         self.adv_scale = DynamicParameter.create(value=advantage_scale)
 
+        # ✅ 控制是否打印 policy debug（默认关闭，避免刷屏）
+        self.debug_policy_print = bool(kwargs.get("debug_policy_print", False))
+
         # TRD (Temporal Return Decomposition) loss coefficient
         self.trd_loss_coef = kwargs.get('trd_loss_coef', 0.01)
 
@@ -564,8 +567,10 @@ class PPOAgent(Agent):
         tf.debugging.check_numerics(entropy, "entropy has NaN/Inf")
         tf.debugging.check_numerics(approx_kl, "approx_kl has NaN/Inf")
 
-        tf.print("[DBG] states", tf.shape(states), "actions", tf.shape(actions), "old_logp",
-                 tf.shape(old_log_probabilities))
+        # ✅ 仅在需要时打印（默认关闭，避免刷屏/拖慢训练）
+        if getattr(self, "debug_policy_print", False):
+            tf.print("[DBG] states", tf.shape(states), "actions", tf.shape(actions), "old_logp",
+                     tf.shape(old_log_probabilities))
 
         entropy_bonus = self.entropy_strength() * entropy
         total_loss = policy_loss - entropy_bonus
@@ -746,6 +751,9 @@ class PPOAgent(Agent):
                 elif self.update_frequency > 1:
                     self.memory.rewards = self.memory.rewards[:-1]
                     self.memory.values = self.memory.values[:-1]
+                    # ✅ 重要：去掉 dummy 后同步 index，避免切片错位
+                    if hasattr(self.memory, "index"):
+                        self.memory.index = max(0, self.memory.index - 1)
 
                 self.log(episode_rewards=episode_reward)
                 self.write_summaries()
@@ -804,17 +812,26 @@ class PPOAgent(Agent):
         T_actions = tf.shape(self.memory.actions)[0]
         T_logp    = tf.shape(self.memory.log_probabilities)[0]
 
-        # 3) returns 用 returns_scalar（别用未定义的 returns）
+        # 3) returns（当前 episode 的标量回报）
         returns_scalar = tf.convert_to_tensor(returns_scalar, dtype=tf.float32)
-        Tr = tf.shape(returns_scalar)[0]
 
-        # 4) values / adv
+        # 4) values / adv（当前 episode）
         values_full = tf.convert_to_tensor(values, dtype=tf.float32)
         values_t = values_full[:-1]  # 去掉 bootstrap
-        Tv_t = tf.shape(values_t)[0]
 
         advantages = tf.convert_to_tensor(advantages, dtype=tf.float32)
-        Ta = tf.shape(advantages)[0]
+
+        # ✅ 对齐长度：当 append=True（多 episode 累积）时，
+        # 需要用“累计长度”来对齐，否则会把旧 episode 的数据截断掉，
+        # 导致 states/actions/returns 长度不一致。
+        if append:
+            Tr = tf.shape(self.memory.returns)[0] if self.memory.returns is not None else tf.shape(returns_scalar)[0]
+            Ta = tf.shape(self.memory.advantages)[0] if self.memory.advantages is not None else tf.shape(advantages)[0]
+            Tv_t = tf.maximum(tf.shape(self.memory.values)[0] - 1, 0) if self.memory.values is not None else tf.shape(values_t)[0]
+        else:
+            Tr = tf.shape(returns_scalar)[0]
+            Ta = tf.shape(advantages)[0]
+            Tv_t = tf.shape(values_t)[0]
 
         # ✅ L = 所有关键量的最小长度（把 states/logp 也算进去）
         L = tf.reduce_min(tf.stack([T_states, T_actions, T_logp, Tr, Tv_t, Ta]))
@@ -917,6 +934,12 @@ class PPOAgent(Agent):
         self.policy_lr.on_episode()
         self.value_lr.on_episode()
         self.adv_scale.on_episode()
+        # ✅ 熵系数/clip_ratio 也允许随 episode 调度
+        # 这样训练脚本可以做“先探索、后收敛”的 schedule
+        if hasattr(self, "entropy_strength"):
+            self.entropy_strength.on_episode()
+        if hasattr(self, "clip_ratio"):
+            self.clip_ratio.on_episode()
 
     def on_episode_start(self):
         """Episode initialization for PPO agent."""
@@ -1084,12 +1107,14 @@ class PPOMemory:
         其中 bins 把 [0, T-t) 均匀切成 (n_bins+1) 段
         输出 shape: [T, n_bins+1]
         """
-        # 真实步数 T（以 actions 为准）
-        T = int(self.actions.shape[0])
-
-        # rewards 里可能有 dummy，取前 T 个环境 reward
+        # rewards 里可能有 dummy，取当前 episode 的环境 reward
         rewards_seq = self.rewards[self.index:]
-        rewards_env = rewards_seq[:T]
+        # ✅ 去掉 dummy reward，避免越界和统计污染
+        rewards_env = rewards_seq[:-1]
+
+        # ✅ 真实步数 T 必须以 rewards_env 长度为准
+        # 否则 append=True 时会出现越界（历史 action 比当前 reward 长）
+        T = int(rewards_env.shape[0])
 
         # 转成 numpy 方便写循环（T<=512 完全够用）
         r = rewards_env.numpy() if isinstance(rewards_env, tf.Tensor) else np.asarray(rewards_env, dtype=np.float32)
@@ -1131,9 +1156,11 @@ class PPOMemory:
         return self.trd_targets
 
     def compute_returns(self, discount: float, append=False):
-        T = int(self.actions.shape[0])
+        # ✅ rewards 序列始终包含 dummy（end_trajectory 追加）
+        # 这里统一丢掉最后一个 dummy，避免返回长度错位/越界
         rewards_seq = self.rewards[self.index:]
-        rewards_env = rewards_seq[:T]
+        # ✅ end_trajectory 一定追加 dummy，所以这里直接去掉最后一个
+        rewards_env = rewards_seq[:-1]
 
         returns_scalar = utils.rewards_to_go(rewards_env, discount=discount)
         returns_scalar = utils.to_float(returns_scalar)  # [T]
@@ -1181,6 +1208,9 @@ class PPOMemory:
             return values_full, adv
 
         advantages = utils.gae(rewards, values=values_full, gamma=gamma, lambda_=lambda_, normalize=False)  # [T]
+        # ✅ dtype 保护：gae 内部会走 numpy/scipy，容易变成 float64
+        # 这里统一转成 float32，避免后面 PPO 计算报错
+        advantages = utils.to_float(advantages)
         # ✅ 只做尺度放大，不在这里做归一化
         # 原来这里 + policy_objective 再标准化会导致“双重归一化”，
         # 使优势过小、梯度变弱，容易卡平台不收敛。
