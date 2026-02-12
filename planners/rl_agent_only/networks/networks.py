@@ -434,8 +434,12 @@ class PPONetwork(Network):
 
         # ✅ 用 raw_scale -> softplus -> scale，避免 scale=0 导致 entropy=0
         # ✅ 提高 min_scale，防止策略过早塌缩到“几乎确定性”
-        raw_scale = Dense(out_dim, activation='linear', name=f'{name_prefix}_raw_scale')(layer)
-        raw_scale = tf.clip_by_value(raw_scale, -5.0, 2.0)  # 大幅限制 std
+        raw_scale = Dense(out_dim,
+                          activation='linear',
+                          kernel_initializer='zeros',
+                          bias_initializer=tf.keras.initializers.Constant(0.5),
+                          name=f'{name_prefix}_raw_scale')(layer)
+        # raw_scale = tf.clip_by_value(raw_scale, -5.0, 2.0)  # 大幅限制 std
         scale = tf.nn.softplus(raw_scale) + min_scale
 
         def _make_dist(params):

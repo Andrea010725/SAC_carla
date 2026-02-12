@@ -19,6 +19,14 @@ planners_path = os.path.join(script_dir, "planners")
 if planners_path not in sys.path:
     sys.path.insert(0, planners_path)
 
+# 添加 CARLA PythonAPI 路径（用于导入agents模块和carla模块）
+carla_api_path = "/home/ajifang/carla/PythonAPI/carla/"
+carla_egg_path = "/home/ajifang/carla/PythonAPI/carla/dist/carla-0.9.15-py3.7-linux-x86_64.egg"
+if carla_api_path not in sys.path:
+    sys.path.insert(0, carla_api_path)
+if carla_egg_path not in sys.path:
+    sys.path.insert(0, carla_egg_path)
+
 import gym
 import numpy as np
 
@@ -91,7 +99,7 @@ def apply_curriculum(episode: int, env: "CarlaGymEnv"):
 
     # --- Stage 2: cones + parked_obstacles，逐步增加障碍密度 ---
     elif episode <= 160:
-        cfg.scenario_pool = ["cones", "parked_obstacles"]
+        cfg.scenario_pool = ["cones", "trimma", "construction_lane_chang"]
         cfg.cone_num = 12
         cfg.num_parked_cars = 3
         cfg.use_yref_in_steer = False
@@ -99,7 +107,7 @@ def apply_curriculum(episode: int, env: "CarlaGymEnv"):
 
     # --- Stage 3: 加入行人场景（jaywalker/trimma） ---
     else:
-        cfg.scenario_pool = ["cones", "parked_obstacles", "jaywalker", "trimma"]
+        cfg.scenario_pool = ["cones", "trimma", "construction_lane_change", "jaywalker"]
         cfg.cone_num = 15
         cfg.num_parked_cars = 4
         cfg.use_yref_in_steer = True
@@ -363,7 +371,7 @@ class CarlaGymEnv(gym.Env):
     def render(self, mode="human"):
         pass
 
-def train_with_logging(agent, env, logger, wandb_run=None, episodes=300, timesteps=512, save_every=100):
+def train_with_logging(agent, env, logger, wandb_run=None, episodes=500, timesteps=512, save_every=100):
     """
     带日志记录和Wandb监控的PPO训练循环 + ✅自动早停/收敛判定
     """
@@ -787,7 +795,7 @@ def train_ppo():
                     "batch_size": 128,           # 修正：从256改为128
                     "update_frequency": 2,       # 新增：与agent一致
                     "optimization_steps": (10, 10),  # 新增：与agent一致
-                    "episodes": 300,
+                    "episodes": 500,
                     "max_steps_per_episode": 512,
                     "wandb_step_log_interval": 10,
 
@@ -844,11 +852,11 @@ def train_ppo():
     # ✅ 只保留当前 ScenarioFactory 真正支持的场景
     # pedestrian_crossing 目前未注册，会走 fallback 导致“无障碍”场景，容易误判收敛
     config.scenario_pool = [
-        "parked_obstacles",
+        # "parked_obstacles",
         "cones",
-        # "jaywalker",             # 如果已验证再打开
-        # "trimma",
-        # "construction_lane_change",
+        "jaywalker",             # 如果已验证再打开
+        "trimma",
+        "construction_lane_change",
         # "vehicle_opens_door",
         # "cut_in",
         # "parking_exit",
@@ -1010,7 +1018,7 @@ def train_ppo():
         train_with_logging(
             agent, env, logger,
             wandb_run=wandb_run,
-            episodes=300,
+            episodes=500,
             # ✅ 和 env.max_episode_steps 保持一致，避免time_limit截断影响统计
             timesteps=int(getattr(config, "max_episode_steps", 512)),
             save_every=100

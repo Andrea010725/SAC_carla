@@ -422,7 +422,7 @@ class ConesScenario(ScenarioBase):
             try:
                 # 导入 TrafficFlowSpawner
                 import sys
-                sys.path.insert(0, '/home/ajifang/DriveAdapter/tools')
+                sys.path.insert(0, '/home/ajifang/Driveadapter_2/tools')
                 from custom_eval import TrafficFlowSpawner
 
                 # 创建 client

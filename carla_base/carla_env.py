@@ -142,7 +142,7 @@ class CarlaEnv(gym.Env):
         # Reward 参数
         # =========================
         self.use_forward_progress = bool(getattr(config, "use_forward_progress", True))
-        self.k_progress = float(getattr(config, "k_progress", 1.2))
+        self.k_progress = float(getattr(config, "k_progress", 2.5))
         self.progress_clip = float(getattr(config, "progress_clip", 1.0))
 
         self.speed_gate_by_lane = bool(getattr(config, "speed_gate_by_lane", True))
@@ -155,7 +155,7 @@ class CarlaEnv(gym.Env):
         self.no_progress_speed_thresh = float(getattr(config, "no_progress_speed_thresh", 0.25))
         self.no_progress_fwd_thresh = float(getattr(config, "no_progress_fwd_thresh", 0.01))
         self.k_idle = float(getattr(config, "k_idle", 0.003))
-        self.no_progress_limit = int(getattr(config, "no_progress_limit", 250))
+        self.no_progress_limit = int(getattr(config, "no_progress_limit", 100))
 
         # ✅ offroad 自适应 margin（固定3.0太容易误杀）
         self.offroad_margin = float(getattr(config, "offroad_margin", 1.0))
@@ -1665,6 +1665,7 @@ class CarlaEnv(gym.Env):
 
         return obs
 
+
     def _get_reward(self):
         import math
         import numpy as np
@@ -1676,25 +1677,25 @@ class CarlaEnv(gym.Env):
 
         # ----------------- terminal penalties -----------------
         # ✅ 终止惩罚：碰撞/出界更痛一点，推动安全学习
-        K_COLLISION_TERMINAL = 180.0
-        K_OFFROAD_TERMINAL = 120.0
+        K_COLLISION_TERMINAL = 300.0
+        K_OFFROAD_TERMINAL = 80.0
         K_NO_PROGRESS_TERM = 50.0
         # ✅ 允许更长时间尝试起步，避免刚学走就被判“无进展”
-        NO_PROGRESS_LIMIT = 260
+        NO_PROGRESS_LIMIT = 150
 
         # ----------------- progress (门控后才给) -----------------
         # ✅ 提高前向进度奖励，避免“保守趴地上”
         # ✅ 让进度回报更“看得见”，避免长期负回报卡平台
-        K_PROGRESS = 1.20
+        K_PROGRESS = 1.60
         PROG_CLIP = 0.60
         PROG_EMA_A = 0.08
 
         # ----------------- speed (鼓励更合理的低速通过，而不是爬行) -----------------
         # ✅ 速度目标再上调一点，配合低速惩罚，让策略别“爬行”
-        TARGET_SPEED = 4.0
+        TARGET_SPEED = 10.0
         V_MAX = 7.0
         OVERSPEED_START = 5.5
-        K_SPEED = 0.35
+        K_SPEED = 0.50
         K_OVERSPEED = 0.15
 
         # ----------------- lane keeping -----------------
@@ -1721,14 +1722,14 @@ class CarlaEnv(gym.Env):
         AVOID_FWD = 55.0
         SAFE_DIST = 22.0
         LAT_TOL = 4.5
-        W_OBS_CLEAR = 2.5  # 近距惩罚稍强，减少碰撞率
+        W_OBS_CLEAR = 1.3  # 近距惩罚稍强，减少碰撞率
         W_OBS_SPEED = 1.0  # 近障碍限速惩罚
-        V_CAP_NEAR = 2.2   # 近障碍速度上限略收紧
+        V_CAP_NEAR = 3.0   # 近障碍速度上限略收紧
 
         # ----------------- alive / success -----------------
         # ✅ 略微提高 alive，降低纯“苟活”收益（配合低速惩罚）
         # ✅ 生存奖励小幅增加，成功奖励更明确
-        R_ALIVE = 0.03
+        R_ALIVE = 0.01 # 0.03
         SUCCESS_BONUS = 80.0
 
         # ----------------- terminal flags -----------------
@@ -1912,8 +1913,8 @@ class CarlaEnv(gym.Env):
             # 近障碍限速：超过 V_CAP_NEAR 就罚
             if obstacle_gate > 0.05:
                 over = max(0.0, speed - V_CAP_NEAR)
-                r_obs_speed = -W_OBS_SPEED * obstacle_gate * float((over / max(V_CAP_NEAR, 1e-6)) ** 2)
-
+                # r_obs_speed = -W_OBS_SPEED * obstacle_gate * float((over / max(V_CAP_NEAR, 1e-6)) ** 2)
+                r_obs_speed = -1.5 * ((speed - V_CAP_NEAR) ** 2)
         # ----------------- speed reward (强门控：危险时不给“快”) -----------------
         # 只鼓励低速接近 TARGET_SPEED
         err = abs(speed - TARGET_SPEED) / max(TARGET_SPEED, 1e-3)
@@ -1923,9 +1924,10 @@ class CarlaEnv(gym.Env):
         # 门控：偏离车道/近障碍 -> 速度奖励变小
         # ✅ 给一个最低门槛，避免奖励被完全“熄火”
         # ✅ 门控别太狠：避免奖励完全“熄火”，导致收敛到龟速
-        safety_gate = float(np.clip(1.0 - 0.6 * lane_ratio, 0.0, 1.0))
-        safety_gate *= float(np.clip(1.0 - 0.8 * obstacle_gate, 0.0, 1.0))
-        safety_gate = max(0.35, safety_gate)
+        raw_gate = float(np.clip(1.0 - 0.3 * lane_ratio, 0.0, 1.0))
+        # safety_gate *= float(np.clip(1.0 - 0.8 * obstacle_gate, 0.0, 1.0))
+        # safety_gate = max(0.35, safety_gate)
+        safety_gate = max(0.80, raw_gate)
         r_speed *= safety_gate
 
         # overspeed penalty：只保留一条，更干净
@@ -1944,8 +1946,8 @@ class CarlaEnv(gym.Env):
 
         # ----------------- 低速惩罚（防止“龟速苟活”） -----------------
         # ✅ 低速惩罚加重：逼迫策略走出“慢速保命”局部最优
-        LOW_SPEED_TH = 1.20
-        K_LOW_SPEED = 0.12
+        LOW_SPEED_TH = 3.0 # 1.20
+        K_LOW_SPEED = 0.3 # 0.12
         r_low_speed = 0.0
         if speed < LOW_SPEED_TH:
             # 低速越接近 0，惩罚越大
@@ -2018,6 +2020,7 @@ class CarlaEnv(gym.Env):
         # reset collision latch
         self.collision = False
         return float(total_reward), bool(done), info
+
 
     # ----------------- render -----------------
     def _draw_display(self, image, throttle, steer, brake):

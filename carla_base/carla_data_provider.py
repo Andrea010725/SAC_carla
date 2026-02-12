@@ -19,7 +19,7 @@ from six import iteritems
 from time import sleep
 
 import carla
-# from agents.navigation.global_route_planner import GlobalRoutePlanner
+from agents.navigation.global_route_planner import GlobalRoutePlanner
 
 
 def calculate_velocity(actor):

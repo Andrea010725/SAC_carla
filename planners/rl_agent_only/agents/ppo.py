@@ -86,11 +86,11 @@ class PPOAgent(Agent):
     # TODO: dynamic-parameters: gamma, lambda, opt_steps, update_freq?, polyak?, clip_norm
     # TODO: debug each action separately
     # TODO: RNN support
-    def __init__(self, *args, policy_lr: Union[float, LearningRateSchedule, DynamicParameter] = 1e-3, gamma=0.99,
+    def __init__(self, *args, policy_lr: Union[float, LearningRateSchedule, DynamicParameter] = 5e-4, gamma=0.99,
                  lambda_=0.95, value_lr: Union[float, LearningRateSchedule, DynamicParameter] = 3e-4, load=False,
                  optimization_steps=(3, 3), name='ppo-agent', optimizer='adam', clip_norm=(1.0, 1.0),
-                 clip_ratio: Union[float, LearningRateSchedule, DynamicParameter] = 0.2, seed_regularization=False,
-                 entropy_regularization: Union[float, LearningRateSchedule, DynamicParameter] = 0.0,
+                 clip_ratio: Union[float, LearningRateSchedule, DynamicParameter] = 0.15, seed_regularization=False,
+                 entropy_regularization: Union[float, LearningRateSchedule, DynamicParameter] = 0.02,
                  network: Union[dict, PPONetwork] = None, update_frequency=1, polyak=1.0, repeat_action=1,
                  advantage_scale: Union[float, LearningRateSchedule, DynamicParameter] = 2.0, **kwargs):
         assert 0.0 < polyak <= 1.0
@@ -633,7 +633,9 @@ class PPOAgent(Agent):
                 next_state, reward, done, _ = self.env.step(self.convert_action(action))
                 episode_reward += reward
 
-                self.log(actions=action, rewards=reward, values=value, log_probs=log_prob)
+                std_mean = tf.reduce_mean(std)
+
+                self.log(actions=action, rewards=reward, values=value, log_probs=log_prob, manual_std_debug=std_mean)
 
                 memory.append(state, action, reward, value, log_prob)
                 state = utils.to_tensor(next_state)

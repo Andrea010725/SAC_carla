@@ -10,6 +10,14 @@ planners_path = os.path.join(script_dir, 'planners')
 if planners_path not in sys.path:
     sys.path.insert(0, planners_path)
 
+# 添加 CARLA PythonAPI 路径（用于导入agents模块和carla模块）
+carla_api_path = "/home/ajifang/carla/PythonAPI/carla/"
+carla_egg_path = "/home/ajifang/carla/PythonAPI/carla/dist/carla-0.9.15-py3.7-linux-x86_64.egg"
+if carla_api_path not in sys.path:
+    sys.path.insert(0, carla_api_path)
+if carla_egg_path not in sys.path:
+    sys.path.insert(0, carla_egg_path)
+
 import gym
 import numpy as np
 

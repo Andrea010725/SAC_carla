@@ -1,0 +1,42 @@
+{
+  "os": "Linux-5.15.0-139-generic-x86_64-with-debian-bullseye-sid",
+  "python": "3.7.7",
+  "startedAt": "2026-02-12T06:18:06.065503Z",
+  "program": "train_ppo_with_wandb.py",
+  "codePath": "train_ppo_with_wandb.py",
+  "git": {
+    "remote": "git@github.com:Andrea010725/SAC_carla.git",
+    "commit": "86d3bd3847c28cf2417658da86d1f17dbc1b881f"
+  },
+  "root": "/home/ajifang/SAC_carla",
+  "host": "ajifang-PC",
+  "username": "ajifang",
+  "executable": "/home/ajifang/miniconda3/envs/py37/bin/python",
+  "codePathLocal": "train_ppo_with_wandb.py",
+  "cpu_count": 20,
+  "cpu_count_logical": 20,
+  "gpu": "NVIDIA GeForce RTX 4090",
+  "gpu_count": 1,
+  "disk": {
+    "/": {
+      "total": "209709965312",
+      "used": "194673934336"
+    }
+  },
+  "memory": {
+    "total": "67420733440"
+  },
+  "cpu": {
+    "count": 20,
+    "countLogical": 20
+  },
+  "gpu_nvidia": [
+    {
+      "name": "NVIDIA GeForce RTX 4090",
+      "memoryTotal": "25757220864",
+      "cudaCores": 16384,
+      "architecture": "Ada"
+    }
+  ],
+  "cudaVersion": "12.9"
+}
