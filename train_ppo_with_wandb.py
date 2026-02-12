@@ -90,7 +90,7 @@ def apply_curriculum(episode: int, env: "CarlaGymEnv"):
     cfg = env.config
 
     # --- Stage 1: 只练 cones，数量少，先稳定学会“走直线 + 不碰撞” ---
-    if episode <= 80:
+    if episode <= 200:
         cfg.scenario_pool = ["cones"]
         cfg.cone_num = 8
         cfg.num_parked_cars = 2
@@ -98,8 +98,8 @@ def apply_curriculum(episode: int, env: "CarlaGymEnv"):
         cfg.yref_steer_gain = 0.0
 
     # --- Stage 2: cones + parked_obstacles，逐步增加障碍密度 ---
-    elif episode <= 160:
-        cfg.scenario_pool = ["cones", "trimma", "construction_lane_chang"]
+    elif episode <= 400:
+        cfg.scenario_pool = ["cones", "trimma", "construction_lane_change"]
         cfg.cone_num = 12
         cfg.num_parked_cars = 3
         cfg.use_yref_in_steer = False

@@ -1677,8 +1677,8 @@ class CarlaEnv(gym.Env):
 
         # ----------------- terminal penalties -----------------
         # ✅ 终止惩罚：碰撞/出界更痛一点，推动安全学习
-        K_COLLISION_TERMINAL = 300.0
-        K_OFFROAD_TERMINAL = 80.0
+        K_COLLISION_TERMINAL = 200.0
+        K_OFFROAD_TERMINAL = 60.0
         K_NO_PROGRESS_TERM = 50.0
         # ✅ 允许更长时间尝试起步，避免刚学走就被判“无进展”
         NO_PROGRESS_LIMIT = 150
@@ -1692,9 +1692,9 @@ class CarlaEnv(gym.Env):
 
         # ----------------- speed (鼓励更合理的低速通过，而不是爬行) -----------------
         # ✅ 速度目标再上调一点，配合低速惩罚，让策略别“爬行”
-        TARGET_SPEED = 10.0
+        TARGET_SPEED = 5.0
         V_MAX = 7.0
-        OVERSPEED_START = 5.5
+        OVERSPEED_START = 6.0
         K_SPEED = 0.50
         K_OVERSPEED = 0.15
 
@@ -1913,8 +1913,8 @@ class CarlaEnv(gym.Env):
             # 近障碍限速：超过 V_CAP_NEAR 就罚
             if obstacle_gate > 0.05:
                 over = max(0.0, speed - V_CAP_NEAR)
-                # r_obs_speed = -W_OBS_SPEED * obstacle_gate * float((over / max(V_CAP_NEAR, 1e-6)) ** 2)
-                r_obs_speed = -1.5 * ((speed - V_CAP_NEAR) ** 2)
+                if over > 0.0:
+                    r_obs_speed = -W_OBS_SPEED * obstacle_gate * float((over / max(V_CAP_NEAR, 1e-6)) ** 2)
         # ----------------- speed reward (强门控：危险时不给“快”) -----------------
         # 只鼓励低速接近 TARGET_SPEED
         err = abs(speed - TARGET_SPEED) / max(TARGET_SPEED, 1e-3)
@@ -1946,8 +1946,8 @@ class CarlaEnv(gym.Env):
 
         # ----------------- 低速惩罚（防止“龟速苟活”） -----------------
         # ✅ 低速惩罚加重：逼迫策略走出“慢速保命”局部最优
-        LOW_SPEED_TH = 3.0 # 1.20
-        K_LOW_SPEED = 0.3 # 0.12
+        LOW_SPEED_TH = 2.5 # 1.20
+        K_LOW_SPEED = 0.2 # 0.12
         r_low_speed = 0.0
         if speed < LOW_SPEED_TH:
             # 低速越接近 0，惩罚越大
@@ -1972,7 +1972,9 @@ class CarlaEnv(gym.Env):
 
         r_success = 0.0
         timeout_flag = bool(getattr(self, "timeout_flag", False))
-        if timeout_flag and (not collision_flag) and (not offroad):
+        prog_ema = float(getattr(self, "progress_ema", 0.0))
+        prog_ok = (speed > 2.0) or (prog_ema > 0.02)
+        if timeout_flag and (not collision_flag) and (not offroad) and prog_ok:
             r_success = SUCCESS_BONUS
 
         # ----------------- total reward -----------------
