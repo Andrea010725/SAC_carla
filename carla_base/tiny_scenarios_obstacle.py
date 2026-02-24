@@ -17,7 +17,13 @@ import json
 import sys
 sys.path.append("/home/ajifang/SAC_carla/carla_base/")
 from tiny_scenarios import VEHICLE_TYPE_DICT, TYPE_VEHICLE_DICT, choose_bp_name
-# from carla_data_provider import CarlaDataProvider
+try:
+    from carla_data_provider import CarlaDataProvider
+except Exception:
+    try:
+        from .carla_data_provider import CarlaDataProvider
+    except Exception:
+        CarlaDataProvider = None
 
 
 from functools import reduce
@@ -256,140 +262,115 @@ def gen_garbage(world,barrier_spawn,num_garbage):
 def gen_cones(world,barrier_spawn,num_cones,cone_interval):
     blueprint_library = world.get_blueprint_library()
     cone_bp = choose_obsbp_name('+traffic_barrier')
-    cone_blueprint = blueprint_library.find(cone_bp)
-    if cone_bp is None:
+    cone_blueprint = blueprint_library.find(cone_bp) if cone_bp else None
+    if cone_blueprint is None:
         raise ValueError("Traffic cone blueprint not found in the library.")
 
-    # Get the waypoint just ahead of the barrier
+    if CarlaDataProvider is None:
+        raise RuntimeError("CarlaDataProvider is not available in tiny_scenarios_obstacle.")
+
     _map = CarlaDataProvider.get_map()
+    if _map is None:
+        raise RuntimeError("CarlaDataProvider map is None.")
+
     barrier_waypoint = _map.get_waypoint(barrier_spawn.transform.location)
-    first_cone_waypoint = barrier_waypoint.next(0.3)[0]  # Get the next waypoint after the barrier
+    if barrier_waypoint is None:
+        raise RuntimeError("Cannot get waypoint near construction barrier.")
 
-    # Spawn the traffic cones
-    for i in range(num_cones):
+    next_wps = barrier_waypoint.next(0.3)
+    first_cone_waypoint = next_wps[0] if next_wps else barrier_waypoint
+
+    def _spawn_static_actor(bp, tf):
+        actor = None
         try:
-            # 尝试获取锥筒的目标waypoint
-            target_waypoint = first_cone_waypoint.next((i + 1) * int(cone_interval))[0]
-            if target_waypoint is not None:  # 确保waypoint是有效的
-                assert isinstance(target_waypoint, carla.Waypoint)
-                # 计算锥筒的位置
-                cone_left_location = carla.Location(
-                    x=target_waypoint.transform.location.x + (
-                            ((target_waypoint.lane_width - 0.8) / 2) * math.sin(
-                        math.radians(target_waypoint.transform.rotation.yaw))),
-                    y=target_waypoint.transform.location.y - (
-                            ((target_waypoint.lane_width - 0.8) / 2) * math.cos(
-                        math.radians(target_waypoint.transform.rotation.yaw))),
-                    z=target_waypoint.transform.location.z)
-
-                # 创建锥筒的变换对象
-                cone_left_transform = carla.Transform(
-                    location=cone_left_location,
-                    rotation=carla.Rotation(pitch=target_waypoint.transform.rotation.pitch,
-                                            yaw=target_waypoint.transform.rotation.yaw,
-                                            roll=target_waypoint.transform.rotation.roll))
-                # 在计算出的位置和方向上生成锥筒
-                cone = world.spawn_actor(cone_blueprint, cone_left_transform)
-                cone.set_simulate_physics(False)
-
-                cone_right_location = carla.Location(
-                    x=target_waypoint.transform.location.x - (
-                            ((target_waypoint.lane_width - 0.8) / 2) * math.sin(
-                        math.radians(target_waypoint.transform.rotation.yaw))),
-                    y=target_waypoint.transform.location.y + (
-                            ((target_waypoint.lane_width - 0.8) / 2) * math.cos(
-                        math.radians(target_waypoint.transform.rotation.yaw))),
-                    z=target_waypoint.transform.location.z)
-
-                # 创建锥筒的变换对象
-                cone_right_transform = carla.Transform(
-                    location=cone_right_location,
-                    rotation=carla.Rotation(pitch=target_waypoint.transform.rotation.pitch,
-                                            yaw=target_waypoint.transform.rotation.yaw,
-                                            roll=target_waypoint.transform.rotation.roll))
-                # 在计算出的位置和方向上生成锥筒
-                cone = world.spawn_actor(cone_blueprint, cone_right_transform)
-                cone.set_simulate_physics(False)
-
-            else:
-                print(f"Invalid waypoint for cone placement at i = {i}")
-        except RuntimeError as e:
-            print(f"Error placing cones at i = {i}: {e}")
-
-        for i in range(num_cones):
+            actor = world.try_spawn_actor(bp, tf)
+        except Exception:
+            actor = None
+        if actor is None:
             try:
-                # 尝试获取锥筒的目标waypoint
-                target_waypoint = first_cone_waypoint.next((i + 1 ) * int(cone_interval))[0]
-                if target_waypoint is not None:  # 确保waypoint是有效的
-                    assert isinstance(target_waypoint, carla.Waypoint)
-                    # 计算锥筒的位置
-                    cone_left_location = carla.Location(
-                        x=target_waypoint.transform.location.x + (
-                                ((target_waypoint.lane_width - 0.8) / 2) * math.sin(
-                            math.radians(target_waypoint.transform.rotation.yaw))),
-                        y=target_waypoint.transform.location.y - (
-                                ((target_waypoint.lane_width - 0.8) / 2) * math.cos(
-                            math.radians(target_waypoint.transform.rotation.yaw))),
-                        z=target_waypoint.transform.location.z)
+                actor = world.spawn_actor(bp, tf)
+            except Exception:
+                actor = None
+        if actor is not None:
+            try:
+                actor.set_simulate_physics(False)
+            except Exception:
+                pass
+        return actor
 
-                    # 创建锥筒的变换对象
-                    cone_left_transform = carla.Transform(
-                        location=cone_left_location,
-                        rotation=carla.Rotation(pitch=target_waypoint.transform.rotation.pitch,
-                                                yaw=target_waypoint.transform.rotation.yaw,
-                                                roll=target_waypoint.transform.rotation.roll))
-                    # 在计算出的位置和方向上生成锥筒
-                    cone = world.spawn_actor(cone_blueprint, cone_left_transform)
-                    cone.set_simulate_physics(False)
+    cone_count = max(0, int(num_cones))
+    interval = max(1.0, float(cone_interval))
+    last_left_transform = None
+    last_target_waypoint = None
 
-                    cone_right_location = carla.Location(
-                        x=target_waypoint.transform.location.x - (
-                                ((target_waypoint.lane_width - 1) / 2) * math.sin(
-                            math.radians(target_waypoint.transform.rotation.yaw))),
-                        y=target_waypoint.transform.location.y + (
-                                ((target_waypoint.lane_width - 1) / 2) * math.cos(
-                            math.radians(target_waypoint.transform.rotation.yaw))),
-                        z=target_waypoint.transform.location.z)
+    for idx in range(cone_count):
+        try:
+            target_candidates = first_cone_waypoint.next((idx + 1) * interval)
+            if not target_candidates:
+                continue
 
-                    # 创建锥筒的变换对象
-                    cone_right_transform = carla.Transform(
-                        location=cone_right_location,
-                        rotation=carla.Rotation(pitch=target_waypoint.transform.rotation.pitch,
-                                                yaw=target_waypoint.transform.rotation.yaw,
-                                                roll=target_waypoint.transform.rotation.roll))
-                    # 在计算出的位置和方向上生成锥筒
-                    cone = world.spawn_actor(cone_blueprint, cone_right_transform)
-                    cone.set_simulate_physics(False)
+            target_waypoint = target_candidates[0]
+            lane_half = max(0.1, (float(target_waypoint.lane_width) - 0.8) * 0.5)
+            yaw_rad = math.radians(target_waypoint.transform.rotation.yaw)
+            sin_yaw = math.sin(yaw_rad)
+            cos_yaw = math.cos(yaw_rad)
 
-                    # 如果是最后一个锥筒，存储其位置
-                    if i == num_cones - 1:
-                        last_cone_transform = cone_left_transform
-                        print('-------last_cone_transform', last_cone_transform)
-                        # Spawn the last barrier
-                        last_barrier_bp = choose_obsbp_name('+street_barrier')
-                        print(f"last_barrier_bp : {last_barrier_bp}\n")
-                        # 从蓝图库中获取障碍物的ActorBlueprint对象
-                        last_barrier_blueprint = blueprint_library.find(last_barrier_bp)
-                        if last_barrier_blueprint is not None:
-                            new_transform_last = carla.Transform(
-                                location=carla.Location(x=last_cone_transform.location.x - (
-                                            target_waypoint.lane_width - 0.8) / 2 * math.sin(
-                                    math.radians(last_cone_transform.rotation.yaw)),
-                                                        y=last_cone_transform.location.y + (
-                                                                    target_waypoint.lane_width - 0.8) / 2 * math.cos(
-                                                            math.radians(last_cone_transform.rotation.yaw)),
-                                                        z=last_cone_transform.location.z + 0.1),  # 保持位置不变
-                                rotation=carla.Rotation(pitch=last_cone_transform.rotation.pitch,
-                                                        yaw=last_cone_transform.rotation.yaw - 90,
-                                                        roll=last_cone_transform.rotation.roll))
-                            last_barrier = world.spawn_actor(last_barrier_blueprint, new_transform_last)
-                            print("-------", last_barrier)
-                            last_barrier.set_simulate_physics(False)  # Ensure the barrier has physics simulation
-                            return new_transform_last
-                else:
-                    print(f"Invalid waypoint for cone placement at i = {i}")
-            except RuntimeError as e:
-                print(f"Error placing cones at i = {i}: {e}")
+            cone_left_location = carla.Location(
+                x=target_waypoint.transform.location.x + lane_half * sin_yaw,
+                y=target_waypoint.transform.location.y - lane_half * cos_yaw,
+                z=target_waypoint.transform.location.z
+            )
+            cone_right_location = carla.Location(
+                x=target_waypoint.transform.location.x - lane_half * sin_yaw,
+                y=target_waypoint.transform.location.y + lane_half * cos_yaw,
+                z=target_waypoint.transform.location.z
+            )
+
+            cone_left_transform = carla.Transform(
+                location=cone_left_location,
+                rotation=carla.Rotation(
+                    pitch=target_waypoint.transform.rotation.pitch,
+                    yaw=target_waypoint.transform.rotation.yaw,
+                    roll=target_waypoint.transform.rotation.roll
+                )
+            )
+            cone_right_transform = carla.Transform(
+                location=cone_right_location,
+                rotation=carla.Rotation(
+                    pitch=target_waypoint.transform.rotation.pitch,
+                    yaw=target_waypoint.transform.rotation.yaw,
+                    roll=target_waypoint.transform.rotation.roll
+                )
+            )
+
+            _spawn_static_actor(cone_blueprint, cone_left_transform)
+            _spawn_static_actor(cone_blueprint, cone_right_transform)
+
+            last_left_transform = cone_left_transform
+            last_target_waypoint = target_waypoint
+        except RuntimeError as e:
+            print(f"Error placing cones at i = {idx}: {e}")
+
+    # 在最后一组锥桶末端放置一个道路指示障碍物（只放一次）
+    if last_left_transform is not None and last_target_waypoint is not None:
+        last_barrier_bp = choose_obsbp_name('+street_barrier')
+        last_barrier_blueprint = blueprint_library.find(last_barrier_bp) if last_barrier_bp else None
+        if last_barrier_blueprint is not None:
+            lane_half = max(0.1, (float(last_target_waypoint.lane_width) - 0.8) * 0.5)
+            yaw_rad = math.radians(last_left_transform.rotation.yaw)
+            new_transform_last = carla.Transform(
+                location=carla.Location(
+                    x=last_left_transform.location.x - lane_half * math.sin(yaw_rad),
+                    y=last_left_transform.location.y + lane_half * math.cos(yaw_rad),
+                    z=last_left_transform.location.z + 0.1
+                ),
+                rotation=carla.Rotation(
+                    pitch=last_left_transform.rotation.pitch,
+                    yaw=last_left_transform.rotation.yaw - 90.0,
+                    roll=last_left_transform.rotation.roll
+                )
+            )
+            _spawn_static_actor(last_barrier_blueprint, new_transform_last)
 
 def gen_Walker(world,num_workers, ref_spawn):
     blueprint_library = world.get_blueprint_library()

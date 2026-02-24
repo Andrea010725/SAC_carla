@@ -662,6 +662,16 @@ class ConesScenario(ScenarioBase):
         # 可选但推荐：清掉 pitch/roll（道路接缝/坡度会让 vehicle spawn 更容易失败）
         safe_rot = carla.Rotation(pitch=0.0, yaw=tf.rotation.yaw, roll=0.0)
 
+        # ✅ DEBUG: 检查朝向是否指向第一个锥桶
+        try:
+            to_cone = self.first_cone_transform.location - safe_loc
+            yaw_rad = math.radians(safe_rot.yaw)
+            fwd = carla.Vector3D(x=math.cos(yaw_rad), y=math.sin(yaw_rad), z=0.0)
+            dot = fwd.x * float(to_cone.x) + fwd.y * float(to_cone.y)
+            print(f"[Cones][DEBUG] ego_yaw={safe_rot.yaw:.1f}, to_cone=({to_cone.x:.1f},{to_cone.y:.1f}), dot={dot:.2f}")
+        except Exception as e:
+            print(f"[Cones][DEBUG] heading check failed: {e}")
+
         print(f"[Cones] 自车spawn位置: ({safe_loc.x:.1f}, {safe_loc.y:.1f})")
         print(f"[Cones] 第一个锥桶位置: ({self.first_cone_transform.location.x:.1f}, {self.first_cone_transform.location.y:.1f})")
 

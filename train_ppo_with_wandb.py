@@ -86,38 +86,82 @@ class RunningMeanStd:
 # ✅ 训练课程策略（Curriculum Learning）
 # 目标：先学“能走、少撞”，再逐步增加场景难度
 # ============================================================
-def apply_curriculum(episode: int, env: "CarlaGymEnv"):
+def apply_curriculum(episode: int, env: "CarlaGymEnv", succ_rate: float = 0.0, window_ready: bool = False):
     cfg = env.config
 
-    # --- Stage 1: 只练 cones，数量少，先稳定学会“走直线 + 不碰撞” ---
-    if episode <= 200:
-        cfg.scenario_pool = ["cones"]
-        cfg.cone_num = 8
-        cfg.num_parked_cars = 2
+    # ✅ 成功率门控课程（优先于固定轮数）
+    # 规则：窗口未就绪时，固定在 Stage1
+    if not window_ready:
+        stage = 1
+    else:
+        s1_thr = float(getattr(cfg, "stage1_success_threshold", 0.70))
+        s2_thr = float(getattr(cfg, "stage2_success_threshold", 0.85))
+        if succ_rate < s1_thr:
+            stage = 1
+        elif succ_rate < s2_thr:
+            stage = 2
+        else:
+            stage = 3
+
+    # 避免长期卡在低阶段：到达指定episode后强制进入更高阶段
+    force_s2_ep = int(getattr(cfg, "force_stage2_episode", 80))
+    force_s3_ep = int(getattr(cfg, "force_stage3_episode", 160))
+    if episode >= force_s3_ep:
+        stage = max(stage, 3)
+    elif episode >= force_s2_ep:
+        stage = max(stage, 2)
+
+    # --- Stage 1: 先练换道/让行基础（不含 jaywalker） ---
+    if stage == 1:
+        cfg.scenario_pool = ["cones", "trimma"]
+        cfg.scenario_weights = {
+            "cones": 0.55,
+            "trimma": 0.45,
+        }
+        cfg.cone_num = 6
+        # 先关闭 y_ref，减少横纵耦合难度
         cfg.use_yref_in_steer = False
         cfg.yref_steer_gain = 0.0
 
-    # --- Stage 2: cones + parked_obstacles，逐步增加障碍密度 ---
-    elif episode <= 400:
+    # --- Stage 2: 加入施工变道，仍不含 jaywalker ---
+    elif stage == 2:
         cfg.scenario_pool = ["cones", "trimma", "construction_lane_change"]
-        cfg.cone_num = 12
-        cfg.num_parked_cars = 3
+        cfg.scenario_weights = {
+            "cones": 0.40,
+            "trimma": 0.35,
+            "construction_lane_change": 0.25,
+        }
+        cfg.cone_num = 8
         cfg.use_yref_in_steer = False
         cfg.yref_steer_gain = 0.0
 
-    # --- Stage 3: 加入行人场景（jaywalker/trimma） ---
+    # --- Stage 3: 加入 jaywalker（低权重，目标是停车避让） ---
     else:
         cfg.scenario_pool = ["cones", "trimma", "construction_lane_change", "jaywalker"]
-        cfg.cone_num = 15
-        cfg.num_parked_cars = 4
-        cfg.use_yref_in_steer = True
-        cfg.yref_steer_gain = 0.03
+        cfg.scenario_weights = {
+            "cones": 0.30,
+            "trimma": 0.25,
+            "construction_lane_change": 0.25,
+            "jaywalker": 0.20,
+        }
+        cfg.cone_num = 8
+        # ✅ Stage3 是否开启 y_ref（做成开关，默认关闭更稳）
+        stage3_use_yref = bool(getattr(cfg, "stage3_use_yref", False))
+        if stage3_use_yref:
+            cfg.use_yref_in_steer = True
+            warm_end = int(getattr(cfg, "stage3_yref_warmup_end", 450))
+            gain_warm = float(getattr(cfg, "stage3_yref_gain_warmup", 0.01))
+            gain_full = float(getattr(cfg, "stage3_yref_gain_full", 0.03))
+            cfg.yref_steer_gain = gain_warm if episode <= warm_end else gain_full
+        else:
+            cfg.use_yref_in_steer = False
+            cfg.yref_steer_gain = 0.0
 
 
 # ============================================================
 # ✅ 熵系数调度：先探索，后收敛
 # ============================================================
-def update_entropy_coeff(episode: int, agent, start: float = 0.12, end: float = 0.03, decay_ep: int = 200):
+def update_entropy_coeff(episode: int, agent, start: float = 0.02, end: float = 0.005, decay_ep: int = 600):
     if not hasattr(agent, "entropy_strength"):
         return
     frac = min(1.0, float(episode) / float(decay_ep))
@@ -146,16 +190,22 @@ class CarlaGymEnv(gym.Env):
         # ✅ 端口使用配置，避免硬编码导致多实例/端口冲突
         carla_port = int(getattr(config, "carla_port", 2000))
         tm_port = int(getattr(config, "carla_tm_port", 8000))
+        self.carla_port = carla_port
+        self.carla_tm_port = tm_port
         self.carla_env = CarlaEnv(config, carla_port, tm_port)
         self.logger = logger
         self.wandb_run = wandb_run
+        self.reset_retry_times = int(getattr(config, "reset_retry_times", 2))
+        self.reset_rebuild_sleep_sec = float(getattr(config, "reset_rebuild_sleep_sec", 1.0))
+        self.rebuild_env_retry_times = int(getattr(config, "rebuild_env_retry_times", 15))
+        self.rebuild_env_sleep_sec = float(getattr(config, "rebuild_env_sleep_sec", 2.0))
 
         # self.observation_space = gym.spaces.Box(
         #     low=-np.inf, high=np.inf, shape=(9,), dtype=np.float32
         # )
-        # self.action_space = gym.spaces.Box(
-        #     low=-1.0, high=1.0, shape=(3,), dtype=np.float32
-        # )
+        # ✅ action 维度开关（2维/3维）
+        # 说明：PPO当前网络固定输出3维，这里用开关仅用于“屏蔽y_ref”
+        self.use_action_dim2 = bool(getattr(config, "use_action_dim2", False))
         # ✅ wrapper 直接复用底层 env 的 space，避免维度写死
         self.observation_space = self.carla_env.observation_space
         self.action_space = self.carla_env.action_space
@@ -164,10 +214,7 @@ class CarlaGymEnv(gym.Env):
 
         # ===== ✅ y_ref 开关交给 CarlaEnv（字段名兼容旧/新配置）=====
         # 优先使用 use_yref_in_steer / yref_steer_gain，若没有则兼容旧字段
-        use_yref_flag = getattr(config, "use_yref_in_steer", getattr(config, "use_yref_mapping", True))
-        yref_gain = getattr(config, "yref_steer_gain", getattr(config, "yref_gain", 0.03))
-        self.carla_env.use_yref_in_steer = bool(use_yref_flag)
-        self.carla_env.yref_steer_gain = float(yref_gain)
+        self._sync_runtime_switches_to_carla_env()
 
         # y_ref 惩罚：wrapper层加（也可以以后下放到 CarlaEnv）
         self.yref_penalty = float(getattr(config, "yref_penalty", 0.0))
@@ -216,8 +263,61 @@ class CarlaGymEnv(gym.Env):
         print("  ✅ 观测归一化已启用: normalize_obs =", self.normalize_obs)
         print("  carla_env.yref_steer_gain   =", getattr(self.carla_env, "yref_steer_gain", None))
 
+    @staticmethod
+    def _is_timeout_error(err: Exception) -> bool:
+        msg = str(err)
+        return ("time-out of" in msg) or ("TimeoutException" in msg) or ("simulator" in msg)
+
+    def _sync_runtime_switches_to_carla_env(self):
+        use_yref_flag = getattr(self.config, "use_yref_in_steer", getattr(self.config, "use_yref_mapping", False))
+        yref_gain = getattr(self.config, "yref_steer_gain", getattr(self.config, "yref_gain", 0.0))
+        self.carla_env.use_yref_in_steer = bool(use_yref_flag)
+        self.carla_env.yref_steer_gain = float(yref_gain)
+
+    def _rebuild_carla_env(self, reason: str):
+        print(f"[CarlaGymEnv] ⚠️ 重建 CarlaEnv: {reason}")
+        try:
+            self.carla_env.close()
+        except Exception:
+            pass
+        last_err = None
+        max_retries = max(0, int(self.rebuild_env_retry_times))
+        for attempt in range(max_retries + 1):
+            try:
+                self.carla_env = CarlaEnv(self.config, self.carla_port, self.carla_tm_port)
+                self._sync_runtime_switches_to_carla_env()
+                self.observation_space = self.carla_env.observation_space
+                self.action_space = self.carla_env.action_space
+                return
+            except Exception as e:
+                last_err = e
+                if attempt < max_retries:
+                    print(
+                        f"[CarlaGymEnv] ⚠️ CarlaEnv重建失败，等待重试 {attempt + 1}/{max_retries}: {e}"
+                    )
+                    time.sleep(max(0.0, float(self.rebuild_env_sleep_sec)))
+                    continue
+                break
+        raise RuntimeError(f"[CarlaGymEnv] 重建 CarlaEnv 最终失败: {last_err}")
+
     def reset(self):
-        obs = self.carla_env.reset()
+        obs = None
+        reset_tries = max(0, int(self.reset_retry_times))
+        for attempt in range(reset_tries + 1):
+            try:
+                obs = self.carla_env.reset()
+                break
+            except Exception as e:
+                if (attempt < reset_tries) and self._is_timeout_error(e):
+                    print(f"[GymReset] ⚠️ reset超时，重试 {attempt + 1}/{reset_tries}: {e}")
+                    self._rebuild_carla_env(reason="reset timeout")
+                    time.sleep(max(0.0, float(self.reset_rebuild_sleep_sec)))
+                    continue
+                raise
+
+        if obs is None:
+            raise RuntimeError("[GymReset] reset failed with no observation.")
+
         self.current_episode += 1
         self._step_count = 0
         self.episode_collision = False
@@ -236,7 +336,7 @@ class CarlaGymEnv(gym.Env):
 
         action = np.asarray(action, dtype=np.float32).reshape(-1)
 
-        # ✅ 如果你当前就是 3 维训练，建议直接强校验
+        # ✅ 动作维度兼容：use_action_dim2 时强制 y_ref=0（屏蔽第三维）
         if action.size < 3:
             raise ValueError(f"action must have 3 dims [a0,a1,a2], got shape={action.shape}")
 
@@ -245,10 +345,9 @@ class CarlaGymEnv(gym.Env):
             action = np.array([0.3, 0.0, 0.0], dtype=np.float32)
 
         action = np.clip(action, -1.0, 1.0).astype(np.float32)
-
         a0 = float(action[0])
         a1 = float(action[1])
-        a2 = float(action[2])
+        a2 = 0.0 if self.use_action_dim2 else float(action[2])
 
         # ----- bias / forced throttle -----
         applied_bias = 0.0
@@ -264,9 +363,41 @@ class CarlaGymEnv(gym.Env):
             forced_throttle = True
 
         action3 = np.array([a0_applied, a1, a2], dtype=np.float32)
-        obs, reward, done, info = self.carla_env.step(action3)
+        try:
+            obs, reward, done, info = self.carla_env.step(action3)
+        except Exception as e:
+            if not self._is_timeout_error(e):
+                raise
+            print(f"[GymStep] ⚠️ step超时，结束当前episode并重建环境: {e}")
+            self._rebuild_carla_env(reason="step timeout")
+            obs = np.zeros(self.observation_space.shape, dtype=np.float32)
+            reward = -120.0
+            done = True
+            info = {
+                "done_reason": "sim_timeout",
+                "timeout": 1.0,
+                "collision": 0.0,
+                "speed": 0.0,
+            }
         if info is None:
             info = {}
+
+        # 四场景动态逻辑：确保 jaywalker 等场景在训练中真实触发
+        if hasattr(self.carla_env, "scenario_instance") and self.carla_env.scenario_instance:
+            scenario = self.carla_env.scenario_instance
+
+            if hasattr(scenario, "check_and_trigger"):
+                try:
+                    ego_loc = self.carla_env.ego.get_location()
+                    scenario.check_and_trigger(ego_loc)
+                except Exception as e:
+                    print(f"⚠️ check_and_trigger failed: {e}")
+
+            if hasattr(scenario, "tick_update"):
+                try:
+                    scenario.tick_update()
+                except Exception as e:
+                    print(f"⚠️ tick_update failed: {e}")
 
         # ✅ 归一化观测
         obs = np.asarray(obs, dtype=np.float32)
@@ -371,7 +502,7 @@ class CarlaGymEnv(gym.Env):
     def render(self, mode="human"):
         pass
 
-def train_with_logging(agent, env, logger, wandb_run=None, episodes=500, timesteps=512, save_every=100):
+def train_with_logging(agent, env, logger, wandb_run=None, episodes=1500, timesteps=512, save_every=100):
     """
     带日志记录和Wandb监控的PPO训练循环 + ✅自动早停/收敛判定
     """
@@ -416,6 +547,7 @@ def train_with_logging(agent, env, logger, wandb_run=None, episodes=500, timeste
     dq_ran_full = deque(maxlen=W)
     dq_no_collision = deque(maxlen=W)
     dq_avg_rps = deque(maxlen=W)  # 可选：avg_reward_per_step
+    scenario_window = deque(maxlen=max(200, W * 10))
 
     stable_good_count = 0
     bad_count = 0
@@ -437,10 +569,12 @@ def train_with_logging(agent, env, logger, wandb_run=None, episodes=500, timeste
         logger.start_episode(episode)
 
         # ============================================================
-        # ✅ 课程学习：动态调整场景 + y_ref 难度
+        # ✅ 课程学习：动态调整场景 + y_ref 难度（success_rate 门控）
         # ============================================================
         try:
-            apply_curriculum(episode, env)
+            succ_rate_prev = _mean(dq_success) if len(dq_success) > 0 else 0.0
+            window_ready = (len(dq_success) == W and episode >= MIN_EP)
+            apply_curriculum(episode, env, succ_rate=succ_rate_prev, window_ready=window_ready)
         except Exception as e:
             print(f"[Curriculum] ⚠️ apply_curriculum failed: {e}")
 
@@ -448,7 +582,10 @@ def train_with_logging(agent, env, logger, wandb_run=None, episodes=500, timeste
         # ✅ 熵系数调度：先探索，后收敛
         # ============================================================
         try:
-            update_entropy_coeff(episode, agent)
+            ent_start = float(getattr(env.config, "entropy_start", 0.02))
+            ent_end = float(getattr(env.config, "entropy_end", 0.005))
+            ent_decay_ep = int(getattr(env.config, "entropy_decay_ep", 600))
+            update_entropy_coeff(episode, agent, start=ent_start, end=ent_end, decay_ep=ent_decay_ep)
         except Exception as e:
             print(f"[EntropySchedule] ⚠️ update_entropy_coeff failed: {e}")
 
@@ -508,7 +645,24 @@ def train_with_logging(agent, env, logger, wandb_run=None, episodes=500, timeste
                     )
 
             action_env = agent.convert_action(action)
-            next_state, reward, done, info = env.step(action_env)
+            try:
+                next_state, reward, done, info = env.step(action_env)
+            except Exception as e:
+                msg = str(e)
+                timeout_like = ("time-out of" in msg) or ("TimeoutException" in msg) or ("simulator" in msg)
+                if timeout_like:
+                    print(f"[EnvStep] ⚠️ simulator timeout at episode={episode}, t={t}: {msg}")
+                    next_state = state
+                    reward = -80.0
+                    done = True
+                    info = {
+                        "done_reason": "sim_timeout",
+                        "timeout": 1.0,
+                        "collision": 0.0,
+                        "speed": 0.0,
+                    }
+                else:
+                    raise
             last_info = info or {}
 
             episode_reward += float(reward)
@@ -529,14 +683,28 @@ def train_with_logging(agent, env, logger, wandb_run=None, episodes=500, timeste
                 episode_collision_count += 1
 
             # 存经验
-            a = action.numpy().reshape(-1)  # [3]
-            m = mean.numpy().reshape(-1)  # [3]
-            s = std.numpy().reshape(-1)  # [3]
+            a = action.numpy().reshape(-1)
+            m = mean.numpy().reshape(-1)
+            s = std.numpy().reshape(-1)
+
+            def _pad3(x):
+                x = np.asarray(x).reshape(-1)
+                if x.size >= 3:
+                    return x[:3]
+                if x.size == 2:
+                    return np.array([x[0], x[1], 0.0], dtype=np.float32)
+                if x.size == 1:
+                    return np.array([x[0], 0.0, 0.0], dtype=np.float32)
+                return np.array([0.0, 0.0, 0.0], dtype=np.float32)
+
+            a3 = _pad3(a)
+            m3 = _pad3(m)
+            s3 = _pad3(s)
 
             agent.log(
-                a_th=a[0], a_steer=a[1], a_yref=a[2],
-                std_th=s[0], std_steer=s[1], std_yref=s[2],
-                mean_th=m[0], mean_steer=m[1], mean_yref=m[2],
+                a_th=a3[0], a_steer=a3[1], a_yref=a3[2],
+                std_th=s3[0], std_steer=s3[1], std_yref=s3[2],
+                mean_th=m3[0], mean_steer=m3[1], mean_yref=m3[2],
                 reward=float(reward),
             )
 
@@ -608,6 +776,10 @@ def train_with_logging(agent, env, logger, wandb_run=None, episodes=500, timeste
                 value_loss_tracker = sum(temp_value_loss) / len(temp_value_loss)
             if temp_entropy:
                 entropy_tracker = sum(temp_entropy) / len(temp_entropy)
+            else:
+                # ✅ fallback：用 rollout std proxy 代替，避免日志一直 0
+                if episode_std_mean_count > 0:
+                    entropy_tracker = float(episode_std_mean_sum / episode_std_mean_count)
 
             agent.memory.delete()
             agent.memory = agent.get_memory()
@@ -633,7 +805,16 @@ def train_with_logging(agent, env, logger, wandb_run=None, episodes=500, timeste
 
         bad_reasons = {"collision", "offroad", "no_progress"}  # ✅ 不把 time_limit 当失败
         no_collision = bool(episode_collision_count == 0)
-        success = int(ran_full and no_collision and (done_reason not in bad_reasons))
+        scenario_name = str(getattr(env.carla_env, "scenario", "")).lower()
+        is_jaywalker = ("jaywalker" in scenario_name)
+        success_speed_min = float(
+            getattr(env.config, "success_min_avg_speed_jaywalker", 0.9)
+            if is_jaywalker else
+            getattr(env.config, "success_min_avg_speed_lane", 1.9)
+        )
+        speed_ok = bool(avg_speed >= success_speed_min)
+        success = int(ran_full and no_collision and (done_reason not in bad_reasons) and speed_ok)
+        scenario_window.append((scenario_name, int(success), int(no_collision), int(ran_full)))
 
         # ============================================================
         # ✅ Early Stop 统计（每个episode都更新一次）
@@ -675,6 +856,12 @@ def train_with_logging(agent, env, logger, wandb_run=None, episodes=500, timeste
 
         # ---------------------- W&B episode log ----------------------
         if wandb_run is not None:
+            def _scenario_metric(metric_index: int, name: str) -> float:
+                values = [item[metric_index] for item in scenario_window if item[0] == name]
+                if not values:
+                    return -1.0
+                return float(sum(values) / len(values))
+
             avg_reward_components = {
                 f"reward/{k}": (v / episode_steps if episode_steps > 0 else 0.0)
                 for k, v in episode_reward_components.items()
@@ -686,6 +873,9 @@ def train_with_logging(agent, env, logger, wandb_run=None, episodes=500, timeste
                 "episode/no_collision": int(no_collision),
                 "episode/success": int(success),
                 "episode/done_reason": done_reason,
+                "episode/speed_ok_for_success": int(speed_ok),
+                "episode/success_speed_min": float(success_speed_min),
+                "episode/scenario_is_jaywalker": int(is_jaywalker),
 
                 "episode/total_reward": float(episode_reward),
                 "episode/avg_reward_per_step": float(episode_reward / max(1, episode_steps)),
@@ -709,6 +899,11 @@ def train_with_logging(agent, env, logger, wandb_run=None, episodes=500, timeste
                 "early/plateau_count": int(plateau_count),
                 "early/best_succ_rate": float(best_succ_rate),
                 "early/best_succ_episode": int(best_succ_episode),
+
+                "scenario_success/cones": _scenario_metric(1, "cones"),
+                "scenario_success/trimma": _scenario_metric(1, "trimma"),
+                "scenario_success/construction_lane_change": _scenario_metric(1, "construction_lane_change"),
+                "scenario_success/jaywalker": _scenario_metric(1, "jaywalker"),
             }
             wandb_metrics.update(avg_reward_components)
 
@@ -774,6 +969,14 @@ def train_ppo():
     print("PPO单独训练 - 带Wandb实时监控（修正版：✅W&B step对齐 + ✅episode横轴 + ✅y_ref开关）")
     print("=" * 70)
 
+    # =========================
+    # ✅ 可视化诊断短跑开关
+    # 说明：用于快速观察碰撞发生位置/时刻
+    # =========================
+    debug_vis = False
+    debug_vis_episodes = 10
+    debug_vis_timesteps = 256
+
     wandb_run = None
     if WANDB_AVAILABLE:
         try:
@@ -783,21 +986,25 @@ def train_ppo():
                 config={
                     "algorithm": "PPO",
                     "env": "CARLA",
-                    "scenario": "parked_obstacles",
-                    "num_parked_cars": 4,
+                    "scenario": "4scenarios_lane_yield_plus_jaywalker",
+                    "scenario_pool": ["cones", "trimma", "construction_lane_change", "jaywalker"],
                     # ✅ P3: 修正超参数配置，与实际agent参数一致
                     "policy_lr": 1e-4,           # 修正：从5e-5改为1e-4
                     "value_lr": 2e-4,            # 修正：从1e-4改为2e-4
                     "gamma": 0.99,
                     "lambda": 0.95,
                     "clip_ratio": 0.2,           # 修正：与agent一致
-                    "entropy_reg": 0.12,         # ✅ 提高探索起点，后续会线性衰减
+                    "entropy_reg": 0.02,
+                    "entropy_start": 0.02,
+                    "entropy_end": 0.005,
+                    "entropy_decay_ep": 600,
                     "batch_size": 128,           # 修正：从256改为128
                     "update_frequency": 2,       # 新增：与agent一致
-                    "optimization_steps": (10, 10),  # 新增：与agent一致
-                    "episodes": 500,
-                    "max_steps_per_episode": 512,
-                    "wandb_step_log_interval": 10,
+                    "optimization_steps": (4, 4),
+                    "trd_loss_coef": 0.0,
+                    "episodes": 1500,
+                    "max_steps_per_episode": 256,
+                    "wandb_step_log_interval": 50,
 
                     # 不篡改动作：保持 False（开启会破坏严格PPO假设）
                     "use_action_bias": False,
@@ -807,17 +1014,22 @@ def train_ppo():
 
                     # ✅ 两版本开关
                     # 兼容旧字段 + 新字段（训练中会用 curriculum 动态开关）
-                    "use_yref_mapping": True,   # 兼容旧字段
-                    "use_yref_in_steer": True,  # 新字段
-                    "yref_gain": 0.03,
-                    "yref_steer_gain": 0.03,
-                    "yref_penalty": 0.05,
+                    "use_yref_mapping": False,   # 兼容旧字段
+                    "use_yref_in_steer": False,  # 新字段
+                    "yref_gain": 0.0,
+                    "yref_steer_gain": 0.0,
+                    "yref_penalty": 0.0,
+                    "obs_control_lat_tol": 2.8,
+                    "low_speed_brake_cut_speed": 0.8,
+                    "low_speed_throttle_floor_speed": 1.0,
+                    "low_speed_throttle_floor": 0.18,
+                    "min_throttle_when_stuck": 0.28,
 
                     "log_steer_saturation": True,
                     "steer_sat_threshold": 0.999,
 
                 },
-                tags=["ppo", "carla", "standalone", "parked_obstacles"],
+                tags=["ppo", "carla", "standalone", "4scenarios", "lane-yield", "jaywalker-stop"],
                 notes="PPO standalone training with reward decomposition monitoring"
             )
             print("\n✅ Wandb已初始化")
@@ -835,6 +1047,7 @@ def train_ppo():
             wandb.define_metric("episode/*", step_metric="episode_num")
             wandb.define_metric("reward/*", step_metric="episode_num")
             wandb.define_metric("training/*", step_metric="episode_num")
+            wandb.define_metric("scenario_success/*", step_metric="episode_num")
 
         except Exception as e:
             print(f"\n⚠️  Wandb初始化失败: {e}")
@@ -846,28 +1059,32 @@ def train_ppo():
     # 如果你的 TM/Server 端口不同，直接改这里即可
     config.carla_port = 2000
     config.carla_tm_port = 8000
+    config.tm_port = config.carla_tm_port
 
     # ✅ 启用随机场景训练
     config.random_scenario = True  # 开启随机场景
     # ✅ 只保留当前 ScenarioFactory 真正支持的场景
     # pedestrian_crossing 目前未注册，会走 fallback 导致“无障碍”场景，容易误判收敛
     config.scenario_pool = [
-        # "parked_obstacles",
         "cones",
-        "jaywalker",             # 如果已验证再打开
         "trimma",
         "construction_lane_change",
-        # "vehicle_opens_door",
-        # "cut_in",
-        # "parking_exit",
+        "jaywalker",             # 默认低权重
     ]
+    # ✅ 四场景权重：前三个偏“换道让行”，jaywalker 低权重偏“停车避让”
+    config.scenario_weights = {
+        "cones": 0.30,
+        "trimma": 0.25,
+        "construction_lane_change": 0.25,
+        "jaywalker": 0.20,
+    }
 
     # ✅ y_ref 新字段默认值（训练中会被 curriculum 动态覆盖）
-    config.use_yref_in_steer = True
-    config.yref_steer_gain = 0.03
+    config.use_yref_in_steer = False
+    config.yref_steer_gain = 0.0
     # 兼容旧字段
-    config.use_yref_mapping = True
-    config.yref_gain = 0.03
+    config.use_yref_mapping = False
+    config.yref_gain = 0.0
 
     # ✅ 训练阶段关闭可视化（减少CARLA渲染负载，降低断连/内存占用）
     # 评估阶段再打开 render + spectator_mode 即可
@@ -881,14 +1098,150 @@ def train_ppo():
     config.draw_ego_direction = False
     config.draw_obstacle_boxes = False
     config.draw_lane_center = False
-    config.wandb_step_log_interval = 10
+    # ✅ 奖励缩放/裁剪（稳定 value loss）
+    config.reward_scale = 1.0
+    config.reward_clip = 0.0
+
+    # ✅ 低速参数回到保守区间，避免“低速强推+刹车被削弱”
+    config.low_speed_throttle_floor_speed = 1.1
+    config.low_speed_throttle_floor = 0.16
+    config.low_speed_brake_cut_speed = 0.8
+    config.min_throttle_when_stuck = 0.26
+    config.obs_control_lat_tol = 2.8
+
+    # ✅ 速度保护与近障碍限油（防爆冲）
+    config.speed_governor_speed = 8.0
+    config.speed_governor_brake_gain = 0.25
+    config.obs_throttle_cap_dist = 10.0
+    config.obs_throttle_cap = 0.38
+    config.obs_brake_dist = 6.0
+    config.obs_brake_value = 0.4
+    config.obs_brake_hard_dist = 3.0
+    config.obs_brake_hard_value = 0.6
+    # reset/cleanup 阶段降低阻塞风险
+    config.cleanup_post_ticks = 1
+
+    # 控制侧场景分档：非 jaywalker 更积极，jaywalker 更保守
+    config.obs_throttle_cap_dist_lane = 8.5
+    config.obs_throttle_cap_lane = 0.42
+    config.obs_throttle_cap_dist_jaywalker = 12.0
+    config.obs_throttle_cap_jaywalker = 0.25
+    config.obs_control_lat_tol_lane = 3.0
+    config.obs_control_lat_tol_jaywalker = 3.0
+    # obstacle brake shield 分场景：lane 更少“过度刹停”，jaywalker 继续保守
+    config.obs_brake_dist_lane = 5.8
+    config.obs_brake_value_lane = 0.38
+    config.obs_brake_hard_dist_lane = 2.8
+    config.obs_brake_hard_value_lane = 0.62
+    config.obs_brake_dist_jaywalker = 7.0
+    config.obs_brake_value_jaywalker = 0.45
+    config.obs_brake_hard_dist_jaywalker = 3.2
+    config.obs_brake_hard_value_jaywalker = 0.70
+    config.low_speed_brake_cut_speed_lane = 0.9
+    config.low_speed_brake_cut_speed_jaywalker = 0.5
+    config.low_speed_throttle_floor_speed_lane = 1.2
+    config.low_speed_throttle_floor_speed_jaywalker = 0.7
+    config.low_speed_throttle_floor_lane = 0.20
+    config.low_speed_throttle_floor_jaywalker = 0.10
+    config.min_throttle_when_stuck_lane = 0.28
+    config.min_throttle_when_stuck_jaywalker = 0.16
+
+    # ✅ 场景感知速度策略（非 jaywalker 更积极，jaywalker 更保守）
+    config.target_speed_lane = 5.2
+    config.target_speed_jaywalker = 4.0
+    config.v_max_lane = 6.8
+    config.v_max_jaywalker = 5.5
+    config.overspeed_start_lane = 5.1
+    config.overspeed_start_jaywalker = 4.5
+    config.v_cap_near_lane = 3.8
+    config.v_cap_near_jaywalker = 2.2
+    config.k_speed_lane = 1.35
+    config.k_speed_jaywalker = 1.1
+    config.k_overspeed_lane = 0.20
+    config.k_overspeed_jaywalker = 0.15
+
+    config.low_speed_th_lane = 2.0
+    config.low_speed_th_jaywalker = 0.6
+    config.k_low_speed_lane = 0.30
+    config.k_low_speed_jaywalker = 0.04
+
+    config.success_bonus_lane = 120.0
+    config.success_bonus_jaywalker = 150.0
+    config.success_speed_th_lane = 2.4
+    config.success_speed_th_jaywalker = 1.0
+    config.success_prog_th_lane = 0.05
+    config.success_prog_th_jaywalker = 0.02
+
+    # 训练侧 success 判据的最低平均速度门槛（用于课程/早停）
+    config.success_min_avg_speed_lane = 2.0
+    config.success_min_avg_speed_jaywalker = 0.9
+    config.progress_full_speed_lane = 3.0
+    config.progress_min_gate_lane = 0.05
+    config.clear_dist_lane = 24.0
+    config.clear_speed_target_lane = 2.3
+    config.k_slow_clear_lane = 0.24
+    # reward 与控制的障碍横向门槛统一到同一量级，降低“奖励判危险但控制不刹”的冲突
+    config.obs_reward_lat_tol_lane = 3.2
+    config.obs_reward_lat_tol_jaywalker = 3.0
+    config.obs_reward_gate_floor_lane = 0.05
+    config.obs_reward_gate_floor_jaywalker = 0.20
+    config.k_avoid_lat_lane = 0.22
+    config.k_avoid_lat_jaywalker = 0.45
+    # construction 场景负载控制（防 timeout）
+    config.construction_num_cones = 8
+    config.construction_cone_interval = 3
+    config.construction_num_garbage = 10
+    config.construction_num_workers = 1
+    config.construction_debug_scan = False
+    config.construction_setup_stabilize_ticks = 2
+    config.traffic_density = 1.5
+    config.flow_range = 50.0
+    config.front_speed_diff_pct = -20.0
+    config.side_speed_diff_pct = 30.0
+    # simulator重启恢复参数：给 CARLA 充分拉起时间，避免一次崩溃带崩整训练
+    config.reset_retry_times = 8
+    config.reset_rebuild_sleep_sec = 2.0
+    config.rebuild_env_retry_times = 20
+    config.rebuild_env_sleep_sec = 3.0
+    # ✅ 障碍物门控调试（大量打印会拖慢训练，默认关闭）
+    config.debug_obstacle_gate = False
+    config.wandb_step_log_interval = 50
     config.observations_type = "state_lane_obstacles"
     config.obs_obstacle_k = 5
     config.obs_obstacle_range = 50.0
 
+    # ✅ 成功率门控课程阈值
+    config.stage1_success_threshold = 0.65
+    config.stage2_success_threshold = 0.82
+    config.force_stage2_episode = 80
+    config.force_stage3_episode = 160
+
+    # ✅ 动作降维开关（False=完整3维动作：throttle/steer/y_ref）
+    config.use_action_dim2 = False
+
+    # ✅ Stage3 是否启用 y_ref（默认关闭更稳）
+    config.stage3_use_yref = False
+    # ✅ Stage3 y_ref 渐进增益
+    config.stage3_yref_warmup_end = 450
+    config.stage3_yref_gain_warmup = 0.01
+    config.stage3_yref_gain_full = 0.03
+
     # ✅ 统一episode步长：训练timesteps 与 env.max_episode_steps 对齐
     # 防止time_limit截断导致统计/收敛判断偏移
-    config.max_episode_steps = 512
+    config.max_episode_steps = 256
+    config.train_episodes = 1500
+    config.entropy_start = 0.02
+    config.entropy_end = 0.005
+    config.entropy_decay_ep = 600
+    config.optimization_steps = (4, 4)
+    config.trd_loss_coef = 0.0
+    config.policy_lr = 1e-4
+    config.value_lr = 2e-4
+    config.gamma = 0.99
+    config.lambda_ = 0.95
+    config.clip_ratio = 0.2
+    config.batch_size = 128
+    config.update_frequency = 2
 
     # ✅ 关闭 early-stop（先保证稳定训练）
     # 如果你想恢复早停，把这个改回 True
@@ -913,10 +1266,29 @@ def train_ppo():
         config.use_forced_throttle = bool(cfg.get("use_forced_throttle", False))
         config.action_bias_strength = float(cfg.get("action_bias_strength", 0.7))
         config.action_bias_decay = float(cfg.get("action_bias_decay", 0.999))
+        config.train_episodes = int(cfg.get("episodes", 1500))
+        config.max_episode_steps = int(cfg.get("max_steps_per_episode", 256))
+        config.policy_lr = float(cfg.get("policy_lr", 1e-4))
+        config.value_lr = float(cfg.get("value_lr", 2e-4))
+        config.gamma = float(cfg.get("gamma", 0.99))
+        config.lambda_ = float(cfg.get("lambda", 0.95))
+        config.clip_ratio = float(cfg.get("clip_ratio", 0.2))
+        config.batch_size = int(cfg.get("batch_size", 128))
+        config.update_frequency = int(cfg.get("update_frequency", 2))
+        config.entropy_reg = float(cfg.get("entropy_reg", 0.02))
+        config.entropy_start = float(cfg.get("entropy_start", 0.02))
+        config.entropy_end = float(cfg.get("entropy_end", 0.005))
+        config.entropy_decay_ep = int(cfg.get("entropy_decay_ep", 600))
+        _opt_steps = cfg.get("optimization_steps", (4, 4))
+        if isinstance(_opt_steps, (list, tuple)) and len(_opt_steps) == 2:
+            config.optimization_steps = (int(_opt_steps[0]), int(_opt_steps[1]))
+        else:
+            config.optimization_steps = (4, 4)
+        config.trd_loss_coef = float(cfg.get("trd_loss_coef", 0.0))
 
         # ✅ y_ref 新旧字段统一：训练内部都用 use_yref_in_steer / yref_steer_gain
-        _use_yref = bool(cfg.get("use_yref_in_steer", cfg.get("use_yref_mapping", True)))
-        _yref_gain = float(cfg.get("yref_steer_gain", cfg.get("yref_gain", 0.03)))
+        _use_yref = bool(cfg.get("use_yref_in_steer", cfg.get("use_yref_mapping", False)))
+        _yref_gain = float(cfg.get("yref_steer_gain", cfg.get("yref_gain", 0.0)))
         config.use_yref_in_steer = _use_yref
         config.yref_steer_gain = _yref_gain
         # 兼容旧字段（防止其他模块仍在读取旧名）
@@ -925,22 +1297,38 @@ def train_ppo():
         config.yref_penalty = float(cfg.get("yref_penalty", 0.0))
         config.log_steer_saturation = bool(cfg.get("log_steer_saturation", True))
         config.steer_sat_threshold = float(cfg.get("steer_sat_threshold", 0.999))
-        config.wandb_step_log_interval = int(cfg.get("wandb_step_log_interval", 10))
+        config.wandb_step_log_interval = int(cfg.get("wandb_step_log_interval", 50))
     else:
         # wandb未开启时的默认值（你也可以手动改这里测试两版）
         config.use_action_bias = False
         config.use_forced_throttle = False
         config.action_bias_strength = 0.7
         config.action_bias_decay = 0.999
+        config.train_episodes = int(getattr(config, "train_episodes", 1500))
+        config.max_episode_steps = int(getattr(config, "max_episode_steps", 256))
+        config.policy_lr = float(getattr(config, "policy_lr", 1e-4))
+        config.value_lr = float(getattr(config, "value_lr", 2e-4))
+        config.gamma = float(getattr(config, "gamma", 0.99))
+        config.lambda_ = float(getattr(config, "lambda_", 0.95))
+        config.clip_ratio = float(getattr(config, "clip_ratio", 0.2))
+        config.batch_size = int(getattr(config, "batch_size", 128))
+        config.update_frequency = int(getattr(config, "update_frequency", 2))
+        config.entropy_reg = float(getattr(config, "entropy_reg", 0.02))
+        config.entropy_start = float(getattr(config, "entropy_start", 0.02))
+        config.entropy_end = float(getattr(config, "entropy_end", 0.005))
+        config.entropy_decay_ep = int(getattr(config, "entropy_decay_ep", 600))
+        config.optimization_steps = tuple(getattr(config, "optimization_steps", (4, 4)))
+        config.trd_loss_coef = float(getattr(config, "trd_loss_coef", 0.0))
 
         # ✅ y_ref 新旧字段统一
-        config.use_yref_in_steer = True
-        config.yref_steer_gain = 0.03
-        config.use_yref_mapping = True
-        config.yref_gain = 0.03
+        config.use_yref_in_steer = False
+        config.yref_steer_gain = 0.0
+        config.use_yref_mapping = False
+        config.yref_gain = 0.0
         config.yref_penalty = 0.0
         config.log_steer_saturation = True
         config.steer_sat_threshold = 0.999
+        config.wandb_step_log_interval = int(getattr(config, "wandb_step_log_interval", 50))
 
     # ===== 根据版本自动设置 yref_penalty =====
     # 不映射版：给一个小惩罚把 y_ref 压到 0
@@ -949,6 +1337,27 @@ def train_ppo():
         config.yref_penalty = 0.0  # 或 0.01（看你是否希望更平滑）
     else:
         config.yref_penalty = 0.05  # 推荐从 0.05 开始（范围 0.02~0.1）
+
+    # =========================
+    # ✅ Debug 可视化模式覆盖（短跑诊断）
+    # =========================
+    if debug_vis:
+        print("\n[VIS DEBUG] ✅ 启用可视化短跑诊断模式")
+        config.render = True
+        config.spectator_mode = "none"
+
+        config.enable_debug_drawing = True
+        config.debug_draw_interval = 5
+        config.draw_detection_range = True
+        config.draw_ego_direction = True
+        config.draw_obstacle_boxes = True
+        config.draw_lane_center = True
+
+        config.random_scenario = False
+        config.scenario = "cones"
+        config.scenario_pool = ["cones"]
+
+        config.max_episode_steps = int(debug_vis_timesteps)
 
     # reward config（保持你的逻辑）
     print("\n[0] 加载激进版Reward配置...")
@@ -989,27 +1398,44 @@ def train_ppo():
     # ✅ obs_dim 改了（9 -> 30）后，旧权重一定不兼容，必须从头训
     weights_dir = "./weights/ppo-carla-obs30"  # 换个新目录
     load_existing = False
-    print("\n✅ obs_dim=30：禁用旧权重加载，从头开始训练")
+    resume_policy_only = False
+    print("\n✅ obs_dim=30：默认从头训练（不恢复旧 policy/value，避免历史坏策略污染）")
 
     # ✅ 修复P1级和P2级问题：优化超参数
     agent = PPOAgent(
         env=env,
-        policy_lr=1e-4,
-        value_lr=2e-4,
-        gamma=0.99,
-        lambda_=0.95,
-        clip_ratio=0.2,              # ✅ P2: 从0.15改为0.2（标准PPO值）
-        # ✅ 提高熵正则，配合线性衰减（先探索、后收敛）
-        entropy_regularization=0.12,
-        optimization_steps=(10, 10),  # ✅ P2: 从(5,5)改为(10,10)（提升数据效率）
-        batch_size=128,               # ✅ P2: 从256改为128（更多batch）
-        update_frequency=2,           # ✅ P2: 从1改为2（累积更多数据）
+        seed=int(getattr(config, "seed", 10)),
+        policy_lr=float(config.policy_lr),
+        value_lr=float(config.value_lr),
+        gamma=float(config.gamma),
+        lambda_=float(config.lambda_),
+        clip_ratio=float(config.clip_ratio),
+        entropy_regularization=float(config.entropy_reg),
+        optimization_steps=tuple(config.optimization_steps),
+        batch_size=int(config.batch_size),
+        update_frequency=int(config.update_frequency),
+        trd_loss_coef=float(getattr(config, "trd_loss_coef", 0.0)),
         name="ppo-carla-obs30",
         load=load_existing
     )
 
     print("✅ PPO Agent创建成功")
     print(f"  - 模型保存路径: {agent.base_path}")
+
+    # ✅ 仅恢复 policy，避免 reward 变化导致 value 失配
+    if resume_policy_only:
+        import os
+        lat_path = os.path.join(weights_dir, "policy_net_lat")
+        lon_path = os.path.join(weights_dir, "policy_net_lon")
+        try:
+            agent.network.policy_lat.load_weights(lat_path)
+            agent.network.policy_lon.load_weights(lon_path)
+            agent.network.update_old_policy()
+            print(f"✅ 已加载 policy_lat: {lat_path}")
+            print(f"✅ 已加载 policy_lon: {lon_path}")
+            print("✅ value 网络已重置（未加载旧权重）")
+        except Exception as e:
+            print(f"⚠️ policy 权重加载失败: {e}")
 
     print("\n[4] 开始训练...")
     print("-" * 70)
@@ -1018,13 +1444,15 @@ def train_ppo():
         train_with_logging(
             agent, env, logger,
             wandb_run=wandb_run,
-            episodes=500,
+            episodes=(debug_vis_episodes if debug_vis else int(getattr(config, "train_episodes", 1500))),
             # ✅ 和 env.max_episode_steps 保持一致，避免time_limit截断影响统计
             timesteps=int(getattr(config, "max_episode_steps", 512)),
             save_every=100
         )
     except KeyboardInterrupt:
         print("\n⚠️  训练被用户中断")
+    except Exception as e:
+        print(f"\n❌ 训练异常中止: {e}")
     finally:
         logger.close()
         env.close()

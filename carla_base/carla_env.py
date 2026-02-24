@@ -112,7 +112,7 @@ class CarlaEnv(gym.Env):
 
         # 渲染/同步
         self.render_display = bool(getattr(config, "render", True))
-        self.fixed_dt = float(getattr(config, "fixed_dt", 0.05))  # 20 FPS
+        self.fixed_dt = float(getattr(config, "fixed_dt", 0.08))  # 12.5 FPS (降低内存/负载)
         self.map_name = str(getattr(config, "map_name", "Town05"))
 
         # 车辆与交通
@@ -129,6 +129,34 @@ class CarlaEnv(gym.Env):
         self.stuck_speed_thresh = float(getattr(config, "stuck_speed_thresh", 0.30))  # m/s
         self.min_throttle_when_stuck = float(getattr(config, "min_throttle_when_stuck", 0.20))
         self.low_speed_steer_scale = float(getattr(config, "low_speed_steer_scale", 0.60))
+        # ✅ 低速转向缩放（避免起步猛打方向）
+        self.enable_low_speed_steer_scale = bool(getattr(config, "enable_low_speed_steer_scale", True))
+        self.low_speed_steer_speed = float(getattr(config, "low_speed_steer_speed", 2.0))
+        self.low_speed_steer_min_scale = float(getattr(config, "low_speed_steer_min_scale", 0.25))
+
+        # ✅ 仅对转向做平滑（不影响油门/刹车）
+        self.enable_steer_smoothing = bool(getattr(config, "enable_steer_smoothing", True))
+        self.steer_smooth_alpha = float(getattr(config, "steer_smooth_alpha", 0.7))
+        # ✅ 低速动作约束：避免“刹车苟活”
+        self.low_speed_brake_cut_speed = float(getattr(config, "low_speed_brake_cut_speed", 0.6))
+        self.low_speed_throttle_floor_speed = float(getattr(config, "low_speed_throttle_floor_speed", 0.6))
+        self.low_speed_throttle_floor = float(getattr(config, "low_speed_throttle_floor", 0.05))
+        # ✅ 速度保护与近障碍限油（防止瞬间飙速撞击）
+        self.speed_governor_speed = float(getattr(config, "speed_governor_speed", 8.0))
+        self.speed_governor_brake_gain = float(getattr(config, "speed_governor_brake_gain", 0.2))
+        self.obs_throttle_cap_dist = float(getattr(config, "obs_throttle_cap_dist", 12.0))
+        self.obs_throttle_cap = float(getattr(config, "obs_throttle_cap", 0.25))
+        # ✅ 近距安全刹车（防止低速也撞）
+        self.obs_brake_dist = float(getattr(config, "obs_brake_dist", 6.0))
+        self.obs_brake_value = float(getattr(config, "obs_brake_value", 0.4))
+        self.obs_brake_hard_dist = float(getattr(config, "obs_brake_hard_dist", 3.0))
+        self.obs_brake_hard_value = float(getattr(config, "obs_brake_hard_value", 0.6))
+        # 仅把“前方且横向接近本车道中心”的障碍用于控制门控，避免被侧后方障碍误触发
+        self.obs_control_lat_tol = float(getattr(config, "obs_control_lat_tol", 2.8))
+        # ✅ spawn朝向校正（通用）
+        self.enable_spawn_yaw_correction = bool(getattr(config, "enable_spawn_yaw_correction", True))
+        self.spawn_yaw_debug = bool(getattr(config, "spawn_yaw_debug", True))
+        self.spawn_yaw_max_dist = float(getattr(config, "spawn_yaw_max_dist", 60.0))
         self.enable_anti_stall = bool(getattr(config, "enable_anti_stall", True))
 
         # =========================
@@ -318,6 +346,10 @@ class CarlaEnv(gym.Env):
 
         self.progress_ema = 0.0
         self.last_obs = None  # 用于 reward 读取障碍信息（在 step 里更新）
+        self.last_obstacle_dist: Optional[float] = None
+        self.last_obstacle_fwd: Optional[float] = None
+        self.last_obstacle_lat: Optional[float] = None
+        self.timeout_flag = False
 
     # ----------------- 同步设置 & 切图 -----------------
     def _apply_sync_settings(self, fixed_dt: float):
@@ -408,6 +440,66 @@ class CarlaEnv(gym.Env):
         self.low_speed_steer_scale = float(
             getattr(self.config, "low_speed_steer_scale", self.low_speed_steer_scale)
         )
+        self.enable_low_speed_steer_scale = bool(
+            getattr(self.config, "enable_low_speed_steer_scale", self.enable_low_speed_steer_scale)
+        )
+        self.low_speed_steer_speed = float(
+            getattr(self.config, "low_speed_steer_speed", self.low_speed_steer_speed)
+        )
+        self.low_speed_steer_min_scale = float(
+            getattr(self.config, "low_speed_steer_min_scale", self.low_speed_steer_min_scale)
+        )
+        self.enable_steer_smoothing = bool(
+            getattr(self.config, "enable_steer_smoothing", self.enable_steer_smoothing)
+        )
+        self.steer_smooth_alpha = float(
+            getattr(self.config, "steer_smooth_alpha", self.steer_smooth_alpha)
+        )
+        self.low_speed_brake_cut_speed = float(
+            getattr(self.config, "low_speed_brake_cut_speed", self.low_speed_brake_cut_speed)
+        )
+        self.low_speed_throttle_floor_speed = float(
+            getattr(self.config, "low_speed_throttle_floor_speed", self.low_speed_throttle_floor_speed)
+        )
+        self.low_speed_throttle_floor = float(
+            getattr(self.config, "low_speed_throttle_floor", self.low_speed_throttle_floor)
+        )
+        self.speed_governor_speed = float(
+            getattr(self.config, "speed_governor_speed", self.speed_governor_speed)
+        )
+        self.speed_governor_brake_gain = float(
+            getattr(self.config, "speed_governor_brake_gain", self.speed_governor_brake_gain)
+        )
+        self.obs_throttle_cap_dist = float(
+            getattr(self.config, "obs_throttle_cap_dist", self.obs_throttle_cap_dist)
+        )
+        self.obs_throttle_cap = float(
+            getattr(self.config, "obs_throttle_cap", self.obs_throttle_cap)
+        )
+        self.obs_brake_dist = float(
+            getattr(self.config, "obs_brake_dist", self.obs_brake_dist)
+        )
+        self.obs_brake_value = float(
+            getattr(self.config, "obs_brake_value", self.obs_brake_value)
+        )
+        self.obs_brake_hard_dist = float(
+            getattr(self.config, "obs_brake_hard_dist", self.obs_brake_hard_dist)
+        )
+        self.obs_brake_hard_value = float(
+            getattr(self.config, "obs_brake_hard_value", self.obs_brake_hard_value)
+        )
+        self.obs_control_lat_tol = float(
+            getattr(self.config, "obs_control_lat_tol", self.obs_control_lat_tol)
+        )
+        self.enable_spawn_yaw_correction = bool(
+            getattr(self.config, "enable_spawn_yaw_correction", self.enable_spawn_yaw_correction)
+        )
+        self.spawn_yaw_debug = bool(
+            getattr(self.config, "spawn_yaw_debug", self.spawn_yaw_debug)
+        )
+        self.spawn_yaw_max_dist = float(
+            getattr(self.config, "spawn_yaw_max_dist", self.spawn_yaw_max_dist)
+        )
 
     # ----------------- reset/step -----------------
     def reset(self):
@@ -417,13 +509,21 @@ class CarlaEnv(gym.Env):
         # ✅ 随机场景选择（如果启用）
         if getattr(self.config, "random_scenario", False):
             scenario_pool = getattr(self.config, "scenario_pool", ["parked_obstacles", "cones"])
-            self.scenario = random.choice(scenario_pool)
+            # ✅ 支持按权重采样场景（例如降低 jaywalker 权重）
+            weights = getattr(self.config, "scenario_weights", None)
+            if isinstance(weights, dict) and len(weights) > 0:
+                w = [float(weights.get(s, 1.0)) for s in scenario_pool]
+                # 防止全 0
+                if sum(w) <= 1e-6:
+                    w = None
+                self.scenario = random.choices(scenario_pool, weights=w, k=1)[0] if w else random.choice(scenario_pool)
+            else:
+                self.scenario = random.choice(scenario_pool)
             print(f"\n[RandomScenario] 本次Episode场景: {self.scenario}")
 
-        # ✅ 温和的清理方案：先清空队列，但不立即关闭 sync_mode
+        # ✅ 先清空队列（如果有）
         if self.sync_mode is not None:
             try:
-                # 清空队列中的残留数据
                 for q in self.sync_mode._queues:
                     try:
                         while not q.empty():
@@ -433,19 +533,17 @@ class CarlaEnv(gym.Env):
             except Exception as e:
                 print(f"[CarlaEnv] ⚠️ 清空队列失败: {e}")
 
-        # 清理 actors（包括传感器）
-        self._cleanup_actors()
-
-        # ✅ 现在关闭 sync_mode（传感器已经被销毁）
+        # ✅ 先关闭 sync_mode，再销毁 actors，避免销毁过程中继续积压 tick 回调
         if self.sync_mode is not None:
             try:
-                # 只恢复设置，不再尝试停止传感器（已经销毁了）
-                if self.sync_mode._settings is not None:
-                    self.world.apply_settings(self.sync_mode._settings)
+                self.sync_mode.close()
             except Exception as e:
-                print(f"[CarlaEnv] ⚠️ 恢复设置失败: {e}")
+                print(f"[CarlaEnv] ⚠️ 关闭 sync_mode 失败: {e}")
             finally:
                 self.sync_mode = None
+
+        # 清理 actors（包括传感器）
+        self._cleanup_actors()
 
         # ✅ 给 CARLA 更多时间来稳定（特别是在清理大量 actors 后）
         time.sleep(0.5)
@@ -474,10 +572,79 @@ class CarlaEnv(gym.Env):
 
         # 搭场景 + spawn
         spawn_tf = self._maybe_setup_scene_and_pick_spawn()
+        # ✅ 通用修正：如果场景提供 first_cone_transform，则强制朝向锥桶
+        try:
+            if getattr(self, "scenario_instance", None) is not None:
+                first_cone_tf = getattr(self.scenario_instance, "first_cone_transform", None)
+                if first_cone_tf is not None and spawn_tf is not None:
+                    loc = spawn_tf.location
+                    cone_loc = first_cone_tf.location
+                    dx = float(cone_loc.x - loc.x)
+                    dy = float(cone_loc.y - loc.y)
+                    yaw = math.degrees(math.atan2(dy, dx))
+                    spawn_tf.rotation.yaw = yaw
+                    if getattr(self, "spawn_yaw_debug", False):
+                        print(f"[SpawnYaw] force facing cones yaw={yaw:.1f}")
+        except Exception as e:
+            if getattr(self, "spawn_yaw_debug", False):
+                print(f"[SpawnYaw] cone-facing correction failed: {e}")
 
         self.ego = self._spawn_ego_with_transform(spawn_tf)
         if self.ego is None:
             raise RuntimeError("spawn ego failed；请确认地图有可用 spawn 点。")
+
+        # ✅ 通用 spawn 朝向校正：只对“同车道前方”的障碍对齐（不被交通流干扰）
+        if self.enable_spawn_yaw_correction:
+            try:
+                ego_loc = self.ego.get_location()
+                ego_tf = self.ego.get_transform()
+                fwd = ego_tf.get_forward_vector()
+                ego_wp = self.map.get_waypoint(ego_loc, project_to_road=True)
+
+                candidates = self._collect_obstacle_candidates()
+                nearest = None
+                for a in candidates:
+                    if a is None:
+                        continue
+                    try:
+                        a_loc = a.get_location()
+                    except Exception:
+                        continue
+
+                    # 只用同车道
+                    obs_wp = self.map.get_waypoint(a_loc, project_to_road=True)
+                    if obs_wp is None or ego_wp is None:
+                        continue
+                    if (obs_wp.road_id != ego_wp.road_id) or (obs_wp.lane_id != ego_wp.lane_id):
+                        continue
+
+                    dx = float(a_loc.x - ego_loc.x)
+                    dy = float(a_loc.y - ego_loc.y)
+                    dist = float(math.hypot(dx, dy))
+                    if dist < 1e-3 or dist > self.spawn_yaw_max_dist:
+                        continue
+
+                    # 只保留“前方”
+                    dot = float(fwd.x * dx + fwd.y * dy)
+                    if dot <= 0.0:
+                        continue
+
+                    if (nearest is None) or (dist < nearest[0]):
+                        nearest = (dist, dx, dy, dot)
+
+                if nearest is not None:
+                    dist, dx, dy, dot = nearest
+                    new_yaw = math.degrees(math.atan2(dy, dx))
+                    new_tf = carla.Transform(
+                        ego_tf.location,
+                        carla.Rotation(pitch=ego_tf.rotation.pitch, yaw=new_yaw, roll=ego_tf.rotation.roll)
+                    )
+                    self.ego.set_transform(new_tf)
+                    if self.spawn_yaw_debug:
+                        print(f"[SpawnYaw] dist={dist:.2f}, dot={dot:.2f}, yaw-> {new_yaw:.1f}")
+            except Exception as e:
+                if self.spawn_yaw_debug:
+                    print(f"[SpawnYaw] correction failed: {e}")
 
         bp_lib = self.world.get_blueprint_library()
         if self.render_display:
@@ -548,6 +715,10 @@ class CarlaEnv(gym.Env):
 
         self.episode_steps = 0
         self.collision = False
+        self.timeout_flag = False
+        self.last_obstacle_dist = None
+        self.last_obstacle_fwd = None
+        self.last_obstacle_lat = None
 
         # RewardMonitor reset
         self.episode_id += 1
@@ -611,13 +782,133 @@ class CarlaEnv(gym.Env):
         # y_ref 仍然读出来，但只用于日志（不用于控制）
         y_ref = float(np.clip(a2, -1.0, 1.0))
 
-        # --------- 3) anti-stall ---------
-        if self.enable_anti_stall and (self.ego is not None):
+        # --------- 3) speed for control shaping ---------
+        speed = None
+        if self.ego is not None:
             v = self.ego.get_velocity()
             speed = float(math.sqrt(v.x * v.x + v.y * v.y + v.z * v.z))
-            if speed < self.stuck_speed_thresh:
+        scenario_name = str(getattr(self, "scenario", "")).lower()
+        is_jaywalker_ctrl = ("jaywalker" in scenario_name)
+
+        # --------- 3.5) speed governor (防爆冲) ---------
+        if speed is not None and speed > self.speed_governor_speed:
+            # 速度越高，刹车越多
+            brake = max(brake, min(0.6, self.speed_governor_brake_gain * (speed - self.speed_governor_speed)))
+            throttle = min(throttle, 0.05)
+
+        # --------- 3.6) obstacle throttle cap (近障碍限油) ---------
+        last_obs_dist = getattr(self, "last_obstacle_dist", None)
+        last_obs_fwd = getattr(self, "last_obstacle_fwd", None)
+        last_obs_lat = getattr(self, "last_obstacle_lat", None)
+        obs_lat_tol = float(
+            getattr(self.config, "obs_control_lat_tol_jaywalker", self.obs_control_lat_tol)
+            if is_jaywalker_ctrl else
+            getattr(self.config, "obs_control_lat_tol_lane", self.obs_control_lat_tol)
+        )
+
+        obs_is_relevant = (
+            (last_obs_dist is not None)
+            and (last_obs_fwd is not None)
+            and (float(last_obs_fwd) > 0.0)
+            and (last_obs_lat is None or abs(float(last_obs_lat)) <= obs_lat_tol)
+        )
+
+        obs_cap_dist = float(
+            getattr(self.config, "obs_throttle_cap_dist_jaywalker", self.obs_throttle_cap_dist)
+            if is_jaywalker_ctrl else
+            getattr(self.config, "obs_throttle_cap_dist_lane", self.obs_throttle_cap_dist)
+        )
+        obs_cap = float(
+            getattr(self.config, "obs_throttle_cap_jaywalker", self.obs_throttle_cap)
+            if is_jaywalker_ctrl else
+            getattr(self.config, "obs_throttle_cap_lane", self.obs_throttle_cap)
+        )
+
+        if (speed is not None) and obs_is_relevant and (float(last_obs_dist) < obs_cap_dist):
+            throttle = min(throttle, obs_cap)
+
+        # --------- 3.7) obstacle brake shield (近距强制刹车) ---------
+        obstacle_brake_active = False
+        obs_brake_dist = float(
+            getattr(self.config, "obs_brake_dist_jaywalker", self.obs_brake_dist)
+            if is_jaywalker_ctrl else
+            getattr(self.config, "obs_brake_dist_lane", self.obs_brake_dist)
+        )
+        obs_brake_value = float(
+            getattr(self.config, "obs_brake_value_jaywalker", self.obs_brake_value)
+            if is_jaywalker_ctrl else
+            getattr(self.config, "obs_brake_value_lane", self.obs_brake_value)
+        )
+        obs_brake_hard_dist = float(
+            getattr(self.config, "obs_brake_hard_dist_jaywalker", self.obs_brake_hard_dist)
+            if is_jaywalker_ctrl else
+            getattr(self.config, "obs_brake_hard_dist_lane", self.obs_brake_hard_dist)
+        )
+        obs_brake_hard_value = float(
+            getattr(self.config, "obs_brake_hard_value_jaywalker", self.obs_brake_hard_value)
+            if is_jaywalker_ctrl else
+            getattr(self.config, "obs_brake_hard_value_lane", self.obs_brake_hard_value)
+        )
+
+        if (speed is not None) and obs_is_relevant:
+            if float(last_obs_dist) < obs_brake_hard_dist:
+                brake = max(brake, obs_brake_hard_value)
+                throttle = min(throttle, 0.02)
+                obstacle_brake_active = True
+            elif float(last_obs_dist) < obs_brake_dist:
+                brake = max(brake, obs_brake_value)
+                throttle = min(throttle, 0.05)
+                obstacle_brake_active = True
+
+        # --------- 4) low-speed steer scale ---------
+        if self.enable_low_speed_steer_scale and (speed is not None):
+            if speed < self.low_speed_steer_speed:
+                frac = speed / max(self.low_speed_steer_speed, 1e-6)
+                scale = self.low_speed_steer_min_scale + (1.0 - self.low_speed_steer_min_scale) * frac
+                steer = float(np.clip(steer * scale, -1.0, 1.0))
+
+        # --------- 5) low-speed throttle/brake shaping ---------
+        ls_brake_cut_speed = float(
+            getattr(self.config, "low_speed_brake_cut_speed_jaywalker", self.low_speed_brake_cut_speed)
+            if is_jaywalker_ctrl else
+            getattr(self.config, "low_speed_brake_cut_speed_lane", self.low_speed_brake_cut_speed)
+        )
+        ls_floor_speed = float(
+            getattr(self.config, "low_speed_throttle_floor_speed_jaywalker", self.low_speed_throttle_floor_speed)
+            if is_jaywalker_ctrl else
+            getattr(self.config, "low_speed_throttle_floor_speed_lane", self.low_speed_throttle_floor_speed)
+        )
+        ls_floor = float(
+            getattr(self.config, "low_speed_throttle_floor_jaywalker", self.low_speed_throttle_floor)
+            if is_jaywalker_ctrl else
+            getattr(self.config, "low_speed_throttle_floor_lane", self.low_speed_throttle_floor)
+        )
+        if speed is not None:
+            if speed < ls_brake_cut_speed and (not obstacle_brake_active):
+                brake = brake * 0.3
+            if speed < ls_floor_speed:
+                throttle = max(throttle, ls_floor)
+
+        # --------- 6) steer smoothing (only steer, keep throttle/brake responsive) ---------
+        if self.enable_steer_smoothing and (self.prev_control_for_smooth is not None):
+            alpha = float(np.clip(self.steer_smooth_alpha, 0.0, 1.0))
+            steer = alpha * steer + (1.0 - alpha) * float(self.prev_control_for_smooth.steer)
+            steer = float(np.clip(steer, -1.0, 1.0))
+
+        # --------- 7) anti-stall ---------
+        if self.enable_anti_stall and (self.ego is not None):
+            min_throttle_stuck = float(
+                getattr(self.config, "min_throttle_when_stuck_jaywalker", self.min_throttle_when_stuck)
+                if is_jaywalker_ctrl else
+                getattr(self.config, "min_throttle_when_stuck_lane", self.min_throttle_when_stuck)
+            )
+            if speed is None:
+                v = self.ego.get_velocity()
+                speed = float(math.sqrt(v.x * v.x + v.y * v.y + v.z * v.z))
+            # 近障碍刹车时禁止 anti-stall 抢控制，避免“低速顶上去撞”
+            if speed < self.stuck_speed_thresh and (not obstacle_brake_active):
                 brake = 0.0
-                throttle = max(throttle, self.min_throttle_when_stuck)
+                throttle = max(throttle, min_throttle_stuck)
                 steer = float(np.clip(steer * self.low_speed_steer_scale, -1.0, 1.0))
 
         # --------- 4) apply control ---------
@@ -626,6 +917,7 @@ class CarlaEnv(gym.Env):
         control.manual_gear_shift = True
         self.ego.apply_control(control)
         self.last_control = control
+        self.prev_control_for_smooth = control
 
         snapshot, display_image = self._tick_once(timeout=15.0)  # ✅ 增加到 15 秒
 
@@ -665,8 +957,6 @@ class CarlaEnv(gym.Env):
         timeout = (self.episode_steps >= self.max_episode_steps)  # 字段名 timeout 保留给日志
         self.timeout_flag = bool(timeout)  # ✅ 新增
 
-        # reset() 里：初始化时
-        self.timeout_flag = False  # ✅ 新增
         done = bool(done_env or timeout)
 
         # --------- 6) done_reason 语义修正 ----------
@@ -717,6 +1007,13 @@ class CarlaEnv(gym.Env):
         return None
 
     def close(self):
+        if self.sync_mode is not None:
+            try:
+                self.sync_mode.close()
+            except Exception:
+                pass
+            finally:
+                self.sync_mode = None
         self._cleanup_actors()
         try:
             # 恢复世界设置，避免退出后 server 被同步模式卡住
@@ -1560,8 +1857,9 @@ class CarlaEnv(gym.Env):
 
         candidates = self._collect_obstacle_candidates()
 
-        # ✅ 添加调试输出（每50步输出一次）
-        if self.episode_steps % 50 == 0:
+        debug_obs_scan = bool(getattr(self.config, "debug_obstacle_obs", False))
+        # ✅ 添加调试输出（按开关控制，避免训练阶段日志过量）
+        if debug_obs_scan and (self.episode_steps % 50 == 0):
             ego_loc = self.ego.get_location() if self.ego else None
             print(f"\n[OBSTACLE DETECTION] Step {self.episode_steps}:")
             print(f"  - 检测范围: {R}m")
@@ -1628,8 +1926,8 @@ class CarlaEnv(gym.Env):
 
         result = np.array(feats, dtype=np.float32)
 
-        # ✅ 添加调试输出（每50步输出一次）
-        if self.episode_steps % 50 == 0:
+        # ✅ 添加调试输出（按开关控制，避免训练阶段日志过量）
+        if debug_obs_scan and (self.episode_steps % 50 == 0):
             non_zero = np.count_nonzero(result)
             print(f"  - 观测值非零元素: {non_zero}/{K*3}")
             if non_zero > 0:
@@ -1677,26 +1975,50 @@ class CarlaEnv(gym.Env):
 
         # ----------------- terminal penalties -----------------
         # ✅ 终止惩罚：碰撞/出界更痛一点，推动安全学习
-        K_COLLISION_TERMINAL = 200.0
+        K_COLLISION_TERMINAL = 450.0
         K_OFFROAD_TERMINAL = 60.0
         K_NO_PROGRESS_TERM = 50.0
         # ✅ 允许更长时间尝试起步，避免刚学走就被判“无进展”
         NO_PROGRESS_LIMIT = 150
 
+        # ----------------- scenario-specific profile -----------------
+        scenario_name = str(getattr(self, "scenario", "")).lower()
+        is_jaywalker = ("jaywalker" in scenario_name)
+
         # ----------------- progress (门控后才给) -----------------
         # ✅ 提高前向进度奖励，避免“保守趴地上”
         # ✅ 让进度回报更“看得见”，避免长期负回报卡平台
-        K_PROGRESS = 1.60
-        PROG_CLIP = 0.60
+        K_PROGRESS = 10.00
+        PROG_CLIP = 1.00
         PROG_EMA_A = 0.08
 
         # ----------------- speed (鼓励更合理的低速通过，而不是爬行) -----------------
-        # ✅ 速度目标再上调一点，配合低速惩罚，让策略别“爬行”
-        TARGET_SPEED = 5.0
-        V_MAX = 7.0
-        OVERSPEED_START = 6.0
-        K_SPEED = 0.50
-        K_OVERSPEED = 0.15
+        # 非 jaywalker: 鼓励稳健前进；jaywalker: 保持更保守速度策略
+        TARGET_SPEED = float(
+            getattr(self.config, "target_speed_jaywalker", 4.0)
+            if is_jaywalker else
+            getattr(self.config, "target_speed_lane", 7.8)
+        )
+        V_MAX = float(
+            getattr(self.config, "v_max_jaywalker", 5.5)
+            if is_jaywalker else
+            getattr(self.config, "v_max_lane", 8.0)
+        )
+        OVERSPEED_START = float(
+            getattr(self.config, "overspeed_start_jaywalker", 4.5)
+            if is_jaywalker else
+            getattr(self.config, "overspeed_start_lane", 6.5)
+        )
+        K_SPEED = float(
+            getattr(self.config, "k_speed_jaywalker", 1.2)
+            if is_jaywalker else
+            getattr(self.config, "k_speed_lane", 1.8)
+        )
+        K_OVERSPEED = float(
+            getattr(self.config, "k_overspeed_jaywalker", 0.15)
+            if is_jaywalker else
+            getattr(self.config, "k_overspeed_lane", 0.18)
+        )
 
         # ----------------- lane keeping -----------------
         # ✅ 轻微降低车道惩罚，减少“怕偏一点就停车”的行为
@@ -1708,8 +2030,8 @@ class CarlaEnv(gym.Env):
         # ----------------- danger (仍然保守，但不要过于强惩罚) -----------------
         # ✅ 危险惩罚仍保守，但稍微缓和强度
         DANGER_START = 0.40
-        K_DANGER = 0.50
-        DANGER_CLIP = 0.80
+        K_DANGER = 0.30
+        DANGER_CLIP = 0.50
 
         # ----------------- obstacle shaping (更早更强) -----------------
         HAVE_OBS = bool(getattr(self, "obs_use_obstacles", False))
@@ -1721,16 +2043,33 @@ class CarlaEnv(gym.Env):
         # ✅ 观察更远一点，提前对障碍做引导惩罚
         AVOID_FWD = 55.0
         SAFE_DIST = 22.0
-        LAT_TOL = 4.5
-        W_OBS_CLEAR = 1.3  # 近距惩罚稍强，减少碰撞率
-        W_OBS_SPEED = 1.0  # 近障碍限速惩罚
-        V_CAP_NEAR = 3.0   # 近障碍速度上限略收紧
+        LAT_TOL = float(
+            getattr(self.config, "obs_reward_lat_tol_jaywalker", 6.5)
+            if is_jaywalker else
+            getattr(self.config, "obs_reward_lat_tol_lane", 4.0)
+        )
+        K_AVOID_LAT = float(
+            getattr(self.config, "k_avoid_lat_jaywalker", 0.50)
+            if is_jaywalker else
+            getattr(self.config, "k_avoid_lat_lane", 0.25)
+        )  # 降低横向奖励，避免“为躲障碍过度横摆”
+        W_OBS_CLEAR = 1.00  # 近距惩罚：适度增强，降低碰撞
+        W_OBS_SPEED = 0.30 # 近障碍限速惩罚：适度增强
+        V_CAP_NEAR = float(
+            getattr(self.config, "v_cap_near_jaywalker", 2.2)
+            if is_jaywalker else
+            getattr(self.config, "v_cap_near_lane", 3.4)
+        )
 
         # ----------------- alive / success -----------------
         # ✅ 略微提高 alive，降低纯“苟活”收益（配合低速惩罚）
         # ✅ 生存奖励小幅增加，成功奖励更明确
         R_ALIVE = 0.01 # 0.03
-        SUCCESS_BONUS = 80.0
+        SUCCESS_BONUS = float(
+            getattr(self.config, "success_bonus_jaywalker", 150.0)
+            if is_jaywalker else
+            getattr(self.config, "success_bonus_lane", 120.0)
+        )
 
         # ----------------- terminal flags -----------------
         collision_flag = bool(getattr(self, "collision", False))
@@ -1824,8 +2163,14 @@ class CarlaEnv(gym.Env):
             except Exception:
                 return None, None, None
 
+            # ✅ 优先用统一的障碍候选（包含 cones/static props）
+            try:
+                candidates = self._collect_obstacle_candidates()
+            except Exception:
+                candidates = []
+
             best = None
-            for a in getattr(self, "obstacle_actors", []):
+            for a in candidates:
                 if a is None:
                     continue
                 try:
@@ -1848,7 +2193,7 @@ class CarlaEnv(gym.Env):
                 return None, None, None
             return best[0], best[1], best[2]
 
-        # 从 obs 解析（保持兼容）
+        # 从 obs 解析（强制优先使用 obs，保证 r_obs_clear 生效）
         if HAVE_OBS and (obs_vec is not None) and (len(obs_vec) >= 9 + LANE_DIM + K_OBS * 3):
             x = np.asarray(obs_vec, dtype=np.float32).reshape(-1)
             start = 9 + LANE_DIM
@@ -1864,14 +2209,9 @@ class CarlaEnv(gym.Env):
                 rely = rely_n * R_OBS
                 dist = dist_n * R_OBS
 
-                yaw = math.radians(float(ego_tf.rotation.yaw))
-                cy, sy = math.cos(yaw), math.sin(yaw)
-                dx_w = relx * cy - rely * sy
-                dy_w = relx * sy + rely * cy
-
-                right = ego_tf.get_right_vector()
-                fwd_proj = dx_w * float(fwd.x) + dy_w * float(fwd.y)
-                lat_proj = dx_w * float(right.x) + dy_w * float(right.y)
+                # _compute_obstacle_obs 中 rel_x 已定义为“前向投影”，这里直接用，不再做符号投票。
+                fwd_proj = relx
+                lat_proj = rely
 
                 front = fwd_proj > 0.0
                 if np.any(front):
@@ -1901,9 +2241,18 @@ class CarlaEnv(gym.Env):
             # 横向门控：别太严
             lat_gate = 1.0
             if nearest_lat is not None:
-                lat_gate = float(np.clip(1.0 - abs(float(nearest_lat)) / max(LAT_TOL, 1e-6), 0.0, 1.0))
+                # ✅ 软门控：避免 lat 稍大就被硬压成 0
+                lat_norm = abs(float(nearest_lat)) / max(LAT_TOL, 1e-6)
+                lat_gate = float(np.exp(-(lat_norm * lat_norm)))
 
             obstacle_gate = g * lat_gate
+            # ✅ 场景化 gate floor：lane 低一些，避免长期误罚；jaywalker 保守一些
+            obs_gate_floor = float(
+                getattr(self.config, "obs_reward_gate_floor_jaywalker", 0.20)
+                if is_jaywalker else
+                getattr(self.config, "obs_reward_gate_floor_lane", 0.05)
+            )
+            obstacle_gate = max(obs_gate_floor, obstacle_gate)
 
             # 进入 SAFE_DIST：平方强惩罚（主导安全）
             if nearest_dist < SAFE_DIST:
@@ -1915,19 +2264,56 @@ class CarlaEnv(gym.Env):
                 over = max(0.0, speed - V_CAP_NEAR)
                 if over > 0.0:
                     r_obs_speed = -W_OBS_SPEED * obstacle_gate * float((over / max(V_CAP_NEAR, 1e-6)) ** 2)
-        # ----------------- speed reward (强门控：危险时不给“快”) -----------------
-        # 只鼓励低速接近 TARGET_SPEED
-        err = abs(speed - TARGET_SPEED) / max(TARGET_SPEED, 1e-3)
-        speed_score = float(np.clip(1.0 - err, 0.0, 1.0))
-        r_speed = K_SPEED * speed_score
+                    # ✅ 避免速度惩罚过大压死学习
+                    r_obs_speed = float(max(r_obs_speed, -1.0))
+
+            # 临近障碍物时打印一次核心量，方便定位 r_obs_clear 是否生效
+            if getattr(self.config, "debug_obstacle_gate", False):
+                try:
+                    if nearest_dist < 12.0:
+                        print(
+                            f"[OBS_GATE] dist={nearest_dist:.2f} "
+                            f"fwd={0.0 if nearest_fwd is None else float(nearest_fwd):.2f} "
+                            f"lat={0.0 if nearest_lat is None else float(nearest_lat):.2f} "
+                            f"gate={obstacle_gate:.3f} lat_gate={0.0 if nearest_lat is None else float(lat_gate):.3f} "
+                            f"r_clear={r_obs_clear:.4f} r_speed={r_obs_speed:.4f}"
+                        )
+                except Exception:
+                    pass
+
+        # ----------------- obstacle-aware lane penalty -----------------
+        # 前方有障碍时，适当放松车道惩罚，鼓励绕行
+        if obstacle_gate > 0.0:
+            lane_gate = max(0.25, 1.0 - 0.8 * float(obstacle_gate))
+            r_lane *= lane_gate
+
+        # ----------------- safety penalty downscale (混训稳定) -----------------
+        # 统一缩放安全类惩罚，避免负回报淹没前进信号
+        safety_penalty_scale = 0.90
+        r_lane *= safety_penalty_scale
+        r_danger *= safety_penalty_scale
+        r_obs_clear *= safety_penalty_scale
+        r_obs_speed *= safety_penalty_scale
+
+        # ----------------- lateral avoidance reward -----------------
+        # 障碍靠近时，鼓励产生横向偏移（帮助“绕开”而不是撞上/刹停）
+        r_avoid_lat = 0.0
+        if (nearest_dist is not None) and (nearest_lat is not None):
+            if (nearest_dist < SAFE_DIST) and (lane_ratio < 0.95):
+                lat_norm = min(abs(float(nearest_lat)) / max(LAT_TOL, 1e-6), 1.0)
+                r_avoid_lat = K_AVOID_LAT * float(obstacle_gate) * float(lat_norm)
+        # ----------------- speed reward (安全速度带，高斯型) -----------------
+        # 中速最高，过慢/过快都下降，避免“龟速”或“硬冲”
+        sigma = 1.5
+        r_speed = K_SPEED * float(math.exp(-((speed - TARGET_SPEED) ** 2) / (2 * sigma * sigma)))
 
         # 门控：偏离车道/近障碍 -> 速度奖励变小
         # ✅ 给一个最低门槛，避免奖励被完全“熄火”
         # ✅ 门控别太狠：避免奖励完全“熄火”，导致收敛到龟速
         raw_gate = float(np.clip(1.0 - 0.3 * lane_ratio, 0.0, 1.0))
-        # safety_gate *= float(np.clip(1.0 - 0.8 * obstacle_gate, 0.0, 1.0))
-        # safety_gate = max(0.35, safety_gate)
-        safety_gate = max(0.80, raw_gate)
+        # ✅ 近障碍时下调“冲刺”收益，但保留最低门槛避免龟速
+        obs_gate = float(np.clip(1.0 - 0.4 * float(obstacle_gate), 0.6, 1.0))
+        safety_gate = max(0.70, raw_gate) * obs_gate
         r_speed *= safety_gate
 
         # overspeed penalty：只保留一条，更干净
@@ -1943,16 +2329,45 @@ class CarlaEnv(gym.Env):
         # 关键：progress 只有在“比较安全”的时候才给，避免为了进度硬撞
         r_progress = K_PROGRESS * prog_fwd
         r_progress *= safety_gate
+        # 非 jaywalker 场景：低速时下调进度收益，避免“龟速刷进度”
+        if not is_jaywalker:
+            progress_full_speed_lane = float(getattr(self.config, "progress_full_speed_lane", 3.2))
+            progress_min_gate_lane = float(getattr(self.config, "progress_min_gate_lane", 0.12))
+            spd_gate = float(np.clip(speed / max(progress_full_speed_lane, 1e-6), progress_min_gate_lane, 1.0))
+            r_progress *= spd_gate
 
         # ----------------- 低速惩罚（防止“龟速苟活”） -----------------
-        # ✅ 低速惩罚加重：逼迫策略走出“慢速保命”局部最优
-        LOW_SPEED_TH = 2.5 # 1.20
-        K_LOW_SPEED = 0.2 # 0.12
+        # 非 jaywalker: 强化“不要龟速”；jaywalker: 保留停车让行能力
+        LOW_SPEED_TH = float(
+            getattr(self.config, "low_speed_th_jaywalker", 0.6)
+            if is_jaywalker else
+            getattr(self.config, "low_speed_th_lane", 2.3)
+        )
+        K_LOW_SPEED = float(
+            getattr(self.config, "k_low_speed_jaywalker", 0.04)
+            if is_jaywalker else
+            getattr(self.config, "k_low_speed_lane", 0.34)
+        )
         r_low_speed = 0.0
         if speed < LOW_SPEED_TH:
             # 低速越接近 0，惩罚越大
             x = (LOW_SPEED_TH - speed) / max(LOW_SPEED_TH, 1e-6)
             r_low_speed = -K_LOW_SPEED * float(x * x)
+
+        # 非 jaywalker：在“路况清晰且基本居中”时额外惩罚低速，避免慢速保命
+        r_slow_clear = 0.0
+        if not is_jaywalker:
+            clear_dist_lane = float(getattr(self.config, "clear_dist_lane", 26.0))
+            clear_speed_target_lane = float(getattr(self.config, "clear_speed_target_lane", 2.4))
+            k_slow_clear_lane = float(getattr(self.config, "k_slow_clear_lane", 0.30))
+            clear_road = (
+                ((nearest_dist is None) or (float(nearest_dist) > clear_dist_lane))
+                and (lane_ratio < 0.55)
+                and (obstacle_gate < 0.25)
+            )
+            if clear_road and speed < clear_speed_target_lane:
+                z = (clear_speed_target_lane - speed) / max(clear_speed_target_lane, 1e-6)
+                r_slow_clear = -k_slow_clear_lane * float(z * z)
 
         # ----------------- terminal checks -----------------
         r_collision = 0.0
@@ -1973,7 +2388,21 @@ class CarlaEnv(gym.Env):
         r_success = 0.0
         timeout_flag = bool(getattr(self, "timeout_flag", False))
         prog_ema = float(getattr(self, "progress_ema", 0.0))
-        prog_ok = (speed > 2.0) or (prog_ema > 0.02)
+        succ_speed_th = float(
+            getattr(self.config, "success_speed_th_jaywalker", 1.0)
+            if is_jaywalker else
+            getattr(self.config, "success_speed_th_lane", 2.8)
+        )
+        succ_prog_th = float(
+            getattr(self.config, "success_prog_th_jaywalker", 0.02)
+            if is_jaywalker else
+            getattr(self.config, "success_prog_th_lane", 0.05)
+        )
+        # 非 jaywalker 需要“有进度 + 有速度”才给成功奖励，避免低速苟活拿 bonus
+        if is_jaywalker:
+            prog_ok = (speed > succ_speed_th) or (prog_ema > succ_prog_th)
+        else:
+            prog_ok = (speed > succ_speed_th) and (prog_ema > succ_prog_th)
         if timeout_flag and (not collision_flag) and (not offroad) and prog_ok:
             r_success = SUCCESS_BONUS
 
@@ -1986,8 +2415,10 @@ class CarlaEnv(gym.Env):
             "r_offroad_soft": float(r_offroad_soft),
             "r_obs_clear": float(r_obs_clear),
             "r_obs_speed": float(r_obs_speed),
+            "r_avoid_lat": float(r_avoid_lat),
             "r_overspeed": float(r_overspeed),
             "r_low_speed": float(r_low_speed),
+            "r_slow_clear": float(r_slow_clear),
             "r_no_progress_terminal": float(r_no_progress_term),
             "r_offroad": float(r_offroad),
             "r_collision": float(r_collision),
@@ -1996,6 +2427,17 @@ class CarlaEnv(gym.Env):
         }
 
         total_reward = float(sum(components.values()))
+
+        # ----------------- reward scale/clip (稳定价值学习) -----------------
+        reward_scale = float(getattr(self.config, "reward_scale", 1.0))
+        reward_clip = float(getattr(self.config, "reward_clip", 0.0))
+        if reward_scale != 1.0:
+            for k in components.keys():
+                components[k] = float(components[k]) * reward_scale
+            total_reward *= reward_scale
+        # ✅ 终止奖励不要裁剪（避免碰撞惩罚被“削弱”）
+        if (not done) and reward_clip and reward_clip > 0.0:
+            total_reward = float(np.clip(total_reward, -reward_clip, reward_clip))
         self.last_reward_components = components.copy()
 
         # ----------------- info -----------------
@@ -2012,12 +2454,23 @@ class CarlaEnv(gym.Env):
             "progress_fwd": float(prog_fwd),
             "progress_ema": float(getattr(self, "progress_ema", 0.0)),
             "no_progress_steps": float(getattr(self, "no_progress_steps", 0)),
+            "scenario_is_jaywalker": float(1.0 if is_jaywalker else 0.0),
             "nearest_obstacle_dist": float(nearest_dist) if nearest_dist is not None else -1.0,
             "nearest_obstacle_fwd": float(nearest_fwd) if nearest_fwd is not None else 0.0,
             "nearest_obstacle_lat": float(nearest_lat) if nearest_lat is not None else 0.0,
             "obstacle_gate": float(obstacle_gate),
             "safety_gate": float(safety_gate),
+            # ✅ debug：观察 obstacle_gate 是否被压成 0
+            "dbg_lat_gate": float(lat_gate) if (nearest_lat is not None) else 0.0,
+            # ✅ debug：确认 obs 是否真的有值
+            "dbg_obs_use": float(1.0 if HAVE_OBS else 0.0),
+            "dbg_obs_vec_len": float(len(obs_vec)) if obs_vec is not None else -1.0,
         }
+
+        # ✅ 保存最近障碍距离，供控制阶段限油使用
+        self.last_obstacle_dist = float(nearest_dist) if nearest_dist is not None else None
+        self.last_obstacle_fwd = float(nearest_fwd) if nearest_fwd is not None else None
+        self.last_obstacle_lat = float(nearest_lat) if nearest_lat is not None else None
 
         # reset collision latch
         self.collision = False
@@ -2241,12 +2694,13 @@ class CarlaEnv(gym.Env):
         if self.scenario_instance is not None:
             try:
                 self.scenario_instance.cleanup()
-                # 给 CARLA 更多时间来处理 actor 销毁（增加 tick 次数和等待时间）
+                # 清理后仅做少量同步 tick，避免 reset 阶段长时间阻塞导致超时
                 if self.world.get_settings().synchronous_mode:
                     try:
-                        for _ in range(10):  # ✅ 从 5 次增加到 10 次
+                        cleanup_post_ticks = int(getattr(self.config, "cleanup_post_ticks", 2))
+                        cleanup_post_ticks = max(0, min(cleanup_post_ticks, 3))
+                        for _ in range(cleanup_post_ticks):
                             self.world.tick()
-                            time.sleep(0.1)  # ✅ 从 0.05 增加到 0.1
                     except Exception:
                         pass
                 print(f"[CarlaEnv] ✅ 场景 {self.scenario} 已清理")

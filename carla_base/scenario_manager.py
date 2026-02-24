@@ -1427,6 +1427,8 @@ class ConstructionLaneChangeScenario(ScenarioBase):
 
         # 施工生成器配置
         self.construction_type = str(getattr(config, "construction_type", "construction1"))
+        self.construction_debug_scan = bool(getattr(config, "construction_debug_scan", False))
+        self.construction_setup_stabilize_ticks = int(getattr(config, "construction_setup_stabilize_ticks", 2))
 
         self.ego_spawn_transform: Optional[carla.Transform] = None
         self.traffic_manager = None
@@ -1622,20 +1624,24 @@ class ConstructionLaneChangeScenario(ScenarioBase):
             print("[ConstructionLaneChange] ❌ 无法定位施工位置 waypoint")
             return False
 
-        # 5) 施工区生成（复用你的 ahead_obstacle_scenario）
-        #    注意：你的施工生成器不返回 actor 列表，所以我们用“前后 actor diff”自动收集
+        # 5) 施工区生成（复用 ahead_obstacle_scenario）
+        #    关键：任何异常都要回收“本次新建actor”，避免泄漏导致后续 tick 超时
         before_ids = set([a.id for a in self.world.get_actors()])
+        new_actors: List[carla.Actor] = []
 
+        # 负载控制：默认降低施工场景一次性生成数量，避免 CARLA 在 reset/setup 阶段卡死
         scene_cfg = {
-            "num_cones": int(max(5, self.construction_length / 3.0)),  # 粗略：长度越长 cones 越多
-            "cone_interval": 3,
-            "num_garbage": 30,
-            "num_workers": 3,
+            "num_cones": int(getattr(self.config, "construction_num_cones", max(5, self.construction_length / 3.0))),
+            "cone_interval": int(getattr(self.config, "construction_cone_interval", 3)),
+            "num_garbage": int(getattr(self.config, "construction_num_garbage", 10)),
+            "num_workers": int(getattr(self.config, "construction_num_workers", 1)),
         }
         gen_cfg = {"gen_cfg": self.construction_type}
 
+        setup_ok = False
         try:
             CarlaDataProvider.set_world(self.world)
+            CarlaDataProvider.set_traffic_manager_port(self.tm_port)
             self.construction_location = ahead_obstacle_scenario(
                 self.world,
                 construction_wp,
@@ -1644,30 +1650,25 @@ class ConstructionLaneChangeScenario(ScenarioBase):
                 scene_cfg=scene_cfg,
                 gen_cfg=gen_cfg
             )
+            setup_ok = True
         except Exception as e:
             print(f"[ConstructionLaneChange] ❌ 施工区生成失败: {e}")
+        finally:
+            try:
+                after_actors = self.world.get_actors()
+                new_actors = [a for a in after_actors if a.id not in before_ids]
+            except Exception:
+                new_actors = []
+
+        if not setup_ok:
+            # setup 中途失败时把本轮新建actor回收，防止泄漏
+            for a in reversed(new_actors):
+                try:
+                    if a is not None and getattr(a, "is_alive", True):
+                        a.destroy()
+                except Exception:
+                    pass
             return False
-
-        # 施工生成后，检查 static.prop 和 walker 是否存在
-        all_actors = self.world.get_actors()
-        props = [a for a in all_actors if a.type_id.startswith("static.prop")]
-        walkers = [a for a in all_actors if a.type_id.startswith("walker.pedestrian")]
-
-        print("[DEBUG] static.prop count =", len(props))
-        print("[DEBUG] walkers count =", len(walkers))
-
-        # 打印离施工点最近的 10 个 static.prop
-        if self.construction_location:
-            props_sorted = sorted(
-                props,
-                key=lambda a: a.get_location().distance(self.construction_location)
-            )
-            for a in props_sorted[:10]:
-                d = a.get_location().distance(self.construction_location)
-                print(f"[DEBUG] prop near construction: {a.type_id} id={a.id} dist={d:.1f}")
-
-        after_actors = self.world.get_actors()
-        new_actors = [a for a in after_actors if a.id not in before_ids]
 
         # 记录这些新 actor，便于 cleanup
         self.scenario_actors.extend(new_actors)
@@ -1677,9 +1678,29 @@ class ConstructionLaneChangeScenario(ScenarioBase):
             print(
                 f"[ConstructionLaneChange] 施工位置: ({self.construction_location.x:.1f}, {self.construction_location.y:.1f})")
 
+        # 可选：重型 debug 扫描（默认关闭，避免 setup 阶段额外开销）
+        if self.construction_debug_scan:
+            try:
+                all_actors = self.world.get_actors()
+                props = [a for a in all_actors if a.type_id.startswith("static.prop")]
+                walkers = [a for a in all_actors if a.type_id.startswith("walker.pedestrian")]
+                print("[DEBUG] static.prop count =", len(props))
+                print("[DEBUG] walkers count =", len(walkers))
+                if self.construction_location:
+                    props_sorted = sorted(
+                        props,
+                        key=lambda a: a.get_location().distance(self.construction_location)
+                    )
+                    for a in props_sorted[:10]:
+                        d = a.get_location().distance(self.construction_location)
+                        print(f"[DEBUG] prop near construction: {a.type_id} id={a.id} dist={d:.1f}")
+            except Exception as e:
+                print(f"[ConstructionLaneChange] ⚠️ debug扫描失败: {e}")
+
         # 同步模式稳定几帧
         if self.world.get_settings().synchronous_mode:
-            for _ in range(5):
+            stable_ticks = max(0, min(int(self.construction_setup_stabilize_ticks), 3))
+            for _ in range(stable_ticks):
                 self.world.tick()
 
         print(f"[ConstructionLaneChange] ✅ 场景生成成功")
@@ -1701,10 +1722,11 @@ class ConstructionLaneChangeScenario(ScenarioBase):
             except:
                 pass
 
-        # 统一销毁
-        for a in self.scenario_actors:
+        # 统一销毁（倒序更稳）
+        for a in reversed(self.scenario_actors):
             try:
-                a.destroy()
+                if a is not None and getattr(a, "is_alive", True):
+                    a.destroy()
             except:
                 pass
         self.scenario_actors = []
