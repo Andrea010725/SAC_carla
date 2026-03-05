@@ -149,23 +149,77 @@ class PPONetwork(Network):
             return list(inputs.values())
         return [inputs]
 
+    def _unwrap_distribution(self, dist):
+        """
+        Keras/TFP 的 DistributionLambda 可能返回带包装器的分布对象。
+        这里尽量剥离到真实分布，避免后续 isinstance 判断失效。
+        """
+        d = dist
+        # 最多展开几层，避免异常对象循环引用
+        for _ in range(6):
+            inner = getattr(d, "distribution", None)
+            if inner is None or inner is d:
+                break
+            d = inner
+        return d
+
     def _get_base_normal(self, dist):
         """
         dist 可能是 Normal / TransformedDistribution(Normal, ...) / Independent(...) / DistributionLambda返回的对象
         目标：返回一个有 .loc / .scale 的分布（通常是 Normal）
         """
-        d = dist
+        d = self._unwrap_distribution(dist)
 
-        # 1) 如果是 TransformedDistribution，base 在 d.distribution
-        if isinstance(d, tfd.TransformedDistribution):
-            d = d.distribution
+        # 逐层下钻到 base distribution（通常是 Normal）
+        for _ in range(6):
+            if isinstance(d, tfd.TransformedDistribution):
+                d = d.distribution
+                continue
 
-        # 2) 如果是 Independent，base 在 d.distribution
-        if isinstance(d, tfd.Independent):
-            d = d.distribution
+            if isinstance(d, tfd.Independent):
+                d = d.distribution
+                continue
 
-        # 3) 兜底：此时 d 应该就是 Normal（至少要有 loc/scale）
+            inner = getattr(d, "distribution", None)
+            if inner is not None and inner is not d:
+                d = inner
+                continue
+            break
+
+        # 兜底：此时 d 应该就是 Normal（至少要有 loc/scale）
         return d
+
+    def _deterministic_from_dist(self, dist):
+        """
+        对 tanh-squash 分布给出 deterministic 动作。
+        - TransformedDistribution(Tanh(Normal))：使用 tanh(loc)
+        - 其他分布：优先尝试 mean()，失败则回退到 base loc
+        """
+        d = self._unwrap_distribution(dist)
+        base = self._get_base_normal(d)
+
+        # 优先使用 base.loc（最稳定，可规避 non-affine bijector 的 mean() 未实现问题）
+        if hasattr(base, "loc"):
+            loc = tf.convert_to_tensor(base.loc, dtype=tf.float32)
+            bijector = getattr(d, "bijector", None)
+            if bijector is not None:
+                try:
+                    return tf.cast(bijector.forward(loc), tf.float32)
+                except Exception:
+                    pass
+            return tf.cast(loc, tf.float32)
+
+        # 退化路径：无法拿到 loc 时再尝试 mean/sample
+        try:
+            return tf.cast(d.mean(), tf.float32)
+        except Exception:
+            return tf.cast(d.sample(), tf.float32)
+
+    def _infer_batch_size_from_inputs(self, inputs):
+        if isinstance(inputs, dict):
+            first = list(inputs.values())[0]
+            return tf.shape(first)[0]
+        return tf.shape(inputs)[0]
 
     def _policy_weight_paths(self):
         """
@@ -252,7 +306,7 @@ class PPONetwork(Network):
         dist_lat = lat_net(inputs, training=False)
 
         if deterministic:
-            lat = dist_lat.mean()
+            lat = self._deterministic_from_dist(dist_lat)
         else:
             lat = dist_lat.sample()
 
@@ -263,7 +317,7 @@ class PPONetwork(Network):
         dist_lon = lon_net(inputs_list + [y_ref], training=False)
 
         if deterministic:
-            throttle = dist_lon.mean()
+            throttle = self._deterministic_from_dist(dist_lon)
         else:
             throttle = dist_lon.sample()
 
@@ -301,7 +355,7 @@ class PPONetwork(Network):
         # ✅ 必须：先赋值再 clip（避免 UnboundLocalError）
         # 如果你有 deterministic 开关，就在这里统一处理
         if hasattr(self, "deterministic") and bool(self.deterministic):
-            lat_sample = dist_lat.mean()  # [B,2] in (-1,1) for tanh dist
+            lat_sample = self._deterministic_from_dist(dist_lat)  # [B,2] in (-1,1) for tanh dist
         else:
             lat_sample = dist_lat.sample()  # [B,2]
 
@@ -328,7 +382,7 @@ class PPONetwork(Network):
         dist_lon = self.old_policy_lon(inputs_list + [y_ref], training=False)
 
         if hasattr(self, "deterministic") and bool(self.deterministic):
-            lon_sample = dist_lon.mean()  # [B,1]
+            lon_sample = self._deterministic_from_dist(dist_lon)  # [B,1]
         else:
             lon_sample = dist_lon.sample()  # [B,1]
 
@@ -376,7 +430,7 @@ class PPONetwork(Network):
         - dist_lon(s, y_ref=0) 只是占位推一下（不用于训练）
         """
         dist_lat = self.policy_lat(inputs, training=False)
-        batch = tf.shape(dist_lat.mean())[0]
+        batch = self._infer_batch_size_from_inputs(inputs)
         y0 = tf.zeros((batch, 1), dtype=tf.float32)
         dist_lon = self.policy_lon(self._as_input_list(inputs) + [y0], training=False)
         return dist_lat, dist_lon
@@ -429,17 +483,26 @@ class PPONetwork(Network):
         return self.policy_layers(inputs, **kwargs)
 
     # ----------------- dist builders -----------------
-    def _squashed_gaussian_dist_layer(self, layer, out_dim, name_prefix, min_scale=0.05):
+    def _squashed_gaussian_dist_layer(
+        self,
+        layer,
+        out_dim,
+        name_prefix,
+        min_scale=0.02,
+        raw_scale_bias=-1.2,
+        raw_scale_clip_min=-4.0,
+        raw_scale_clip_max=-0.1,
+    ):
         mu = Dense(out_dim, activation='linear', name=f'{name_prefix}_mu')(layer)
 
-        # ✅ 用 raw_scale -> softplus -> scale，避免 scale=0 导致 entropy=0
-        # ✅ 提高 min_scale，防止策略过早塌缩到“几乎确定性”
+        # raw_scale -> softplus -> scale
+        # 关键：初始化和上限都更保守，避免 std 长期卡在 ~1.0 导致动作抖动。
         raw_scale = Dense(out_dim,
                           activation='linear',
                           kernel_initializer='zeros',
-                          bias_initializer=tf.keras.initializers.Constant(0.5),
+                          bias_initializer=tf.keras.initializers.Constant(raw_scale_bias),
                           name=f'{name_prefix}_raw_scale')(layer)
-        # raw_scale = tf.clip_by_value(raw_scale, -5.0, 2.0)  # 大幅限制 std
+        raw_scale = tf.clip_by_value(raw_scale, raw_scale_clip_min, raw_scale_clip_max)
         scale = tf.nn.softplus(raw_scale) + min_scale
 
         def _make_dist(params):
@@ -461,8 +524,15 @@ class PPONetwork(Network):
         """
         inputs = self._get_input_layers()
         last_layer = self.policy_layers(inputs, **kwargs)
-        # dist_lat = self._gaussian_dist_layer(last_layer, out_dim=2, name_prefix='lat')
-        dist_lat = self._squashed_gaussian_dist_layer(last_layer, out_dim=2, name_prefix='lat')
+        dist_lat = self._squashed_gaussian_dist_layer(
+            last_layer,
+            out_dim=2,
+            name_prefix='lat',
+            min_scale=float(kwargs.get("min_scale_lat", kwargs.get("min_scale", 0.02))),
+            raw_scale_bias=float(kwargs.get("raw_scale_bias_lat", kwargs.get("raw_scale_bias", -1.2))),
+            raw_scale_clip_min=float(kwargs.get("raw_scale_clip_min_lat", kwargs.get("raw_scale_clip_min", -4.0))),
+            raw_scale_clip_max=float(kwargs.get("raw_scale_clip_max_lat", kwargs.get("raw_scale_clip_max", -0.1))),
+        )
 
         return Model(list(inputs.values()), outputs=dist_lat, name='Policy-Lat')
 
@@ -486,8 +556,15 @@ class PPONetwork(Network):
             x = Dense(units, activation=activation)(x)
             x = LayerNormalization()(x)
 
-        # dist_lon = self._gaussian_dist_layer(x, out_dim=1, name_prefix='lon')
-        dist_lon = self._squashed_gaussian_dist_layer(x, out_dim=1, name_prefix='lon')
+        dist_lon = self._squashed_gaussian_dist_layer(
+            x,
+            out_dim=1,
+            name_prefix='lon',
+            min_scale=float(kwargs.get("min_scale_lon", kwargs.get("min_scale", 0.02))),
+            raw_scale_bias=float(kwargs.get("raw_scale_bias_lon", kwargs.get("raw_scale_bias", -1.2))),
+            raw_scale_clip_min=float(kwargs.get("raw_scale_clip_min_lon", kwargs.get("raw_scale_clip_min", -4.0))),
+            raw_scale_clip_max=float(kwargs.get("raw_scale_clip_max_lon", kwargs.get("raw_scale_clip_max", -0.1))),
+        )
 
         return Model(list(inputs.values()) + [y_ref_in], outputs=dist_lon, name='Policy-Lon')
 

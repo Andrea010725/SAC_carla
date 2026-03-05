@@ -96,6 +96,14 @@ class PPOAgent(Agent):
         assert 0.0 < polyak <= 1.0
         assert repeat_action >= 1
 
+        # PPO-specific kwargs must be removed before calling Agent.__init__()
+        # to avoid "unexpected keyword argument" errors in base class.
+        debug_policy_print = bool(kwargs.pop("debug_policy_print", False))
+        trd_loss_coef = float(kwargs.pop("trd_loss_coef", 0.01))
+        trd_warmup_updates = int(kwargs.pop("trd_warmup_updates", 20))
+        trd_ramp_updates = int(kwargs.pop("trd_ramp_updates", 80))
+        target_kl = float(kwargs.pop("target_kl", 0.0))
+        kl_stop_multiplier = float(kwargs.pop("kl_stop_multiplier", 1.5))
         kwargs.pop("town", None)
         super().__init__(*args, name=name, **kwargs)
 
@@ -106,16 +114,18 @@ class PPOAgent(Agent):
         self.adv_scale = DynamicParameter.create(value=advantage_scale)
 
         # ✅ 控制是否打印 policy debug（默认关闭，避免刷屏）
-        self.debug_policy_print = bool(kwargs.get("debug_policy_print", False))
+        self.debug_policy_print = debug_policy_print
 
         # TRD (Temporal Return Decomposition) loss coefficient
-        self.trd_loss_coef = kwargs.get('trd_loss_coef', 0.01)
+        self.trd_loss_coef = trd_loss_coef
 
         # TRD schedule
-        self.trd_coef_max = float(kwargs.get("trd_loss_coef", 0.01))
-        self.trd_warmup_updates = int(kwargs.get("trd_warmup_updates", 20))  # 前20次update不训练TRD
-        self.trd_ramp_updates = int(kwargs.get("trd_ramp_updates", 80))  # 再用80次线性爬升到max
+        self.trd_coef_max = trd_loss_coef
+        self.trd_warmup_updates = trd_warmup_updates  # 前20次update不训练TRD
+        self.trd_ramp_updates = trd_ramp_updates  # 再用80次线性爬升到max
         self.update_step = tf.Variable(0, dtype=tf.int64, trainable=False)
+        self.target_kl = max(0.0, target_kl)
+        self.kl_stop_multiplier = max(1.0, kl_stop_multiplier)
 
         if seed_regularization:
             def _seed_regularization():
@@ -321,11 +331,29 @@ class PPOAgent(Agent):
         value_batches = self.get_value_batches()
         policy_batches = self.get_policy_batches()
 
+        # PPO 关键：在一次 update 开始时固定 old policy，
+        # 整个 policy optimization 期间都使用同一份 old policy 计算 ratio。
+        self.network.update_old_policy()
+
         # Policy network optimization:
+        stop_policy_opt = False
         for opt_step in range(self.optimization_steps['policy']):
+            if stop_policy_opt:
+                break
             for data_batch in policy_batches:
                 self.seed_regularization()
-                total_loss, policy_grads = self.get_policy_gradients(data_batch)
+                total_loss, approx_kl, policy_grads = self.get_policy_gradients(data_batch)
+
+                approx_kl_val = float(approx_kl.numpy()) if tf.is_tensor(approx_kl) else float(approx_kl)
+                self.log(policy_approx_kl=approx_kl_val)
+                if (
+                    self.target_kl > 0.0
+                    and approx_kl_val > (self.target_kl * self.kl_stop_multiplier)
+                ):
+                    self.log(policy_kl_early_stop=1.0)
+                    stop_policy_opt = True
+                    break
+
                 self.update_policy(policy_grads)
 
                 if isinstance(policy_grads, dict):
@@ -334,6 +362,9 @@ class PPOAgent(Agent):
                 # 注意：policy_grads 里可能有 None
                 global_norm = tf.linalg.global_norm([g for g in policy_grads if g is not None])
                 self.log(grad_norm_policy=global_norm)
+
+        # policy 更新完成后再同步一次 old policy，供下一轮 update 使用。
+        self.network.update_old_policy()
 
         # Value network optimization:
         for _ in range(self.optimization_steps['value']):
@@ -375,12 +406,14 @@ class PPOAgent(Agent):
             out = self.policy_objective(batch)
             if isinstance(out, (tuple, list)):
                 loss = out[0]
+                approx_kl = out[1]
             else:
                 loss = out
+                approx_kl = tf.constant(0.0, dtype=tf.float32)
 
         vars_ = self._policy_vars()
         gradients = tape.gradient(loss, vars_)
-        return loss, gradients
+        return loss, approx_kl, gradients
 
     def update_policy(self, gradients) -> (list, bool):
         return self.apply_policy_gradients(gradients), True
@@ -399,8 +432,6 @@ class PPOAgent(Agent):
         gv = [(g, v) for g, v in zip(gradients, vars_) if g is not None]
         if len(gv) == 0:
             print("[PPO] ⚠️ all policy grads are None, skip apply_gradients")
-            # 仍然保持 old_policy 同步（避免下一步 act/predict 用旧到离谱的权重）
-            self.network.update_old_policy()
             return gradients
 
         if self.should_polyak_average:
@@ -412,12 +443,8 @@ class PPOAgent(Agent):
             # 对两套 policy 分别做 polyak
             utils.polyak_averaging(self.network.policy_lat, old_lat, alpha=self.polyak_coeff)
             utils.polyak_averaging(self.network.policy_lon, old_lon, alpha=self.polyak_coeff)
-
-            # 同步 old_policy_lat/lon
-            self.network.update_old_policy()
         else:
             self.policy_optimizer.apply_gradients(gv)
-            self.network.update_old_policy()
 
         return gradients
 

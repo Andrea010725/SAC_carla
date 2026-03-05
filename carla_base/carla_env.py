@@ -132,11 +132,42 @@ class CarlaEnv(gym.Env):
         # ✅ 低速转向缩放（避免起步猛打方向）
         self.enable_low_speed_steer_scale = bool(getattr(config, "enable_low_speed_steer_scale", True))
         self.low_speed_steer_speed = float(getattr(config, "low_speed_steer_speed", 2.0))
-        self.low_speed_steer_min_scale = float(getattr(config, "low_speed_steer_min_scale", 0.25))
+        self.low_speed_steer_min_scale = float(getattr(config, "low_speed_steer_min_scale", 0.90))
 
-        # ✅ 仅对转向做平滑（不影响油门/刹车）
-        self.enable_steer_smoothing = bool(getattr(config, "enable_steer_smoothing", True))
+        # 训练默认关闭转向后处理，避免“策略动作 != 实际执行动作”的学习偏差
+        self.enable_steer_smoothing = bool(getattr(config, "enable_steer_smoothing", False))
         self.steer_smooth_alpha = float(getattr(config, "steer_smooth_alpha", 0.7))
+        # ✅ 收敛稳定性关键开关：
+        # 训练阶段默认开启“动作一致性模式”，关闭非必要后处理，减少
+        # policy输出动作 与 实际执行动作 的偏差（on-policy mismatch）。
+        # 安全相关的限速/近障碍刹车仍保留。
+        self.train_onpolicy_action_mode = bool(getattr(config, "train_onpolicy_action_mode", True))
+        # ✅ 限制相邻步转向变化，默认关闭（训练时优先动作一致性）
+        self.enable_steer_rate_limit = bool(getattr(config, "enable_steer_rate_limit", True))
+        self.steer_rate_limit_lane = float(getattr(config, "steer_rate_limit_lane", 0.14))
+        self.steer_rate_limit_jaywalker = float(getattr(config, "steer_rate_limit_jaywalker", 0.06))
+        self.steer_rate_limit_obs_lane = float(getattr(config, "steer_rate_limit_obs_lane", 0.26))
+        self.steer_rate_limit_obs_jaywalker = float(getattr(config, "steer_rate_limit_obs_jaywalker", 0.16))
+        # ✅ 直行稳态，默认关闭（训练阶段避免额外 steer 偏置）
+        self.enable_straight_stability = bool(getattr(config, "enable_straight_stability", True))
+        self.straight_stability_speed_lane = float(getattr(config, "straight_stability_speed_lane", 2.8))
+        self.straight_stability_speed_jaywalker = float(getattr(config, "straight_stability_speed_jaywalker", 1.4))
+        self.straight_stability_lane_ratio = float(getattr(config, "straight_stability_lane_ratio", 0.15))
+        self.straight_steer_damp = float(getattr(config, "straight_steer_damp", 0.45))
+        self.straight_steer_deadband = float(getattr(config, "straight_steer_deadband", 0.028))
+        # ✅ 限制 postprocess 对转向的修改幅度，降低 raw/applied 偏差导致的策略学习失配
+        self.enable_steer_delta_clip = bool(getattr(config, "enable_steer_delta_clip", True))
+        self.max_steer_postprocess_delta = float(getattr(config, "max_steer_postprocess_delta", 0.36))
+        # ✅ 近障碍转向辅助，默认关闭（由奖励塑形驱动避障）
+        self.obstacle_steer_assist_enable = bool(getattr(config, "obstacle_steer_assist_enable", False))
+        self.obstacle_steer_assist_dist_lane = float(getattr(config, "obstacle_steer_assist_dist_lane", 12.0))
+        self.obstacle_steer_assist_dist_jaywalker = float(getattr(config, "obstacle_steer_assist_dist_jaywalker", 9.0))
+        self.obstacle_steer_assist_gain_lane = float(getattr(config, "obstacle_steer_assist_gain_lane", 0.30))
+        self.obstacle_steer_assist_gain_jaywalker = float(getattr(config, "obstacle_steer_assist_gain_jaywalker", 0.10))
+        self.obstacle_steer_assist_max_lane = float(getattr(config, "obstacle_steer_assist_max_lane", 0.42))
+        self.obstacle_steer_assist_max_jaywalker = float(getattr(config, "obstacle_steer_assist_max_jaywalker", 0.16))
+        self.obstacle_steer_assist_lat_eps = float(getattr(config, "obstacle_steer_assist_lat_eps", 0.15))
+        self.obstacle_steer_assist_min_factor = float(getattr(config, "obstacle_steer_assist_min_factor", 0.30))
         # ✅ 低速动作约束：避免“刹车苟活”
         self.low_speed_brake_cut_speed = float(getattr(config, "low_speed_brake_cut_speed", 0.6))
         self.low_speed_throttle_floor_speed = float(getattr(config, "low_speed_throttle_floor_speed", 0.6))
@@ -452,8 +483,77 @@ class CarlaEnv(gym.Env):
         self.enable_steer_smoothing = bool(
             getattr(self.config, "enable_steer_smoothing", self.enable_steer_smoothing)
         )
+        self.train_onpolicy_action_mode = bool(
+            getattr(self.config, "train_onpolicy_action_mode", self.train_onpolicy_action_mode)
+        )
         self.steer_smooth_alpha = float(
             getattr(self.config, "steer_smooth_alpha", self.steer_smooth_alpha)
+        )
+        self.enable_steer_rate_limit = bool(
+            getattr(self.config, "enable_steer_rate_limit", self.enable_steer_rate_limit)
+        )
+        self.steer_rate_limit_lane = float(
+            getattr(self.config, "steer_rate_limit_lane", self.steer_rate_limit_lane)
+        )
+        self.steer_rate_limit_jaywalker = float(
+            getattr(self.config, "steer_rate_limit_jaywalker", self.steer_rate_limit_jaywalker)
+        )
+        self.steer_rate_limit_obs_lane = float(
+            getattr(self.config, "steer_rate_limit_obs_lane", self.steer_rate_limit_obs_lane)
+        )
+        self.steer_rate_limit_obs_jaywalker = float(
+            getattr(self.config, "steer_rate_limit_obs_jaywalker", self.steer_rate_limit_obs_jaywalker)
+        )
+        self.enable_straight_stability = bool(
+            getattr(self.config, "enable_straight_stability", self.enable_straight_stability)
+        )
+        self.straight_stability_speed_lane = float(
+            getattr(self.config, "straight_stability_speed_lane", self.straight_stability_speed_lane)
+        )
+        self.straight_stability_speed_jaywalker = float(
+            getattr(self.config, "straight_stability_speed_jaywalker", self.straight_stability_speed_jaywalker)
+        )
+        self.straight_stability_lane_ratio = float(
+            getattr(self.config, "straight_stability_lane_ratio", self.straight_stability_lane_ratio)
+        )
+        self.straight_steer_damp = float(
+            getattr(self.config, "straight_steer_damp", self.straight_steer_damp)
+        )
+        self.straight_steer_deadband = float(
+            getattr(self.config, "straight_steer_deadband", self.straight_steer_deadband)
+        )
+        self.enable_steer_delta_clip = bool(
+            getattr(self.config, "enable_steer_delta_clip", self.enable_steer_delta_clip)
+        )
+        self.max_steer_postprocess_delta = float(
+            getattr(self.config, "max_steer_postprocess_delta", self.max_steer_postprocess_delta)
+        )
+        self.obstacle_steer_assist_enable = bool(
+            getattr(self.config, "obstacle_steer_assist_enable", self.obstacle_steer_assist_enable)
+        )
+        self.obstacle_steer_assist_dist_lane = float(
+            getattr(self.config, "obstacle_steer_assist_dist_lane", self.obstacle_steer_assist_dist_lane)
+        )
+        self.obstacle_steer_assist_dist_jaywalker = float(
+            getattr(self.config, "obstacle_steer_assist_dist_jaywalker", self.obstacle_steer_assist_dist_jaywalker)
+        )
+        self.obstacle_steer_assist_gain_lane = float(
+            getattr(self.config, "obstacle_steer_assist_gain_lane", self.obstacle_steer_assist_gain_lane)
+        )
+        self.obstacle_steer_assist_gain_jaywalker = float(
+            getattr(self.config, "obstacle_steer_assist_gain_jaywalker", self.obstacle_steer_assist_gain_jaywalker)
+        )
+        self.obstacle_steer_assist_max_lane = float(
+            getattr(self.config, "obstacle_steer_assist_max_lane", self.obstacle_steer_assist_max_lane)
+        )
+        self.obstacle_steer_assist_max_jaywalker = float(
+            getattr(self.config, "obstacle_steer_assist_max_jaywalker", self.obstacle_steer_assist_max_jaywalker)
+        )
+        self.obstacle_steer_assist_lat_eps = float(
+            getattr(self.config, "obstacle_steer_assist_lat_eps", self.obstacle_steer_assist_lat_eps)
+        )
+        self.obstacle_steer_assist_min_factor = float(
+            getattr(self.config, "obstacle_steer_assist_min_factor", self.obstacle_steer_assist_min_factor)
         )
         self.low_speed_brake_cut_speed = float(
             getattr(self.config, "low_speed_brake_cut_speed", self.low_speed_brake_cut_speed)
@@ -789,6 +889,7 @@ class CarlaEnv(gym.Env):
             speed = float(math.sqrt(v.x * v.x + v.y * v.y + v.z * v.z))
         scenario_name = str(getattr(self, "scenario", "")).lower()
         is_jaywalker_ctrl = ("jaywalker" in scenario_name)
+        strict_onpolicy_mode = bool(getattr(self, "train_onpolicy_action_mode", False))
 
         # --------- 3.5) speed governor (防爆冲) ---------
         if speed is not None and speed > self.speed_governor_speed:
@@ -812,6 +913,9 @@ class CarlaEnv(gym.Env):
             and (float(last_obs_fwd) > 0.0)
             and (last_obs_lat is None or abs(float(last_obs_lat)) <= obs_lat_tol)
         )
+        steer_assist = 0.0
+        lane_ratio_ctrl = -1.0
+        max_delta = 0.0
 
         obs_cap_dist = float(
             getattr(self.config, "obs_throttle_cap_dist_jaywalker", self.obs_throttle_cap_dist)
@@ -825,7 +929,9 @@ class CarlaEnv(gym.Env):
         )
 
         if (speed is not None) and obs_is_relevant and (float(last_obs_dist) < obs_cap_dist):
-            throttle = min(throttle, obs_cap)
+            dist_ratio = float(np.clip(float(last_obs_dist) / max(obs_cap_dist, 1e-6), 0.0, 1.0))
+            dynamic_cap = max(0.08, float(obs_cap) * (0.40 + 0.60 * dist_ratio))
+            throttle = min(throttle, dynamic_cap)
 
         # --------- 3.7) obstacle brake shield (近距强制刹车) ---------
         obstacle_brake_active = False
@@ -838,6 +944,11 @@ class CarlaEnv(gym.Env):
             getattr(self.config, "obs_brake_value_jaywalker", self.obs_brake_value)
             if is_jaywalker_ctrl else
             getattr(self.config, "obs_brake_value_lane", self.obs_brake_value)
+        )
+        obs_brake_soft_target_speed = float(
+            getattr(self.config, "obs_brake_soft_target_speed_jaywalker", 1.8)
+            if is_jaywalker_ctrl else
+            getattr(self.config, "obs_brake_soft_target_speed_lane", 3.4)
         )
         obs_brake_hard_dist = float(
             getattr(self.config, "obs_brake_hard_dist_jaywalker", self.obs_brake_hard_dist)
@@ -856,13 +967,84 @@ class CarlaEnv(gym.Env):
                 throttle = min(throttle, 0.02)
                 obstacle_brake_active = True
             elif float(last_obs_dist) < obs_brake_dist:
-                brake = max(brake, obs_brake_value)
-                throttle = min(throttle, 0.05)
+                # 中距离软刹：仅在“超出近障碍目标速度”或已经非常接近时介入，
+                # 避免把车长期压在 3m/s 以下。
+                dist_ratio = float(np.clip((obs_brake_dist - float(last_obs_dist)) / max(obs_brake_dist, 1e-6), 0.0, 1.0))
+                over_speed = max(0.0, float(speed) - obs_brake_soft_target_speed)
+                speed_ratio = float(np.clip(over_speed / max(obs_brake_soft_target_speed, 1e-6), 0.0, 1.0))
+                should_soft_brake = (over_speed > 0.0) or ((dist_ratio > 0.75) and (float(speed) > 0.8))
+                if should_soft_brake:
+                    soft_brake = float(np.clip(obs_brake_value * max(0.25 * dist_ratio, speed_ratio), 0.0, 1.0))
+                    brake = max(brake, soft_brake)
+                    throttle = min(throttle, 0.10)
+                    obstacle_brake_active = True
+
+            # TTC brake shield: distance-only braking is too late at higher speed.
+            ttc = float(last_obs_dist) / max(float(speed), 0.10)
+            obs_ttc_brake_crit = float(
+                getattr(self.config, "obs_ttc_brake_crit_jaywalker", 2.4)
+                if is_jaywalker_ctrl else
+                getattr(self.config, "obs_ttc_brake_crit_lane", 2.3)
+            )
+            obs_ttc_brake_gain = float(
+                getattr(self.config, "obs_ttc_brake_gain_jaywalker", 0.50)
+                if is_jaywalker_ctrl else
+                getattr(self.config, "obs_ttc_brake_gain_lane", 0.45)
+            )
+            if (ttc < obs_ttc_brake_crit) and (float(speed) > 0.8):
+                ttc_ratio = float(np.clip((obs_ttc_brake_crit - ttc) / max(obs_ttc_brake_crit, 1e-6), 0.0, 1.0))
+                ttc_brake = float(np.clip(obs_ttc_brake_gain * (0.20 + 0.80 * ttc_ratio), 0.0, 1.0))
+                brake = max(brake, ttc_brake)
+                throttle = min(throttle, 0.08)
                 obstacle_brake_active = True
 
+        # --------- 3.8) obstacle steer assist (近障碍轻量引导绕行) ---------
+        if (not strict_onpolicy_mode) and self.obstacle_steer_assist_enable and obs_is_relevant and (last_obs_dist is not None):
+            assist_dist = float(
+                self.obstacle_steer_assist_dist_jaywalker
+                if is_jaywalker_ctrl else
+                self.obstacle_steer_assist_dist_lane
+            )
+            if float(last_obs_dist) < assist_dist:
+                assist_gain = float(
+                    self.obstacle_steer_assist_gain_jaywalker
+                    if is_jaywalker_ctrl else
+                    self.obstacle_steer_assist_gain_lane
+                )
+                assist_max = float(
+                    self.obstacle_steer_assist_max_jaywalker
+                    if is_jaywalker_ctrl else
+                    self.obstacle_steer_assist_max_lane
+                )
+                lat_eps = max(1e-3, float(self.obstacle_steer_assist_lat_eps))
+                min_factor = float(np.clip(self.obstacle_steer_assist_min_factor, 0.0, 1.0))
+                obs_lat = float(last_obs_lat) if last_obs_lat is not None else 0.0
+
+                # 障碍在右 -> 向左打轮；障碍在左 -> 向右打轮。
+                if abs(obs_lat) >= lat_eps:
+                    dir_sign = np.sign(obs_lat)
+                else:
+                    prev_st = float(self.prev_control_for_smooth.steer) if self.prev_control_for_smooth is not None else 0.0
+                    dir_sign = np.sign(prev_st) if abs(prev_st) > 0.02 else -1.0
+
+                dist_factor = float(np.clip((assist_dist - float(last_obs_dist)) / max(assist_dist, 1e-6), 0.0, 1.0))
+                lat_factor = max(min_factor, min(1.0, abs(obs_lat) / max(obs_lat_tol, 1e-6)))
+                steer_assist = float(dir_sign * assist_gain * dist_factor * lat_factor)
+                steer_assist = float(np.clip(steer_assist, -assist_max, assist_max))
+                steer = float(np.clip(steer + steer_assist, -1.0, 1.0))
+
         # --------- 4) low-speed steer scale ---------
-        if self.enable_low_speed_steer_scale and (speed is not None):
-            if speed < self.low_speed_steer_speed:
+        if (not strict_onpolicy_mode) and self.enable_low_speed_steer_scale and (speed is not None):
+            apply_low_speed_scale = True
+            if obs_is_relevant and (last_obs_dist is not None):
+                obs_relax_dist = float(
+                    self.obstacle_steer_assist_dist_jaywalker
+                    if is_jaywalker_ctrl else
+                    self.obstacle_steer_assist_dist_lane
+                )
+                if float(last_obs_dist) < obs_relax_dist:
+                    apply_low_speed_scale = False
+            if apply_low_speed_scale and speed < self.low_speed_steer_speed:
                 frac = speed / max(self.low_speed_steer_speed, 1e-6)
                 scale = self.low_speed_steer_min_scale + (1.0 - self.low_speed_steer_min_scale) * frac
                 steer = float(np.clip(steer * scale, -1.0, 1.0))
@@ -883,20 +1065,83 @@ class CarlaEnv(gym.Env):
             if is_jaywalker_ctrl else
             getattr(self.config, "low_speed_throttle_floor_lane", self.low_speed_throttle_floor)
         )
-        if speed is not None:
+        ls_brake_cut_scale = float(
+            getattr(self.config, "low_speed_brake_cut_scale_jaywalker", 0.30)
+            if is_jaywalker_ctrl else
+            getattr(self.config, "low_speed_brake_cut_scale_lane", 0.10)
+        )
+        ls_brake_cut_scale = float(np.clip(ls_brake_cut_scale, 0.0, 1.0))
+        if (not strict_onpolicy_mode) and (speed is not None):
             if speed < ls_brake_cut_speed and (not obstacle_brake_active):
-                brake = brake * 0.3
-            if speed < ls_floor_speed:
+                brake = brake * ls_brake_cut_scale
+            # 近障碍时不要抬最小油门，避免与障碍刹车策略冲突
+            if speed < ls_floor_speed and (not obstacle_brake_active):
                 throttle = max(throttle, ls_floor)
 
         # --------- 6) steer smoothing (only steer, keep throttle/brake responsive) ---------
-        if self.enable_steer_smoothing and (self.prev_control_for_smooth is not None):
+        if (not strict_onpolicy_mode) and self.enable_steer_smoothing and (self.prev_control_for_smooth is not None):
             alpha = float(np.clip(self.steer_smooth_alpha, 0.0, 1.0))
             steer = alpha * steer + (1.0 - alpha) * float(self.prev_control_for_smooth.steer)
             steer = float(np.clip(steer, -1.0, 1.0))
 
+        # --------- 6.1) steer rate limit (限制相邻步变化，抑制左右抖) ---------
+        if (not strict_onpolicy_mode) and self.enable_steer_rate_limit and (self.prev_control_for_smooth is not None):
+            max_delta = float(self.steer_rate_limit_jaywalker if is_jaywalker_ctrl else self.steer_rate_limit_lane)
+            if obs_is_relevant and (last_obs_dist is not None):
+                obs_relax_dist = float(
+                    self.obstacle_steer_assist_dist_jaywalker
+                    if is_jaywalker_ctrl else
+                    self.obstacle_steer_assist_dist_lane
+                )
+                if float(last_obs_dist) < obs_relax_dist:
+                    obs_max_delta = float(
+                        self.steer_rate_limit_obs_jaywalker
+                        if is_jaywalker_ctrl else
+                        self.steer_rate_limit_obs_lane
+                    )
+                    max_delta = max(max_delta, obs_max_delta)
+            # 低速时放宽单步转角变化，降低 raw/applied 偏差导致的策略学习失配
+            if speed is not None and speed < 1.5:
+                low_speed_relax = 0.10 * float(np.clip(abs(steer_raw), 0.0, 1.0))
+                max_delta = max(max_delta, 0.10 + low_speed_relax)
+            prev_steer = float(self.prev_control_for_smooth.steer)
+            steer = float(np.clip(steer, prev_steer - max_delta, prev_steer + max_delta))
+
+        # --------- 6.2) straight stability (直行稳态抑制) ---------
+        if (
+            (not strict_onpolicy_mode)
+            and
+            self.enable_straight_stability
+            and (speed is not None)
+            and (not obs_is_relevant)
+            and (self.ego is not None)
+        ):
+            stable_speed = float(
+                self.straight_stability_speed_jaywalker
+                if is_jaywalker_ctrl else
+                self.straight_stability_speed_lane
+            )
+            if speed > stable_speed:
+                try:
+                    wp_now = self.map.get_waypoint(self.ego.get_location(), project_to_road=True)
+                    if wp_now is not None:
+                        ego_loc = self.ego.get_location()
+                        lane_width_now = float(getattr(wp_now, "lane_width", 3.5))
+                        lane_dev_now = float(math.hypot(
+                            ego_loc.x - wp_now.transform.location.x,
+                            ego_loc.y - wp_now.transform.location.y
+                        ))
+                        offroad_thresh_now = 0.5 * lane_width_now + float(getattr(self, "offroad_margin", 1.0))
+                        lane_ratio_ctrl = lane_dev_now / max(offroad_thresh_now, 1e-6)
+                        if lane_ratio_ctrl < float(self.straight_stability_lane_ratio):
+                            steer = float(np.clip(steer * float(self.straight_steer_damp), -1.0, 1.0))
+                            if abs(steer) < float(self.straight_steer_deadband):
+                                steer = 0.0
+                except Exception:
+                    pass
+
         # --------- 7) anti-stall ---------
-        if self.enable_anti_stall and (self.ego is not None):
+        if (not strict_onpolicy_mode) and self.enable_anti_stall and (self.ego is not None):
             min_throttle_stuck = float(
                 getattr(self.config, "min_throttle_when_stuck_jaywalker", self.min_throttle_when_stuck)
                 if is_jaywalker_ctrl else
@@ -909,9 +1154,20 @@ class CarlaEnv(gym.Env):
             if speed < self.stuck_speed_thresh and (not obstacle_brake_active):
                 brake = 0.0
                 throttle = max(throttle, min_throttle_stuck)
-                steer = float(np.clip(steer * self.low_speed_steer_scale, -1.0, 1.0))
+                # 避免再次缩小转角（前面低速缩放已处理），否则 raw/applied 差距过大
+                steer = float(np.clip(steer, -1.0, 1.0))
+
+        # --------- 7.1) clip steer postprocess delta ---------
+        if (not strict_onpolicy_mode) and self.enable_steer_delta_clip:
+            max_pp_delta = max(0.0, float(self.max_steer_postprocess_delta))
+            steer_delta = float(steer - steer_raw)
+            if abs(steer_delta) > max_pp_delta:
+                steer = float(np.clip(steer_raw + np.sign(steer_delta) * max_pp_delta, -1.0, 1.0))
 
         # --------- 4) apply control ---------
+        # 训练侧需要“实际执行动作”来构建 on-policy 数据，
+        # 因此把 throttle/brake 合成为单一 throttle_brake 标量并写入 info。
+        applied_throttle_brake = float(np.clip(float(throttle) - float(brake), -1.0, 1.0))
         control = carla.VehicleControl(throttle=throttle, brake=brake, steer=steer)
         control.gear = 1
         control.manual_gear_shift = True
@@ -975,8 +1231,14 @@ class CarlaEnv(gym.Env):
         # time_limit 不给惩罚：0.0
         comps["r_timeout"] = 0.0
 
-        # 最终 reward：严格由 components 求和，保证和分解一致
-        reward = float(sum(comps.values()))
+        # ✅ 使用 _get_reward() 返回的 reward 作为训练真值，避免在 step 中被二次重算覆盖
+        # （此前会绕过 reward_clip 等逻辑，导致训练目标与配置不一致）
+        reward = float(reward_env)
+        components_sum = float(sum(comps.values()))
+        residual = float(reward - components_sum)
+        # 把 residual 显式挂到分解里，保证日志闭合且可诊断
+        if abs(residual) > 1e-8:
+            comps["r_postprocess_adjust"] = residual
 
         # 给 train_with_logging 用（你那边用的是 env.step_reward_components）
         self.last_reward_components = comps.copy()
@@ -988,6 +1250,9 @@ class CarlaEnv(gym.Env):
         info["raw_throttle_brake"] = float(a0)
         info["raw_steer"] = float(steer_raw)  # 这就是 applied steer
         info["raw_y_ref"] = float(y_ref)
+        info["applied_throttle"] = float(throttle)
+        info["applied_brake"] = float(brake)
+        info["applied_throttle_brake"] = float(applied_throttle_brake)
 
         info["applied_steer"] = float(steer)
 
@@ -995,6 +1260,13 @@ class CarlaEnv(gym.Env):
         info["yref_steer_gain"] = float(self.yref_steer_gain)
         info["yref_used"] = 1.0 if self.use_yref_in_steer else 0.0
         info["steer_delta_from_yref"] = float(steer - steer_raw)
+        info["steer_assist"] = float(steer_assist)
+        info["lane_ratio_ctrl"] = float(lane_ratio_ctrl)
+        info["steer_rate_limit_applied"] = float(max_delta)
+        info["steer_postprocess_delta_max"] = float(
+            self.max_steer_postprocess_delta if self.enable_steer_delta_clip else 0.0
+        )
+        info["train_onpolicy_action_mode"] = float(1.0 if strict_onpolicy_mode else 0.0)
 
         if self.use_yref_in_steer:
             info["steer_delta_from_yref"] = float(steer - steer_raw)
@@ -1030,6 +1302,7 @@ class CarlaEnv(gym.Env):
     def _reset_reward_state(self):
         # 彻底重置 episode 内部 reward 状态
         self.no_progress_steps = 0
+        self.offroad_steps = 0
         self.prev_control_for_smooth = None
 
         self.target_wp = None
@@ -1850,10 +2123,15 @@ class CarlaEnv(gym.Env):
           per obstacle: [rel_x_norm, rel_y_norm, dist_norm]
         其中：
           rel_x = 前向投影（自车 forward 点乘）
-          rel_y = 横向投影（自车 right 点乘，右为正）
+          rel_y = 横向投影（自车 left 点乘，左为正）
+        关键：
+          训练时必须优先保留“前方障碍”的观测，否则后侧/旁侧障碍会挤掉锥桶信号，
+          导致策略学不到前向避障。
         """
         K = int(self.obs_obstacle_k)
         R = float(self.obs_obstacle_range)
+        front_fwd_min = float(getattr(self.config, "obs_front_priority_fwd_min", -0.5))
+        front_lat_tol = float(getattr(self.config, "obs_front_priority_lat_tol", self.obs_control_lat_tol))
 
         candidates = self._collect_obstacle_candidates()
 
@@ -1906,16 +2184,20 @@ class CarlaEnv(gym.Env):
             ego_left = carla.Vector3D(x=-ego_right.x, y=-ego_right.y, z=-ego_right.z)
             rel_y = dx * ego_left.x + dy * ego_left.y  # 左为正
 
-            items.append((dist, rel_x, rel_y))
+            is_front = bool(rel_x > front_fwd_min)
+            is_front_lane = bool(is_front and (abs(rel_y) <= front_lat_tol))
+            # 0: 前方同车道附近优先；1: 其他前方；2: 侧后方（仅在前方不足时补齐）
+            priority = 0 if is_front_lane else (1 if is_front else 2)
+            items.append((priority, dist, rel_x, rel_y))
 
         if not items:
             return np.zeros((K * 3,), dtype=np.float32)
 
-        items.sort(key=lambda x: x[0])
+        items.sort(key=lambda x: (x[0], x[1]))
         items = items[:K]
 
         feats = []
-        for dist, rel_x, rel_y in items:
+        for _prio, dist, rel_x, rel_y in items:
             rel_x_n = float(np.clip(rel_x / R, -1.0, 1.0))
             rel_y_n = float(np.clip(rel_y / R, -1.0, 1.0))
             dist_n = float(np.clip(dist / R, 0.0, 1.0))
@@ -1975,11 +2257,11 @@ class CarlaEnv(gym.Env):
 
         # ----------------- terminal penalties -----------------
         # ✅ 终止惩罚：碰撞/出界更痛一点，推动安全学习
-        K_COLLISION_TERMINAL = 450.0
-        K_OFFROAD_TERMINAL = 60.0
-        K_NO_PROGRESS_TERM = 50.0
+        K_COLLISION_TERMINAL = float(getattr(self.config, "k_collision_terminal", 320.0))
+        K_OFFROAD_TERMINAL = float(getattr(self.config, "k_offroad_terminal", 75.0))
+        K_NO_PROGRESS_TERM = float(getattr(self.config, "k_no_progress_terminal", 50.0))
         # ✅ 允许更长时间尝试起步，避免刚学走就被判“无进展”
-        NO_PROGRESS_LIMIT = 150
+        NO_PROGRESS_LIMIT = int(getattr(self.config, "no_progress_limit", 150))
 
         # ----------------- scenario-specific profile -----------------
         scenario_name = str(getattr(self, "scenario", "")).lower()
@@ -1988,50 +2270,50 @@ class CarlaEnv(gym.Env):
         # ----------------- progress (门控后才给) -----------------
         # ✅ 提高前向进度奖励，避免“保守趴地上”
         # ✅ 让进度回报更“看得见”，避免长期负回报卡平台
-        K_PROGRESS = 10.00
-        PROG_CLIP = 1.00
-        PROG_EMA_A = 0.08
+        K_PROGRESS = float(getattr(self.config, "k_progress", 6.00))
+        PROG_CLIP = float(getattr(self.config, "progress_clip", 1.00))
+        PROG_EMA_A = float(getattr(self.config, "progress_ema_alpha", 0.08))
 
         # ----------------- speed (鼓励更合理的低速通过，而不是爬行) -----------------
         # 非 jaywalker: 鼓励稳健前进；jaywalker: 保持更保守速度策略
         TARGET_SPEED = float(
-            getattr(self.config, "target_speed_jaywalker", 4.0)
+            getattr(self.config, "target_speed_jaywalker", 3.8)
             if is_jaywalker else
-            getattr(self.config, "target_speed_lane", 7.8)
+            getattr(self.config, "target_speed_lane", 4.8)
         )
         V_MAX = float(
-            getattr(self.config, "v_max_jaywalker", 5.5)
+            getattr(self.config, "v_max_jaywalker", 5.2)
             if is_jaywalker else
-            getattr(self.config, "v_max_lane", 8.0)
+            getattr(self.config, "v_max_lane", 7.0)
         )
         OVERSPEED_START = float(
-            getattr(self.config, "overspeed_start_jaywalker", 4.5)
+            getattr(self.config, "overspeed_start_jaywalker", 4.3)
             if is_jaywalker else
-            getattr(self.config, "overspeed_start_lane", 6.5)
+            getattr(self.config, "overspeed_start_lane", 5.2)
         )
         K_SPEED = float(
-            getattr(self.config, "k_speed_jaywalker", 1.2)
+            getattr(self.config, "k_speed_jaywalker", 1.0)
             if is_jaywalker else
-            getattr(self.config, "k_speed_lane", 1.8)
+            getattr(self.config, "k_speed_lane", 2.10)
         )
         K_OVERSPEED = float(
-            getattr(self.config, "k_overspeed_jaywalker", 0.15)
+            getattr(self.config, "k_overspeed_jaywalker", 0.18)
             if is_jaywalker else
-            getattr(self.config, "k_overspeed_lane", 0.18)
+            getattr(self.config, "k_overspeed_lane", 0.24)
         )
 
         # ----------------- lane keeping -----------------
         # ✅ 轻微降低车道惩罚，减少“怕偏一点就停车”的行为
         # ✅ 轻微降低车道惩罚，避免“怕偏一点就停车”
-        K_LANE = 0.35
-        SOFT_START_RATIO = 0.60
-        K_OFFROAD_SOFT = 1.6
+        K_LANE = float(getattr(self.config, "k_lane", 0.50))
+        SOFT_START_RATIO = float(getattr(self.config, "offroad_soft_start_ratio", 0.60))
+        K_OFFROAD_SOFT = float(getattr(self.config, "k_offroad_soft", 1.6))
 
         # ----------------- danger (仍然保守，但不要过于强惩罚) -----------------
         # ✅ 危险惩罚仍保守，但稍微缓和强度
-        DANGER_START = 0.40
-        K_DANGER = 0.30
-        DANGER_CLIP = 0.50
+        DANGER_START = float(getattr(self.config, "danger_start_ratio", 0.35))
+        K_DANGER = float(getattr(self.config, "k_danger", 0.45))
+        DANGER_CLIP = float(getattr(self.config, "danger_clip", 0.50))
 
         # ----------------- obstacle shaping (更早更强) -----------------
         HAVE_OBS = bool(getattr(self, "obs_use_obstacles", False))
@@ -2040,9 +2322,21 @@ class CarlaEnv(gym.Env):
         USE_LANE_FEAT = bool(getattr(self, "obs_use_lane", True))
         LANE_DIM = 6 if USE_LANE_FEAT else 0
 
-        # ✅ 观察更远一点，提前对障碍做引导惩罚
-        AVOID_FWD = 55.0
-        SAFE_DIST = 22.0
+        # 障碍前向作用距离/安全距离：按场景从 config 读取（避免硬编码覆盖训练配置）
+        AVOID_FWD = float(
+            getattr(self.config, "avoid_fwd_jaywalker", 30.0)
+            if is_jaywalker else
+            getattr(self.config, "avoid_fwd_lane", 30.0)
+        )
+        SAFE_DIST = float(
+            getattr(self.config, "safe_dist_jaywalker", 14.0)
+            if is_jaywalker else
+            getattr(self.config, "safe_dist_lane", 14.0)
+        )
+        # 防御式约束：避免异常配置导致奖励门控畸形
+        AVOID_FWD = max(8.0, AVOID_FWD)
+        SAFE_DIST = max(3.0, SAFE_DIST)
+        SAFE_DIST = min(SAFE_DIST, AVOID_FWD)
         LAT_TOL = float(
             getattr(self.config, "obs_reward_lat_tol_jaywalker", 6.5)
             if is_jaywalker else
@@ -2051,20 +2345,48 @@ class CarlaEnv(gym.Env):
         K_AVOID_LAT = float(
             getattr(self.config, "k_avoid_lat_jaywalker", 0.50)
             if is_jaywalker else
-            getattr(self.config, "k_avoid_lat_lane", 0.25)
-        )  # 降低横向奖励，避免“为躲障碍过度横摆”
-        W_OBS_CLEAR = 1.00  # 近距惩罚：适度增强，降低碰撞
-        W_OBS_SPEED = 0.30 # 近障碍限速惩罚：适度增强
+            getattr(self.config, "k_avoid_lat_lane", 1.20)
+        )  # 中等横向奖励，鼓励提前绕障但不过度摆动
+        W_OBS_CLEAR = float(
+            getattr(self.config, "w_obs_clear_jaywalker", 4.2)
+            if is_jaywalker else
+            getattr(self.config, "w_obs_clear_lane", 6.8)
+        )
+        W_OBS_SPEED = float(
+            getattr(self.config, "w_obs_speed_jaywalker", 1.4)
+            if is_jaywalker else
+            getattr(self.config, "w_obs_speed_lane", 1.6)
+        )
+        W_OBS_DANGER = float(
+            getattr(self.config, "w_obs_danger_jaywalker", 1.2)
+            if is_jaywalker else
+            getattr(self.config, "w_obs_danger_lane", 2.8)
+        )
+        W_OBS_TTC = float(
+            getattr(self.config, "w_obs_ttc_jaywalker", 2.5)
+            if is_jaywalker else
+            getattr(self.config, "w_obs_ttc_lane", 2.8)
+        )
+        OBS_TTC_CRIT = float(
+            getattr(self.config, "obs_ttc_crit_jaywalker", 2.2)
+            if is_jaywalker else
+            getattr(self.config, "obs_ttc_crit_lane", 2.8)
+        )
+        OBS_DANGER_DIST = float(
+            getattr(self.config, "obs_danger_dist_jaywalker", 9.0)
+            if is_jaywalker else
+            getattr(self.config, "obs_danger_dist_lane", 13.5)
+        )
         V_CAP_NEAR = float(
             getattr(self.config, "v_cap_near_jaywalker", 2.2)
             if is_jaywalker else
-            getattr(self.config, "v_cap_near_lane", 3.4)
+            getattr(self.config, "v_cap_near_lane", 4.2)
         )
 
         # ----------------- alive / success -----------------
         # ✅ 略微提高 alive，降低纯“苟活”收益（配合低速惩罚）
         # ✅ 生存奖励小幅增加，成功奖励更明确
-        R_ALIVE = 0.01 # 0.03
+        R_ALIVE = float(getattr(self.config, "r_alive", 0.01))  # 0.03
         SUCCESS_BONUS = float(
             getattr(self.config, "success_bonus_jaywalker", 150.0)
             if is_jaywalker else
@@ -2125,9 +2447,26 @@ class CarlaEnv(gym.Env):
             r_no_progress_term = -K_NO_PROGRESS_TERM
 
         # ----------------- lane/offroad -----------------
-        offroad_thresh = 0.5 * lane_width + 1.0
+        offroad_thresh = 0.5 * lane_width + float(getattr(self, "offroad_margin", 1.0))
         lane_ratio = lane_dev / max(offroad_thresh, 1e-6)
-        offroad = bool(lane_dev > offroad_thresh)
+        offroad_geom = bool(lane_dev > offroad_thresh)
+
+        # 使用 strict waypoint 判定“真正离开可行驶道”，避免避障横向动作被误判 offroad。
+        wp_strict = None
+        try:
+            wp_strict = m.get_waypoint(loc, project_to_road=False, lane_type=carla.LaneType.Driving)
+        except Exception:
+            wp_strict = None
+        offroad = bool(wp_strict is None)
+        if not hasattr(self, "offroad_steps"):
+            self.offroad_steps = 0
+        if offroad:
+            self.offroad_steps += 1
+        else:
+            self.offroad_steps = 0
+        offroad_persist_steps = int(getattr(self.config, "offroad_persist_steps", 12))
+        # 终止更严格：同时满足 strict 与几何偏离，且持续若干步
+        offroad_terminal = bool(offroad and offroad_geom and (self.offroad_steps >= max(1, offroad_persist_steps)))
 
         # soft offroad penalty (提前拉回)
         r_offroad_soft = 0.0
@@ -2160,6 +2499,7 @@ class CarlaEnv(gym.Env):
                 e_loc = tf2.location
                 e_fwd = tf2.get_forward_vector()
                 e_right = tf2.get_right_vector()
+                e_left = carla.Vector3D(x=-e_right.x, y=-e_right.y, z=-e_right.z)
             except Exception:
                 return None, None, None
 
@@ -2185,7 +2525,7 @@ class CarlaEnv(gym.Env):
                 fwdp = dx_ * float(e_fwd.x) + dy_ * float(e_fwd.y)
                 if fwdp <= 0.0:
                     continue
-                latp = dx_ * float(e_right.x) + dy_ * float(e_right.y)
+                latp = dx_ * float(e_left.x) + dy_ * float(e_left.y)
                 if (best is None) or (dist_ < best[0]):
                     best = (dist_, fwdp, latp)
 
@@ -2232,6 +2572,8 @@ class CarlaEnv(gym.Env):
         # ----------------- obstacle penalties (删掉 r_obs_sep，避免刷奖励抖动) -----------------
         r_obs_clear = 0.0
         r_obs_speed = 0.0
+        r_obs_danger = 0.0
+        r_obs_ttc = 0.0
 
         if (nearest_dist is not None) and (nearest_fwd is not None):
             # 前向门控：越近越强
@@ -2250,7 +2592,7 @@ class CarlaEnv(gym.Env):
             obs_gate_floor = float(
                 getattr(self.config, "obs_reward_gate_floor_jaywalker", 0.20)
                 if is_jaywalker else
-                getattr(self.config, "obs_reward_gate_floor_lane", 0.05)
+                    getattr(self.config, "obs_reward_gate_floor_lane", 0.02)
             )
             obstacle_gate = max(obs_gate_floor, obstacle_gate)
 
@@ -2259,13 +2601,25 @@ class CarlaEnv(gym.Env):
                 x = (SAFE_DIST - float(nearest_dist)) / max(SAFE_DIST, 1e-6)
                 r_obs_clear = -W_OBS_CLEAR * obstacle_gate * float(x * x)
 
+            # 更近距离的危险惩罚（提前塑形，避免“直到碰撞前都敢硬冲”）
+            if nearest_dist < OBS_DANGER_DIST:
+                xd = (OBS_DANGER_DIST - float(nearest_dist)) / max(OBS_DANGER_DIST, 1e-6)
+                r_obs_danger = -W_OBS_DANGER * obstacle_gate * float(xd * xd)
+
+            # TTC 惩罚：避免“高速贴近障碍直到碰撞”
+            ttc = float(nearest_dist) / max(float(speed), 0.10)
+            if ttc < OBS_TTC_CRIT:
+                xt = (OBS_TTC_CRIT - ttc) / max(OBS_TTC_CRIT, 1e-6)
+                ttc_gate = max(0.30, float(obstacle_gate))
+                r_obs_ttc = -W_OBS_TTC * ttc_gate * float(xt * xt)
+
             # 近障碍限速：超过 V_CAP_NEAR 就罚
             if obstacle_gate > 0.05:
                 over = max(0.0, speed - V_CAP_NEAR)
                 if over > 0.0:
                     r_obs_speed = -W_OBS_SPEED * obstacle_gate * float((over / max(V_CAP_NEAR, 1e-6)) ** 2)
                     # ✅ 避免速度惩罚过大压死学习
-                    r_obs_speed = float(max(r_obs_speed, -1.0))
+                    r_obs_speed = float(max(r_obs_speed, -2.8))
 
             # 临近障碍物时打印一次核心量，方便定位 r_obs_clear 是否生效
             if getattr(self.config, "debug_obstacle_gate", False):
@@ -2284,27 +2638,39 @@ class CarlaEnv(gym.Env):
         # ----------------- obstacle-aware lane penalty -----------------
         # 前方有障碍时，适当放松车道惩罚，鼓励绕行
         if obstacle_gate > 0.0:
-            lane_gate = max(0.25, 1.0 - 0.8 * float(obstacle_gate))
+            lane_gate = max(0.08, 1.0 - 0.9 * float(obstacle_gate))
             r_lane *= lane_gate
 
         # ----------------- safety penalty downscale (混训稳定) -----------------
         # 统一缩放安全类惩罚，避免负回报淹没前进信号
-        safety_penalty_scale = 0.90
+        safety_penalty_scale = float(getattr(self.config, "safety_penalty_scale", 1.00))
         r_lane *= safety_penalty_scale
         r_danger *= safety_penalty_scale
         r_obs_clear *= safety_penalty_scale
         r_obs_speed *= safety_penalty_scale
+        r_obs_danger *= safety_penalty_scale
+        r_obs_ttc *= safety_penalty_scale
 
         # ----------------- lateral avoidance reward -----------------
-        # 障碍靠近时，鼓励产生横向偏移（帮助“绕开”而不是撞上/刹停）
+        # 障碍靠近时，给少量“横向让行”激励。
+        # 约束：只在近障碍且仍基本居中时生效，避免把车“奖励到出道”。
         r_avoid_lat = 0.0
         if (nearest_dist is not None) and (nearest_lat is not None):
-            if (nearest_dist < SAFE_DIST) and (lane_ratio < 0.95):
+            avoid_active_dist = min(SAFE_DIST, 18.0)
+            if (nearest_dist < avoid_active_dist) and (lane_ratio < 0.95) and (obstacle_gate > 0.15):
                 lat_norm = min(abs(float(nearest_lat)) / max(LAT_TOL, 1e-6), 1.0)
-                r_avoid_lat = K_AVOID_LAT * float(obstacle_gate) * float(lat_norm)
+                near_factor = float(np.clip((avoid_active_dist - float(nearest_dist)) / max(avoid_active_dist, 1e-6), 0.0, 1.0))
+                lane_keep_factor = float(np.clip((0.95 - float(lane_ratio)) / 0.95, 0.0, 1.0))
+                avoid_cap = float(
+                    getattr(self.config, "k_avoid_lat_cap_jaywalker", 0.18)
+                    if is_jaywalker else
+                    getattr(self.config, "k_avoid_lat_cap_lane", 0.85)
+                )
+                r_avoid_lat = K_AVOID_LAT * float(obstacle_gate) * near_factor * lane_keep_factor * float(lat_norm)
+                r_avoid_lat = float(min(r_avoid_lat, avoid_cap))
         # ----------------- speed reward (安全速度带，高斯型) -----------------
         # 中速最高，过慢/过快都下降，避免“龟速”或“硬冲”
-        sigma = 1.5
+        sigma = float(getattr(self.config, "speed_reward_sigma", 1.5))
         r_speed = K_SPEED * float(math.exp(-((speed - TARGET_SPEED) ** 2) / (2 * sigma * sigma)))
 
         # 门控：偏离车道/近障碍 -> 速度奖励变小
@@ -2312,7 +2678,7 @@ class CarlaEnv(gym.Env):
         # ✅ 门控别太狠：避免奖励完全“熄火”，导致收敛到龟速
         raw_gate = float(np.clip(1.0 - 0.3 * lane_ratio, 0.0, 1.0))
         # ✅ 近障碍时下调“冲刺”收益，但保留最低门槛避免龟速
-        obs_gate = float(np.clip(1.0 - 0.4 * float(obstacle_gate), 0.6, 1.0))
+        obs_gate = float(np.clip(1.0 - 0.95 * float(obstacle_gate), 0.10, 1.0))
         safety_gate = max(0.70, raw_gate) * obs_gate
         r_speed *= safety_gate
 
@@ -2329,10 +2695,13 @@ class CarlaEnv(gym.Env):
         # 关键：progress 只有在“比较安全”的时候才给，避免为了进度硬撞
         r_progress = K_PROGRESS * prog_fwd
         r_progress *= safety_gate
+        if (nearest_dist is not None) and (obstacle_gate > 0.20):
+            near_prog_gate = float(np.clip(float(nearest_dist) / max(SAFE_DIST, 1e-6), 0.20, 1.0))
+            r_progress *= near_prog_gate
         # 非 jaywalker 场景：低速时下调进度收益，避免“龟速刷进度”
         if not is_jaywalker:
-            progress_full_speed_lane = float(getattr(self.config, "progress_full_speed_lane", 3.2))
-            progress_min_gate_lane = float(getattr(self.config, "progress_min_gate_lane", 0.12))
+            progress_full_speed_lane = float(getattr(self.config, "progress_full_speed_lane", 4.2))
+            progress_min_gate_lane = float(getattr(self.config, "progress_min_gate_lane", 0.10))
             spd_gate = float(np.clip(speed / max(progress_full_speed_lane, 1e-6), progress_min_gate_lane, 1.0))
             r_progress *= spd_gate
 
@@ -2341,12 +2710,12 @@ class CarlaEnv(gym.Env):
         LOW_SPEED_TH = float(
             getattr(self.config, "low_speed_th_jaywalker", 0.6)
             if is_jaywalker else
-            getattr(self.config, "low_speed_th_lane", 2.3)
+            getattr(self.config, "low_speed_th_lane", 3.2)
         )
         K_LOW_SPEED = float(
             getattr(self.config, "k_low_speed_jaywalker", 0.04)
             if is_jaywalker else
-            getattr(self.config, "k_low_speed_lane", 0.34)
+            getattr(self.config, "k_low_speed_lane", 0.95)
         )
         r_low_speed = 0.0
         if speed < LOW_SPEED_TH:
@@ -2358,8 +2727,8 @@ class CarlaEnv(gym.Env):
         r_slow_clear = 0.0
         if not is_jaywalker:
             clear_dist_lane = float(getattr(self.config, "clear_dist_lane", 26.0))
-            clear_speed_target_lane = float(getattr(self.config, "clear_speed_target_lane", 2.4))
-            k_slow_clear_lane = float(getattr(self.config, "k_slow_clear_lane", 0.30))
+            clear_speed_target_lane = float(getattr(self.config, "clear_speed_target_lane", 3.6))
+            k_slow_clear_lane = float(getattr(self.config, "k_slow_clear_lane", 0.90))
             clear_road = (
                 ((nearest_dist is None) or (float(nearest_dist) > clear_dist_lane))
                 and (lane_ratio < 0.55)
@@ -2369,6 +2738,20 @@ class CarlaEnv(gym.Env):
                 z = (clear_speed_target_lane - speed) / max(clear_speed_target_lane, 1e-6)
                 r_slow_clear = -k_slow_clear_lane * float(z * z)
 
+        # 非 jaywalker：远离障碍时启用“速度地板”，避免长期低速试探
+        r_speed_floor = 0.0
+        if (not is_jaywalker) and bool(getattr(self.config, "speed_floor_enable_lane", True)):
+            speed_floor_target = float(getattr(self.config, "speed_floor_target_lane", 3.0))
+            speed_floor_k = float(getattr(self.config, "speed_floor_k_lane", 1.2))
+            speed_floor_obs_exempt_dist = float(getattr(self.config, "speed_floor_obs_exempt_dist_lane", 14.0))
+            speed_floor_lane_ratio_max = float(getattr(self.config, "speed_floor_lane_ratio_max", 0.85))
+
+            far_from_obs = ((nearest_dist is None) or (float(nearest_dist) > speed_floor_obs_exempt_dist))
+            keep_lane_ok = (lane_ratio < speed_floor_lane_ratio_max)
+            if far_from_obs and keep_lane_ok and (speed < speed_floor_target):
+                q = (speed_floor_target - speed) / max(speed_floor_target, 1e-6)
+                r_speed_floor = -speed_floor_k * float(q * q)
+
         # ----------------- terminal checks -----------------
         r_collision = 0.0
         if collision_flag:
@@ -2377,7 +2760,7 @@ class CarlaEnv(gym.Env):
             r_collision = -K_COLLISION_TERMINAL
 
         r_offroad = 0.0
-        if (not done) and offroad:
+        if (not done) and offroad_terminal:
             done = True
             done_reason = "offroad"
             r_offroad = -K_OFFROAD_TERMINAL
@@ -2403,7 +2786,7 @@ class CarlaEnv(gym.Env):
             prog_ok = (speed > succ_speed_th) or (prog_ema > succ_prog_th)
         else:
             prog_ok = (speed > succ_speed_th) and (prog_ema > succ_prog_th)
-        if timeout_flag and (not collision_flag) and (not offroad) and prog_ok:
+        if timeout_flag and (not collision_flag) and (not offroad_terminal) and prog_ok:
             r_success = SUCCESS_BONUS
 
         # ----------------- total reward -----------------
@@ -2415,10 +2798,13 @@ class CarlaEnv(gym.Env):
             "r_offroad_soft": float(r_offroad_soft),
             "r_obs_clear": float(r_obs_clear),
             "r_obs_speed": float(r_obs_speed),
+            "r_obs_danger": float(r_obs_danger),
+            "r_obs_ttc": float(r_obs_ttc),
             "r_avoid_lat": float(r_avoid_lat),
             "r_overspeed": float(r_overspeed),
             "r_low_speed": float(r_low_speed),
             "r_slow_clear": float(r_slow_clear),
+            "r_speed_floor": float(r_speed_floor),
             "r_no_progress_terminal": float(r_no_progress_term),
             "r_offroad": float(r_offroad),
             "r_collision": float(r_collision),
@@ -2451,6 +2837,9 @@ class CarlaEnv(gym.Env):
             "offroad_thresh": float(offroad_thresh),
             "lane_ratio": float(lane_ratio),
             "offroad": float(offroad),
+            "offroad_geom": float(offroad_geom),
+            "offroad_terminal": float(offroad_terminal),
+            "offroad_steps": float(getattr(self, "offroad_steps", 0)),
             "progress_fwd": float(prog_fwd),
             "progress_ema": float(getattr(self, "progress_ema", 0.0)),
             "no_progress_steps": float(getattr(self, "no_progress_steps", 0)),
