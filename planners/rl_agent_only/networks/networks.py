@@ -120,6 +120,10 @@ class PPONetwork(Network):
         self.agent: PPOAgent
 
         self.distribution = self.agent.distribution_type
+        self.value_representation = str(getattr(self.agent, "value_representation", "scalar")).strip().lower()
+        if self.value_representation not in ("scalar", "decomposed"):
+            self.value_representation = "scalar"
+        self.value_dim = 1 if self.value_representation == "scalar" else 2
 
         # TRD (设置在创建网络之前,因为value_network需要用到)
         self.trd_bins = getattr(self.agent, "trd_bins", 10)
@@ -141,7 +145,7 @@ class PPONetwork(Network):
         self.value = self.value_network(**value)
 
         # last_value: (base, exp)
-        self.last_value = tf.zeros((1, 2), dtype=tf.float32)
+        self.last_value = tf.zeros((1, self.value_dim), dtype=tf.float32)
 
     # ----------------- small utils -----------------
     def _as_input_list(self, inputs):
@@ -452,7 +456,7 @@ class PPONetwork(Network):
 
     # ----------------- MLP blocks -----------------
     def policy_layers(self, inputs: Dict[str, Input], **kwargs):
-        units = kwargs.get('units', 32)
+        units = kwargs.get('units', 128)
         num_layers = kwargs.get('num_layers', kwargs.get('layers', 2))
         activation = kwargs.get('activation', tf.nn.swish)
         dropout_rate = kwargs.get('dropout', 0.0)
@@ -545,7 +549,7 @@ class PPONetwork(Network):
 
         x = concatenate([inputs['state'], y_ref_in], axis=1)
 
-        units = kwargs.get('units', 32)
+        units = kwargs.get('units', 128)
         num_layers = kwargs.get('num_layers', kwargs.get('layers', 2))
         activation = kwargs.get('activation', tf.nn.swish)
 
@@ -584,6 +588,10 @@ class PPONetwork(Network):
     def value_head(self, layer: Layer, exponent_scale=6.0, components=1, **kwargs):
         assert components >= 1
         assert exponent_scale > 0.0
+
+        if self.value_representation == "scalar":
+            # 标量 value 更稳定，避免 base×10^exp 的数量级震荡
+            return Dense(units=1, activation='linear', name='v-scalar')(layer)
 
         if components == 1:
             base = Dense(units=1, activation=tf.nn.tanh, name='v-base')(layer)
@@ -636,5 +644,5 @@ class PPONetwork(Network):
         self.policy_lat.summary()
         print('\n==== Policy Lon (throttle | y_ref) ====')
         self.policy_lon.summary()
-        print('\n==== Value Network (+TRD) ====')
+        print(f'\n==== Value Network (+TRD, repr={self.value_representation}) ====')
         self.value.summary()

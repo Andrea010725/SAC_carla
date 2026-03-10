@@ -460,7 +460,7 @@ class CarlaGymEnv(gym.Env):
 
         # ✅ 观测归一化（修复P0级问题）
         self.obs_normalizer = RunningMeanStd(shape=(self.observation_space.shape[0],))
-        self.normalize_obs = True  # 可以通过config控制
+        self.normalize_obs = bool(getattr(config, "normalize_obs", True))
         self.obs_clip = 10.0  # 归一化后裁剪到[-10, 10]
 
         print("\n[DEBUG] CarlaEnv y_ref switch after wrapper init:")
@@ -2115,9 +2115,19 @@ def train_with_logging(
     return int(last_global_episode)
 
 
-def train_ppo():
+def train_ppo(profile: str = "default"):
+    profile = str(profile).strip().lower()
+    if profile in ("obs30", "default", ""):
+        profile = "default"
+    elif profile in ("standalone", "simple", "4scenarios", "four_scenarios"):
+        profile = "4scenarios" if profile in ("4scenarios", "four_scenarios") else profile
+    else:
+        print(f"[Profile] ⚠️ 未知profile={profile}，回退到 default")
+        profile = "default"
+
     print("=" * 70)
     print("PPO单独训练 - 带Wandb实时监控（修正版：✅W&B step对齐 + ✅episode横轴 + ✅y_ref开关）")
+    print(f"训练配置档: {profile}")
     print("=" * 70)
 
     # =========================
@@ -2835,6 +2845,9 @@ def train_ppo():
         else:
             config.optimization_steps = (4, 4)
         config.trd_loss_coef = float(cfg.get("trd_loss_coef", 0.0))
+        config.value_representation = str(cfg.get("value_representation", "scalar")).strip().lower()
+        config.network_units = int(cfg.get("network_units", 128))
+        config.network_layers = int(cfg.get("network_layers", 2))
 
         # ✅ y_ref 新旧字段统一：训练内部都用 use_yref_in_steer / yref_steer_gain
         _use_yref = bool(cfg.get("use_yref_in_steer", cfg.get("use_yref_mapping", False)))
@@ -3087,6 +3100,9 @@ def train_ppo():
         config.entropy_rescue_end = float(getattr(config, "entropy_rescue_end", 0.010))
         config.optimization_steps = tuple(getattr(config, "optimization_steps", (4, 4)))
         config.trd_loss_coef = float(getattr(config, "trd_loss_coef", 0.0))
+        config.value_representation = str(getattr(config, "value_representation", "scalar")).strip().lower()
+        config.network_units = int(getattr(config, "network_units", 128))
+        config.network_layers = int(getattr(config, "network_layers", 2))
 
         # ✅ y_ref 新旧字段统一
         config.use_yref_in_steer = bool(getattr(config, "use_yref_in_steer", False))
@@ -3427,6 +3443,88 @@ def train_ppo():
         print(f"[Config] ⚠️ runtime sanitize failed: {e}")
 
     # =========================
+    # ✅ Profile 覆盖：统一旧脚本入口到一套稳定训练链
+    # =========================
+    def _apply_profile_overrides(cfg, profile_name: str):
+        # 所有 profile 的公共稳态配置
+        cfg.normalize_obs = bool(getattr(cfg, "normalize_obs", True))
+        cfg.value_representation = str(getattr(cfg, "value_representation", "scalar")).strip().lower()
+        if cfg.value_representation not in ("scalar", "decomposed"):
+            cfg.value_representation = "scalar"
+        cfg.network_units = int(getattr(cfg, "network_units", 128))
+        cfg.network_layers = int(getattr(cfg, "network_layers", 2))
+        cfg.trd_loss_coef = float(getattr(cfg, "trd_loss_coef", 0.0))
+        cfg.use_action_bias = bool(getattr(cfg, "use_action_bias", False))
+        cfg.use_forced_throttle = bool(getattr(cfg, "use_forced_throttle", False))
+        cfg.train_onpolicy_action_mode = bool(getattr(cfg, "train_onpolicy_action_mode", True))
+        if cfg.train_onpolicy_action_mode:
+            cfg.ppo_store_executed_action = True
+
+        if profile_name == "standalone":
+            cfg.agent_name = "ppo-carla-standalone"
+            cfg.random_scenario = False
+            cfg.scenario = "parked_obstacles"
+            cfg.scenario_pool = ["parked_obstacles"]
+            cfg.observations_type = "state"
+            cfg.obs_obstacle_k = 0
+            cfg.use_yref_in_steer = False
+            cfg.use_yref_mapping = False
+            cfg.yref_steer_gain = 0.0
+            cfg.yref_gain = 0.0
+            cfg.yref_penalty = 0.0
+            cfg.max_episode_steps = int(getattr(cfg, "max_episode_steps", 512))
+            cfg.train_episodes = int(getattr(cfg, "train_episodes", 1000))
+            cfg.batch_size = int(getattr(cfg, "batch_size", 256))
+            cfg.update_frequency = int(getattr(cfg, "update_frequency", 1))
+            cfg.optimization_steps = tuple(getattr(cfg, "optimization_steps", (6, 6)))
+            cfg.policy_lr = float(getattr(cfg, "policy_lr", 5e-5))
+            cfg.value_lr = float(getattr(cfg, "value_lr", 1e-4))
+        elif profile_name == "simple":
+            cfg.agent_name = "ppo-carla-simple"
+            cfg.random_scenario = False
+            cfg.scenario = "parked_obstacles"
+            cfg.scenario_pool = ["parked_obstacles"]
+            cfg.observations_type = "state"
+            cfg.obs_obstacle_k = 0
+            cfg.use_yref_in_steer = False
+            cfg.use_yref_mapping = False
+            cfg.yref_steer_gain = 0.0
+            cfg.yref_gain = 0.0
+            cfg.yref_penalty = 0.0
+            cfg.max_episode_steps = int(getattr(cfg, "max_episode_steps", 512))
+            cfg.train_episodes = int(getattr(cfg, "train_episodes", 600))
+            cfg.batch_size = int(getattr(cfg, "batch_size", 256))
+            cfg.update_frequency = int(getattr(cfg, "update_frequency", 1))
+            cfg.optimization_steps = tuple(getattr(cfg, "optimization_steps", (6, 6)))
+            cfg.policy_lr = float(getattr(cfg, "policy_lr", 5e-5))
+            cfg.value_lr = float(getattr(cfg, "value_lr", 1e-4))
+        elif profile_name == "4scenarios":
+            cfg.agent_name = "ppo-carla-4scenarios"
+            cfg.random_scenario = True
+            cfg.scenario_pool = ["cones", "jaywalker", "trimma", "construction_lane_change"]
+            cfg.observations_type = "state_lane_obstacles"
+            cfg.max_episode_steps = int(getattr(cfg, "max_episode_steps", 512))
+            cfg.train_episodes = int(getattr(cfg, "train_episodes", 300))
+            cfg.update_frequency = int(getattr(cfg, "update_frequency", 1))
+            cfg.optimization_steps = tuple(getattr(cfg, "optimization_steps", (5, 5)))
+            cfg.policy_lr = float(getattr(cfg, "policy_lr", 1e-4))
+            cfg.value_lr = float(getattr(cfg, "value_lr", 2e-4))
+            cfg.use_yref_in_steer = bool(getattr(cfg, "use_yref_in_steer", True))
+            cfg.use_yref_mapping = bool(getattr(cfg, "use_yref_in_steer", True))
+        else:
+            cfg.agent_name = str(getattr(cfg, "agent_name", "ppo-carla-obs30"))
+            cfg.value_representation = str(getattr(cfg, "value_representation", "scalar")).strip().lower()
+
+    _apply_profile_overrides(config, profile)
+    print(
+        "[Profile] "
+        f"name={profile}, agent_name={getattr(config, 'agent_name', 'ppo-carla-obs30')}, "
+        f"obs={getattr(config, 'observations_type', None)}, value_repr={getattr(config, 'value_representation', None)}, "
+        f"net=({getattr(config, 'network_units', None)}x{getattr(config, 'network_layers', None)}), "
+        f"trd_coef={getattr(config, 'trd_loss_coef', None)}"
+    )
+
+    # =========================
     # ✅ Debug 可视化模式覆盖（短跑诊断）
     # =========================
     if debug_vis:
@@ -3504,7 +3602,7 @@ def train_ppo():
         getattr(config, "policy_raw_scale_clip_high", None),
     ))
 
-    agent_name = "ppo-carla-obs30"
+    agent_name = str(getattr(config, "agent_name", "ppo-carla-obs30"))
     weights_root = "./weights"
     agent_base_path = os.path.join(weights_root, agent_name)
     dump_effective_config(config, os.path.join(agent_base_path, "effective_config.json"))
@@ -3608,7 +3706,10 @@ def train_ppo():
         optimization_steps=tuple(config.optimization_steps),
         batch_size=int(config.batch_size),
         update_frequency=int(config.update_frequency),
+        value_representation=str(getattr(config, "value_representation", "scalar")),
         network=dict(
+            units=int(getattr(config, "network_units", 128)),
+            num_layers=int(getattr(config, "network_layers", 2)),
             policy=dict(
                 min_scale=float(getattr(config, "policy_min_scale", 0.06)),
                 min_scale_lat=float(getattr(config, "policy_min_scale_lat", 0.08)),

@@ -18,7 +18,6 @@ from ..networks.networks import PPONetwork
 from tensorflow.keras import losses
 from tensorflow.keras.optimizers.schedules import LearningRateSchedule
 
-import ipdb
 import json
 from dataclasses import dataclass
 import logging
@@ -99,11 +98,14 @@ class PPOAgent(Agent):
         # PPO-specific kwargs must be removed before calling Agent.__init__()
         # to avoid "unexpected keyword argument" errors in base class.
         debug_policy_print = bool(kwargs.pop("debug_policy_print", False))
-        trd_loss_coef = float(kwargs.pop("trd_loss_coef", 0.01))
+        trd_loss_coef = float(kwargs.pop("trd_loss_coef", 0.0))
         trd_warmup_updates = int(kwargs.pop("trd_warmup_updates", 20))
         trd_ramp_updates = int(kwargs.pop("trd_ramp_updates", 80))
         target_kl = float(kwargs.pop("target_kl", 0.0))
         kl_stop_multiplier = float(kwargs.pop("kl_stop_multiplier", 1.5))
+        value_representation = str(kwargs.pop("value_representation", "scalar")).strip().lower()
+        if value_representation not in ("scalar", "decomposed"):
+            value_representation = "scalar"
         kwargs.pop("town", None)
         super().__init__(*args, name=name, **kwargs)
 
@@ -112,6 +114,7 @@ class PPOAgent(Agent):
         self.lambda_ = lambda_
         self.repeat_action = repeat_action
         self.adv_scale = DynamicParameter.create(value=advantage_scale)
+        self.value_representation = value_representation
 
         # ✅ 控制是否打印 policy debug（默认关闭，避免刷屏）
         self.debug_policy_print = debug_policy_print
@@ -508,10 +511,18 @@ class PPOAgent(Agent):
     def value_objective(self, batch):
         states, returns, trd_targets = batch[:3]
         values, trd_pred = self.network.value_and_trd(states, training=True)
-
-        base_loss = tf.reduce_mean(losses.MSE(y_true=returns[:, 0], y_pred=values[:, 0]))
-        exp_loss = tf.reduce_mean(losses.MSE(y_true=returns[:, 1], y_pred=values[:, 1]))
-        value_loss = 0.5 * (0.25 * base_loss + exp_loss / (self.network.exp_scale ** 2))
+        repr_mode = getattr(self, "value_representation", "scalar")
+        if repr_mode == "decomposed":
+            returns = tf.convert_to_tensor(returns, dtype=tf.float32)
+            base_loss = tf.reduce_mean(losses.MSE(y_true=returns[:, 0], y_pred=values[:, 0]))
+            exp_loss = tf.reduce_mean(losses.MSE(y_true=returns[:, 1], y_pred=values[:, 1]))
+            value_loss = 0.5 * (0.25 * base_loss + exp_loss / (self.network.exp_scale ** 2))
+        else:
+            returns = tf.reshape(tf.convert_to_tensor(returns, dtype=tf.float32), [-1])
+            values_scalar = tf.reshape(values[:, 0], [-1])
+            base_loss = tf.reduce_mean(losses.MSE(y_true=returns, y_pred=values_scalar))
+            exp_loss = tf.constant(0.0, dtype=tf.float32)
+            value_loss = base_loss
 
         # ---- TRD coef schedule (warmup + ramp) ----
         step = tf.cast(self.update_step, tf.float32)
@@ -801,7 +812,13 @@ class PPOAgent(Agent):
 
     def get_memory(self):
         """Instantiate the agent's memory; easy to subclass"""
-        return PPOMemory(state_spec=self.state_spec, num_actions=self.num_actions)
+        value_dim = int(getattr(self.network, "value_dim", 1))
+        return PPOMemory(
+            state_spec=self.state_spec,
+            num_actions=self.num_actions,
+            value_dim=value_dim,
+            value_representation=self.value_representation,
+        )
 
     # TRD
     def end_episode(self, last_value, append=False):
@@ -903,17 +920,21 @@ class PPOAgent(Agent):
 
 
         # ✅ returns - values_t 绝不会再 shape mismatch
-        self.log(
+        log_kwargs = dict(
             returns=returns_scalar,
             advantages=advantages,
             values=values_t,
-            returns_minus_values=returns_scalar- values_t,
-            returns_base=self.memory.returns[:L, 0] if self.memory.returns is not None else None,
-            returns_exp=self.memory.returns[:L, 1] if self.memory.returns is not None else None,
-            values_base=self.memory.values[:L, 0] if tf.shape(self.memory.values)[0] >= L + 1 else None,
-            values_exp = self.memory.values[:L, 1] if tf.shape(self.memory.values)[0] >= L + 1 else None,
+            returns_minus_values=returns_scalar - values_t,
             advantages_normalized=self.memory.advantages,
         )
+        if getattr(self, "value_representation", "scalar") == "decomposed":
+            log_kwargs.update(
+                returns_base=self.memory.returns[:L, 0] if self.memory.returns is not None else None,
+                returns_exp=self.memory.returns[:L, 1] if self.memory.returns is not None else None,
+                values_base=self.memory.values[:L, 0] if tf.shape(self.memory.values)[0] >= L + 1 else None,
+                values_exp=self.memory.values[:L, 1] if tf.shape(self.memory.values)[0] >= L + 1 else None,
+            )
+        self.log(**log_kwargs)
 
         # 5) dump
         try:
@@ -1005,9 +1026,12 @@ class PPOAgent(Agent):
 
             T, dim = trd.shape
             steps = min(T, max_steps)
-
-            V = values[:-1, 0] * np.power(10.0, values[:-1, 1])
-            R = returns[:, 0] * np.power(10.0, returns[:, 1])
+            if getattr(self, "value_representation", "scalar") == "decomposed":
+                V = values[:-1, 0] * np.power(10.0, values[:-1, 1])
+                R = returns[:, 0] * np.power(10.0, returns[:, 1])
+            else:
+                V = values[:-1, 0]
+                R = returns
 
             filepath = os.path.join(self.base_path, filename)
             os.makedirs(os.path.dirname(filepath), exist_ok=True)
@@ -1032,8 +1056,10 @@ class PPOAgent(Agent):
 class PPOMemory:
     """Recent memory used in PPOAgent"""
 
-    def __init__(self, state_spec: dict, num_actions: int):
+    def __init__(self, state_spec: dict, num_actions: int, value_dim: int = 1, value_representation: str = "scalar"):
         self.index = 0
+        self.value_dim = int(max(1, value_dim))
+        self.value_representation = str(value_representation).strip().lower()
 
         if list(state_spec.keys()) == ['state']:
             self.states = tf.zeros(shape=(0,) + state_spec.get('state'), dtype=tf.float32)
@@ -1045,7 +1071,7 @@ class PPOMemory:
                 self.states[name] = tf.zeros(shape=(0,) + shape, dtype=tf.float32)
 
         self.rewards = tf.zeros(shape=(0,), dtype=tf.float32)
-        self.values = tf.zeros(shape=(0, 2), dtype=tf.float32)
+        self.values = tf.zeros(shape=(0, self.value_dim), dtype=tf.float32)
         self.actions = tf.zeros(shape=(0, num_actions), dtype=tf.float32)
         # self.log_probabilities = tf.zeros(shape=(0, num_actions), dtype=tf.float32)
         self.log_probabilities = tf.zeros((0,), dtype=tf.float32)  # ✅ 只存 joint logp
@@ -1194,9 +1220,15 @@ class PPOMemory:
         returns_scalar = utils.rewards_to_go(rewards_env, discount=discount)
         returns_scalar = utils.to_float(returns_scalar)  # [T]
 
-        new_returns = tf.map_fn(fn=utils.decompose_number, elems=returns_scalar,
-                                dtype=(tf.float32, tf.float32))
-        new_returns = tf.stack(new_returns, axis=1)  # [T,2]
+        if self.value_representation == "decomposed":
+            new_returns = tf.map_fn(
+                fn=utils.decompose_number,
+                elems=returns_scalar,
+                dtype=(tf.float32, tf.float32),
+            )
+            new_returns = tf.stack(new_returns, axis=1)  # [T,2]
+        else:
+            new_returns = returns_scalar  # [T]
 
         if (self.returns is None) or (not append):
             self.returns = new_returns
@@ -1217,7 +1249,10 @@ class PPOMemory:
         rewards = self.rewards[self.index:]  # [T+1]
 
         # values_full: [T+1]
-        values_full = self.values[self.index:, 0] * tf.pow(10.0, self.values[self.index:, 1])
+        if self.value_representation == "decomposed":
+            values_full = self.values[self.index:, 0] * tf.pow(10.0, self.values[self.index:, 1])
+        else:
+            values_full = tf.reshape(self.values[self.index:, 0], [-1])
 
         # --- 强一致性检查（宁可裁剪也不要错位）---
         r_len = tf.shape(rewards)[0]

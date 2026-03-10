@@ -59,7 +59,7 @@ SAC_LANE_NAMES = [
     "wp_rel_y_norm",
 ]
 SAC_OBS_NAMES = ["rel_x_norm", "rel_y_norm", "dist_norm"]
-SCRIPT_VERSION = "sensor_mvp_api_assist_step16_obs_w099_v20260310"
+SCRIPT_VERSION = "sensor_mvp_api_gt_sensor_only_step12_sem_lidar_no_radar_fuse_v20260310"
 LANE_LOOKAHEAD_FIXED_M = 12.0
 LANE_DIR_MOTION_MIN_STEP_M = 0.10
 LANE_DIR_OPPOSITE_MOTION = True
@@ -75,10 +75,6 @@ LANE_LINE_SIDE_MIN_POINTS = 1
 SEM_LIDAR_MIN_POINTS = 24
 RADAR_MATCH_RADIUS_M = 3.0
 USE_RADAR_FOR_OBS_SPEED = False
-USE_API_LANE_ASSIST = True
-USE_API_OBS_ASSIST = True
-API_LANE_ASSIST_WEIGHT = 0.95
-API_OBS_ASSIST_WEIGHT = 0.99
 
 
 def wrap_angle(a: float) -> float:
@@ -87,15 +83,6 @@ def wrap_angle(a: float) -> float:
     while a < -math.pi:
         a += 2.0 * math.pi
     return a
-
-
-def blend_angle(sensor_a: float, prior_a: float, prior_w: float) -> float:
-    w = float(np.clip(prior_w, 0.0, 1.0))
-    s = (1.0 - w) * math.sin(sensor_a) + w * math.sin(prior_a)
-    c = (1.0 - w) * math.cos(sensor_a) + w * math.cos(prior_a)
-    if abs(s) < 1e-9 and abs(c) < 1e-9:
-        return float(sensor_a)
-    return float(math.atan2(s, c))
 
 
 def _semantic_labels(sem_image: carla.Image) -> np.ndarray:
@@ -546,23 +533,6 @@ class SensorEstimator:
             self.prev_lane_center_offset = float(lane[0])
             if float(lane[2]) > 1e-3:
                 self.prev_lane_width = float(lane[2])
-
-        lane_api_assist_used = 0.0
-        if USE_API_LANE_ASSIST:
-            try:
-                lane_prior = compute_lane_gt(carla_env)
-                wp = float(np.clip(API_LANE_ASSIST_WEIGHT, 0.0, 1.0))
-                ws = float(1.0 - wp)
-                lane[0] = float(ws * float(lane[0]) + wp * float(lane_prior[0]))
-                lane[1] = float(blend_angle(float(lane[1]), float(lane_prior[1]), wp))
-                lane[2] = float(ws * float(lane[2]) + wp * float(lane_prior[2]))
-                lane[3] = float(ws * float(lane[3]) + wp * float(lane_prior[3]))
-                lane[4] = float(ws * float(lane[4]) + wp * float(lane_prior[4]))
-                lane[5] = float(ws * float(lane[5]) + wp * float(lane_prior[5]))
-                lane_api_assist_used = 1.0
-            except Exception:
-                lane_api_assist_used = 0.0
-
         radar_points = _radar_points_ego(radar)
         ts = float(lidar.timestamp) if lidar is not None else (float(sem_lidar.timestamp) if sem_lidar is not None else 0.0)
         obs, obs_meta = self._estimate_obstacles_from_points(
@@ -571,22 +541,6 @@ class SensorEstimator:
             ts,
             radar_points=radar_points,
         )
-        obs_api_assist_used = 0.0
-        if USE_API_OBS_ASSIST:
-            try:
-                obs_prior = compute_obstacle_gt(
-                    carla_env=carla_env,
-                    obstacle_k=self.k,
-                    obs_range=self.obs_range,
-                    front_fwd_min=self.front_fwd_min,
-                    front_lat_tol=self.front_lat_tol,
-                )
-                wp = float(np.clip(API_OBS_ASSIST_WEIGHT, 0.0, 1.0))
-                ws = float(1.0 - wp)
-                obs = (ws * obs + wp * obs_prior).astype(np.float32)
-                obs_api_assist_used = 1.0
-            except Exception:
-                obs_api_assist_used = 0.0
         lane_sac = canonical_lane_to_sac(lane)
         obs_sac = canonical_obs_to_sac(obs, self.obs_range)
         meta = {
@@ -607,8 +561,6 @@ class SensorEstimator:
             "obs_radar_matches": float(obs_meta.get("obs_radar_matches", 0.0)),
             "obs_candidate_clusters": float(obs_meta.get("obs_candidate_clusters", 0.0)),
             "obs_radar_points": float(obs_meta.get("obs_radar_points", 0.0)),
-            "lane_api_assist_used": float(lane_api_assist_used),
-            "obs_api_assist_used": float(obs_api_assist_used),
         }
         return lane, obs, lane_sac, obs_sac, meta
 
@@ -1237,8 +1189,6 @@ def build_csv_fields(obstacle_k: int) -> List[str]:
         "diag_obs_radar_matches",
         "diag_obs_candidate_clusters",
         "diag_obs_radar_points",
-        "diag_lane_api_assist_used",
-        "diag_obs_api_assist_used",
     ]
     for n in LANE_NAMES:
         fields.extend([f"lane_gt_{n}", f"lane_pred_{n}", f"lane_abs_{n}"])
@@ -1352,8 +1302,6 @@ def main():
     obs_radar_match_vals = []
     obs_candidate_cluster_vals = []
     obs_radar_points_vals = []
-    lane_api_assist_steps = 0
-    obs_api_assist_steps = 0
 
     valid_steps = 0
     total_env_steps = 0
@@ -1447,8 +1395,6 @@ def main():
                     obs_radar_match_vals.append(float(est_meta.get("obs_radar_matches", 0.0)))
                     obs_candidate_cluster_vals.append(float(est_meta.get("obs_candidate_clusters", 0.0)))
                     obs_radar_points_vals.append(float(est_meta.get("obs_radar_points", 0.0)))
-                    lane_api_assist_steps += int(est_meta.get("lane_api_assist_used", 0.0) > 0.5)
-                    obs_api_assist_steps += int(est_meta.get("obs_api_assist_used", 0.0) > 0.5)
 
                     lane_gt = compute_lane_gt(env)
                     obs_gt_world_k3 = compute_obstacle_gt(
@@ -1491,8 +1437,6 @@ def main():
                         "diag_obs_radar_matches": float(est_meta.get("obs_radar_matches", 0.0)),
                         "diag_obs_candidate_clusters": float(est_meta.get("obs_candidate_clusters", 0.0)),
                         "diag_obs_radar_points": float(est_meta.get("obs_radar_points", 0.0)),
-                        "diag_lane_api_assist_used": float(est_meta.get("lane_api_assist_used", 0.0)),
-                        "diag_obs_api_assist_used": float(est_meta.get("obs_api_assist_used", 0.0)),
                     }
                     for i, n in enumerate(LANE_NAMES):
                         row[f"lane_gt_{n}"] = float(lane_gt[i])
@@ -1587,12 +1531,6 @@ def main():
         "obs_radar_matches_mean": float(obs_radar_matches_mean),
         "obs_candidate_clusters_mean": float(obs_candidate_clusters_mean),
         "obs_radar_points_mean": float(obs_radar_points_mean),
-        "lane_api_assist_rate": float(lane_api_assist_steps / max(1, valid_steps)),
-        "obs_api_assist_rate": float(obs_api_assist_steps / max(1, valid_steps)),
-        "api_assist_weights": {
-            "lane": float(API_LANE_ASSIST_WEIGHT),
-            "obstacle": float(API_OBS_ASSIST_WEIGHT),
-        },
         "obstacle_nonzero_rate": float(obs_nonzero_steps / max(1, valid_steps)),
         "output_csv": os.path.abspath(output_csv),
     }

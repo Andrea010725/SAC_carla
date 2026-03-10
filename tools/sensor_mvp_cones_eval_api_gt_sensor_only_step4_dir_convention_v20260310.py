@@ -59,26 +59,10 @@ SAC_LANE_NAMES = [
     "wp_rel_y_norm",
 ]
 SAC_OBS_NAMES = ["rel_x_norm", "rel_y_norm", "dist_norm"]
-SCRIPT_VERSION = "sensor_mvp_api_assist_step16_obs_w099_v20260310"
+SCRIPT_VERSION = "sensor_mvp_api_gt_sensor_only_step4_dir_convention_v20260310"
 LANE_LOOKAHEAD_FIXED_M = 12.0
 LANE_DIR_MOTION_MIN_STEP_M = 0.10
 LANE_DIR_OPPOSITE_MOTION = True
-LANE_WIDTH_VALID_MIN_M = 2.0
-LANE_WIDTH_VALID_MAX_M = 5.0
-LANE_WIDTH_ROAD_CLAMP_MIN_M = 2.8
-LANE_WIDTH_ROAD_CLAMP_MAX_M = 4.2
-LANE_CENTER_SMOOTH_ALPHA = 0.75
-LANE_WIDTH_SMOOTH_ALPHA = 0.70
-LANE_LINE_NEIGHBOR_RADIUS_PX = 1
-LANE_LINE_SLICE_MIN_POINTS = 4
-LANE_LINE_SIDE_MIN_POINTS = 1
-SEM_LIDAR_MIN_POINTS = 24
-RADAR_MATCH_RADIUS_M = 3.0
-USE_RADAR_FOR_OBS_SPEED = False
-USE_API_LANE_ASSIST = True
-USE_API_OBS_ASSIST = True
-API_LANE_ASSIST_WEIGHT = 0.95
-API_OBS_ASSIST_WEIGHT = 0.99
 
 
 def wrap_angle(a: float) -> float:
@@ -87,15 +71,6 @@ def wrap_angle(a: float) -> float:
     while a < -math.pi:
         a += 2.0 * math.pi
     return a
-
-
-def blend_angle(sensor_a: float, prior_a: float, prior_w: float) -> float:
-    w = float(np.clip(prior_w, 0.0, 1.0))
-    s = (1.0 - w) * math.sin(sensor_a) + w * math.sin(prior_a)
-    c = (1.0 - w) * math.cos(sensor_a) + w * math.cos(prior_a)
-    if abs(s) < 1e-9 and abs(c) < 1e-9:
-        return float(sensor_a)
-    return float(math.atan2(s, c))
 
 
 def _semantic_labels(sem_image: carla.Image) -> np.ndarray:
@@ -108,68 +83,11 @@ def _semantic_labels(sem_image: carla.Image) -> np.ndarray:
     return arr[:, :, 2]
 
 
-def _dilate_binary(mask: np.ndarray, radius: int) -> np.ndarray:
-    if radius <= 0:
-        return mask
-    h, w = mask.shape
-    pad = int(radius)
-    padded = np.pad(mask, ((pad, pad), (pad, pad)), mode="constant", constant_values=False)
-    out = np.zeros((h, w), dtype=bool)
-    for dy in range(-pad, pad + 1):
-        y0 = pad + dy
-        y1 = y0 + h
-        for dx in range(-pad, pad + 1):
-            x0 = pad + dx
-            x1 = x0 + w
-            out |= padded[y0:y1, x0:x1]
-    return out
-
-
 def _lidar_points(lidar: carla.LidarMeasurement) -> np.ndarray:
     pts = np.frombuffer(lidar.raw_data, dtype=np.float32)
     if pts.size == 0:
         return np.zeros((0, 4), dtype=np.float32)
     return pts.reshape((-1, 4))
-
-
-def _semantic_lidar_points_and_tags(sem_lidar) -> Tuple[np.ndarray, np.ndarray]:
-    if sem_lidar is None:
-        return np.zeros((0, 3), dtype=np.float32), np.zeros((0,), dtype=np.uint8)
-    pts: List[Tuple[float, float, float]] = []
-    tags: List[int] = []
-    try:
-        for det in sem_lidar:
-            p = det.point
-            pts.append((float(p.x), float(p.y), float(p.z)))
-            tags.append(int(det.object_tag))
-    except Exception:
-        return np.zeros((0, 3), dtype=np.float32), np.zeros((0,), dtype=np.uint8)
-    if not pts:
-        return np.zeros((0, 3), dtype=np.float32), np.zeros((0,), dtype=np.uint8)
-    return np.asarray(pts, dtype=np.float32), np.asarray(tags, dtype=np.uint8)
-
-
-def _radar_points_ego(radar_meas) -> np.ndarray:
-    if radar_meas is None:
-        return np.zeros((0, 3), dtype=np.float32)
-    out: List[Tuple[float, float, float]] = []
-    try:
-        for det in radar_meas:
-            depth = float(det.depth)
-            az = float(det.azimuth)
-            alt = float(det.altitude)
-            # CARLA radar uses sensor-forward coordinates:
-            # x=forward, y=right, z=up. Convert to ego-left convention for lateral.
-            cos_alt = math.cos(alt)
-            fwd = float(depth * cos_alt * math.cos(az))
-            lat = float(-depth * cos_alt * math.sin(az))
-            rel_speed = float(det.velocity)
-            out.append((fwd, lat, rel_speed))
-    except Exception:
-        return np.zeros((0, 3), dtype=np.float32)
-    if not out:
-        return np.zeros((0, 3), dtype=np.float32)
-    return np.asarray(out, dtype=np.float32)
 
 
 def _transform_points(points_xyz: np.ndarray, tf: carla.Transform) -> np.ndarray:
@@ -274,7 +192,6 @@ class SensorSuite:
         sem_h: int = 360,
         sem_fov: float = 100.0,
         lidar_range: float = 60.0,
-        radar_range: float = 60.0,
     ):
         self.world = world
         self.ego = ego
@@ -283,16 +200,10 @@ class SensorSuite:
         self.sem_fov = float(sem_fov)
         self.sem_queue: "queue.Queue[carla.Image]" = queue.Queue()
         self.lidar_queue: "queue.Queue[carla.LidarMeasurement]" = queue.Queue()
-        self.sem_lidar_queue: "queue.Queue" = queue.Queue()
-        self.radar_queue: "queue.Queue" = queue.Queue()
         self.sem_stash: Optional[carla.Image] = None
         self.lidar_stash: Optional[carla.LidarMeasurement] = None
-        self.sem_lidar_stash = None
-        self.radar_stash = None
         self.sem_cam: Optional[carla.Sensor] = None
         self.lidar: Optional[carla.Sensor] = None
-        self.sem_lidar: Optional[carla.Sensor] = None
-        self.radar: Optional[carla.Sensor] = None
         self._actors: List[carla.Actor] = []
 
         bp_lib = world.get_blueprint_library()
@@ -321,32 +232,6 @@ class SensorSuite:
             raise RuntimeError("Failed to spawn LiDAR.")
         self.lidar.listen(self.lidar_queue.put)
         self._actors.append(self.lidar)
-
-        sem_lidar_bp = bp_lib.find("sensor.lidar.ray_cast_semantic")
-        sem_lidar_bp.set_attribute("range", f"{float(lidar_range):.1f}")
-        sem_lidar_bp.set_attribute("channels", "32")
-        sem_lidar_bp.set_attribute("points_per_second", "90000")
-        sem_lidar_bp.set_attribute("rotation_frequency", f"{1.0 / max(float(fixed_dt), 1e-3):.2f}")
-        sem_lidar_bp.set_attribute("upper_fov", "10.0")
-        sem_lidar_bp.set_attribute("lower_fov", "-30.0")
-        sem_lidar_tf = carla.Transform(carla.Location(x=0.00, z=1.90))
-        self.sem_lidar = world.try_spawn_actor(sem_lidar_bp, sem_lidar_tf, attach_to=ego)
-        if self.sem_lidar is None:
-            raise RuntimeError("Failed to spawn semantic LiDAR.")
-        self.sem_lidar.listen(self.sem_lidar_queue.put)
-        self._actors.append(self.sem_lidar)
-
-        radar_bp = bp_lib.find("sensor.other.radar")
-        radar_bp.set_attribute("horizontal_fov", "35")
-        radar_bp.set_attribute("vertical_fov", "20")
-        radar_bp.set_attribute("range", f"{float(radar_range):.1f}")
-        radar_bp.set_attribute("points_per_second", "1500")
-        radar_tf = carla.Transform(carla.Location(x=2.0, z=1.0))
-        self.radar = world.try_spawn_actor(radar_bp, radar_tf, attach_to=ego)
-        if self.radar is None:
-            raise RuntimeError("Failed to spawn radar.")
-        self.radar.listen(self.radar_queue.put)
-        self._actors.append(self.radar)
 
     def _wait_frame(
         self,
@@ -382,12 +267,10 @@ class SensorSuite:
     def poll(self, world_frame: int, timeout_s: float = 1.5):
         sem = self._wait_frame(self.sem_queue, world_frame, timeout_s, "sem_stash")
         lidar = self._wait_frame(self.lidar_queue, world_frame, timeout_s, "lidar_stash")
-        sem_lidar = self._wait_frame(self.sem_lidar_queue, world_frame, timeout_s, "sem_lidar_stash")
-        radar = self._wait_frame(self.radar_queue, world_frame, timeout_s, "radar_stash")
-        return sem, lidar, sem_lidar, radar
+        return sem, lidar
 
     def close(self):
-        for s in (self.sem_cam, self.lidar, self.sem_lidar, self.radar):
+        for s in (self.sem_cam, self.lidar):
             if s is None:
                 continue
             try:
@@ -402,8 +285,6 @@ class SensorSuite:
         self._actors.clear()
         self.sem_cam = None
         self.lidar = None
-        self.sem_lidar = None
-        self.radar = None
 
 
 class SensorEstimator:
@@ -422,29 +303,21 @@ class SensorEstimator:
         self.prev_ts: Optional[float] = None
         self.prev_ego_xy: Optional[Tuple[float, float]] = None
         self.prev_lane_dir_sign: float = -1.0 if LANE_DIR_OPPOSITE_MOTION else 1.0
-        self.prev_lane_center_offset: Optional[float] = None
-        self.prev_lane_width: Optional[float] = None
 
     def reset(self):
         self.prev_clusters = []
         self.prev_ts = None
         self.prev_ego_xy = None
         self.prev_lane_dir_sign = -1.0 if LANE_DIR_OPPOSITE_MOTION else 1.0
-        self.prev_lane_center_offset = None
-        self.prev_lane_width = None
 
     def estimate(
         self,
         carla_env: CarlaEnv,
         sem: carla.Image,
         lidar: carla.LidarMeasurement,
-        sem_lidar=None,
-        radar=None,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Dict[str, float]]:
-        points_lidar = _lidar_points(lidar) if lidar is not None else np.zeros((0, 4), dtype=np.float32)
-        sem_lidar_local_xyz, sem_lidar_tags = _semantic_lidar_points_and_tags(sem_lidar)
-        use_sem_lidar = sem_lidar_local_xyz.shape[0] >= int(SEM_LIDAR_MIN_POINTS)
-        if points_lidar.shape[0] == 0 and sem_lidar_local_xyz.shape[0] == 0:
+        points_lidar = _lidar_points(lidar)
+        if points_lidar.shape[0] == 0:
             lane = np.zeros((6,), dtype=np.float32)
             obs = np.zeros((self.k, 3), dtype=np.float32)
             meta = {
@@ -455,59 +328,39 @@ class SensorEstimator:
                 "lane_nonzero": 0.0,
                 "obs_nonzero": 0.0,
                 "projection_mode": "no_lidar",
-                "lane_source_sem_lidar": 0.0,
-                "obs_radar_matches": 0.0,
-                "obs_candidate_clusters": 0.0,
-                "obs_radar_points": 0.0,
             }
             return lane, obs, canonical_lane_to_sac(lane), canonical_obs_to_sac(obs, self.obs_range), meta
 
+        sem_labels = _semantic_labels(sem)
+        lidar_local_xyz = points_lidar[:, :3]
+        world_xyz = _transform_points(lidar_local_xyz, lidar.transform)
+        u, v, valid, proj_mode = _project_world_to_camera(
+            world_xyz=world_xyz,
+            cam_tf=sem.transform,
+            img_w=int(sem.width),
+            img_h=int(sem.height),
+            fov_deg=float(getattr(sem, "fov", 100.0)),
+        )
+
+        total_pts = int(points_lidar.shape[0])
+        valid_cnt = int(np.count_nonzero(valid))
+        valid_ratio = float(valid_cnt / max(1, total_pts))
+
         used_lidar_only_fallback = 0.0
-        if use_sem_lidar:
-            sem_lidar_world = _transform_points(sem_lidar_local_xyz, sem_lidar.transform)
-            valid_world = sem_lidar_world
-            lane_labels = sem_lidar_tags.astype(np.uint8)
-            obs_labels = sem_lidar_tags.astype(np.uint8)
-            total_pts = int(sem_lidar_local_xyz.shape[0])
-            valid_cnt = int(sem_lidar_local_xyz.shape[0])
-            valid_ratio = 1.0
-            proj_mode = "semantic_lidar"
+        if valid_cnt <= 16:
+            # projection is effectively unusable; fallback to lidar-only geometry
+            used_lidar_only_fallback = 1.0
+            valid_world = world_xyz
+            lane_labels = np.full((valid_world.shape[0],), SEM_ROAD, dtype=np.uint8)
+            obs_labels = np.zeros((valid_world.shape[0],), dtype=np.uint8)
         else:
-            sem_labels = _semantic_labels(sem)
-            lidar_local_xyz = points_lidar[:, :3]
-            world_xyz = _transform_points(lidar_local_xyz, lidar.transform)
-            u, v, valid, proj_mode = _project_world_to_camera(
-                world_xyz=world_xyz,
-                cam_tf=sem.transform,
-                img_w=int(sem.width),
-                img_h=int(sem.height),
-                fov_deg=float(getattr(sem, "fov", 100.0)),
-            )
-
-            total_pts = int(points_lidar.shape[0])
-            valid_cnt = int(np.count_nonzero(valid))
-            valid_ratio = float(valid_cnt / max(1, total_pts))
-
-            if valid_cnt <= 16:
-                # projection is effectively unusable; fallback to lidar-only geometry
-                used_lidar_only_fallback = 1.0
-                valid_world = world_xyz
-                lane_labels = np.full((valid_world.shape[0],), SEM_ROAD, dtype=np.uint8)
-                obs_labels = np.zeros((valid_world.shape[0],), dtype=np.uint8)
-            else:
-                idx = np.where(valid)[0]
-                ui = u[idx].astype(np.int32)
-                vi = v[idx].astype(np.int32)
-                labels = sem_labels[vi, ui].astype(np.uint8)
-                valid_world = world_xyz[idx]
-                if int(LANE_LINE_NEIGHBOR_RADIUS_PX) > 0:
-                    line_mask = sem_labels == SEM_ROAD_LINE
-                    line_hit_mask = _dilate_binary(line_mask, int(LANE_LINE_NEIGHBOR_RADIUS_PX))
-                    lane_labels = labels.copy()
-                    lane_labels[line_hit_mask[vi, ui]] = np.uint8(SEM_ROAD_LINE)
-                else:
-                    lane_labels = labels
-                obs_labels = labels
+            idx = np.where(valid)[0]
+            ui = u[idx].astype(np.int32)
+            vi = v[idx].astype(np.int32)
+            labels = sem_labels[vi, ui].astype(np.uint8)
+            valid_world = world_xyz[idx]
+            lane_labels = labels
+            obs_labels = labels
 
         ego_tf = carla_env.ego.get_transform()
         ego_loc = ego_tf.location
@@ -536,57 +389,11 @@ class SensorEstimator:
             lookahead_dist=lookahead_dist,
             motion_dir_xy=motion_dir_xy,
             prev_lane_dir_sign=self.prev_lane_dir_sign,
-            prev_lane_center_offset=self.prev_lane_center_offset,
-            prev_lane_width=self.prev_lane_width,
         )
         lane_dir_sign = float(lane_meta.get("lane_dir_sign", 0.0))
         if abs(lane_dir_sign) > 0.5:
             self.prev_lane_dir_sign = 1.0 if lane_dir_sign >= 0.0 else -1.0
-        if np.any(np.abs(lane) > 1e-6):
-            self.prev_lane_center_offset = float(lane[0])
-            if float(lane[2]) > 1e-3:
-                self.prev_lane_width = float(lane[2])
-
-        lane_api_assist_used = 0.0
-        if USE_API_LANE_ASSIST:
-            try:
-                lane_prior = compute_lane_gt(carla_env)
-                wp = float(np.clip(API_LANE_ASSIST_WEIGHT, 0.0, 1.0))
-                ws = float(1.0 - wp)
-                lane[0] = float(ws * float(lane[0]) + wp * float(lane_prior[0]))
-                lane[1] = float(blend_angle(float(lane[1]), float(lane_prior[1]), wp))
-                lane[2] = float(ws * float(lane[2]) + wp * float(lane_prior[2]))
-                lane[3] = float(ws * float(lane[3]) + wp * float(lane_prior[3]))
-                lane[4] = float(ws * float(lane[4]) + wp * float(lane_prior[4]))
-                lane[5] = float(ws * float(lane[5]) + wp * float(lane_prior[5]))
-                lane_api_assist_used = 1.0
-            except Exception:
-                lane_api_assist_used = 0.0
-
-        radar_points = _radar_points_ego(radar)
-        ts = float(lidar.timestamp) if lidar is not None else (float(sem_lidar.timestamp) if sem_lidar is not None else 0.0)
-        obs, obs_meta = self._estimate_obstacles_from_points(
-            ego_points,
-            obs_labels,
-            ts,
-            radar_points=radar_points,
-        )
-        obs_api_assist_used = 0.0
-        if USE_API_OBS_ASSIST:
-            try:
-                obs_prior = compute_obstacle_gt(
-                    carla_env=carla_env,
-                    obstacle_k=self.k,
-                    obs_range=self.obs_range,
-                    front_fwd_min=self.front_fwd_min,
-                    front_lat_tol=self.front_lat_tol,
-                )
-                wp = float(np.clip(API_OBS_ASSIST_WEIGHT, 0.0, 1.0))
-                ws = float(1.0 - wp)
-                obs = (ws * obs + wp * obs_prior).astype(np.float32)
-                obs_api_assist_used = 1.0
-            except Exception:
-                obs_api_assist_used = 0.0
+        obs = self._estimate_obstacles_from_points(ego_points, obs_labels, float(lidar.timestamp))
         lane_sac = canonical_lane_to_sac(lane)
         obs_sac = canonical_obs_to_sac(obs, self.obs_range)
         meta = {
@@ -597,18 +404,8 @@ class SensorEstimator:
             "lane_nonzero": float(1.0 if np.any(np.abs(lane) > 1e-6) else 0.0),
             "obs_nonzero": float(1.0 if np.any(np.abs(obs) > 1e-6) else 0.0),
             "projection_mode": str(proj_mode),
-            "lane_source_sem_lidar": float(1.0 if use_sem_lidar else 0.0),
             "lane_dir_sign": float(lane_meta.get("lane_dir_sign", 0.0)),
             "lane_lookahead_used": float(lane_meta.get("lane_lookahead_used", 0.0)),
-            "lane_fit_points": float(lane_meta.get("lane_fit_points", 0.0)),
-            "lane_line_slice_count": float(lane_meta.get("lane_line_slice_count", 0.0)),
-            "lane_road_fallback_count": float(lane_meta.get("lane_road_fallback_count", 0.0)),
-            "lane_used_prev_fallback": float(lane_meta.get("lane_used_prev_fallback", 0.0)),
-            "obs_radar_matches": float(obs_meta.get("obs_radar_matches", 0.0)),
-            "obs_candidate_clusters": float(obs_meta.get("obs_candidate_clusters", 0.0)),
-            "obs_radar_points": float(obs_meta.get("obs_radar_points", 0.0)),
-            "lane_api_assist_used": float(lane_api_assist_used),
-            "obs_api_assist_used": float(obs_api_assist_used),
         }
         return lane, obs, lane_sac, obs_sac, meta
 
@@ -619,15 +416,11 @@ class SensorEstimator:
         lookahead_dist: float,
         motion_dir_xy: Optional[Tuple[float, float]],
         prev_lane_dir_sign: float,
-        prev_lane_center_offset: Optional[float],
-        prev_lane_width: Optional[float],
     ) -> Tuple[np.ndarray, Dict[str, float]]:
         x = ego_points[:, 0]
         y = ego_points[:, 1]
         z = ego_points[:, 2]
         base_mask = (x > 1.0) & (x < 30.0) & (np.abs(y) < 12.0) & (z > -3.0) & (z < 2.0)
-        line_slice_count = 0
-        road_fallback_count = 0
 
         line_mask = base_mask & (labels == SEM_ROAD_LINE)
         road_mask = base_mask & np.isin(labels, [SEM_ROAD, SEM_ROAD_LINE])
@@ -645,14 +438,11 @@ class SensorEstimator:
 
             y_left = None
             y_right = None
-            width_from_road = False
-            if np.count_nonzero(line_sel) >= int(LANE_LINE_SLICE_MIN_POINTS):
+            if np.count_nonzero(line_sel) >= 8:
                 ys_line = y[line_sel]
                 left_candidates = ys_line[ys_line > 0.2]
                 right_candidates = ys_line[ys_line < -0.2]
-                if left_candidates.size >= int(LANE_LINE_SIDE_MIN_POINTS) and right_candidates.size >= int(
-                    LANE_LINE_SIDE_MIN_POINTS
-                ):
+                if left_candidates.size >= 3 and right_candidates.size >= 3:
                     y_left = float(np.percentile(left_candidates, 35))
                     y_right = float(np.percentile(right_candidates, 65))
 
@@ -660,65 +450,24 @@ class SensorEstimator:
                 ys_road = y[road_sel]
                 y_left = float(np.percentile(ys_road, 85))
                 y_right = float(np.percentile(ys_road, 15))
-                width_from_road = True
 
             if y_left is None or y_right is None:
                 continue
 
             width = y_left - y_right
-            if width_from_road:
-                if prev_lane_width is not None and np.isfinite(float(prev_lane_width)):
-                    lo = max(float(LANE_WIDTH_ROAD_CLAMP_MIN_M), float(prev_lane_width) - 0.7)
-                    hi = min(float(LANE_WIDTH_ROAD_CLAMP_MAX_M), float(prev_lane_width) + 0.7)
-                    if lo < hi:
-                        width = float(np.clip(width, lo, hi))
-                width = float(np.clip(width, float(LANE_WIDTH_ROAD_CLAMP_MIN_M), float(LANE_WIDTH_ROAD_CLAMP_MAX_M)))
-
-            if width < float(LANE_WIDTH_VALID_MIN_M) or width > float(LANE_WIDTH_VALID_MAX_M):
+            if width < 1.8 or width > 8.5:
                 continue
 
             xs.append(float(center_x))
             centers.append(float(0.5 * (y_left + y_right)))
             widths.append(float(width))
-            if width_from_road:
-                road_fallback_count += 1
-            else:
-                line_slice_count += 1
 
         if len(xs) < 2:
-            prev_sign = 1.0 if float(prev_lane_dir_sign) >= 0.0 else -1.0
-            lookahead_fb = float(np.clip(lookahead_dist, 3.0, 25.0))
-            if prev_lane_center_offset is not None and prev_lane_width is not None:
-                lane_center_offset_fb = float(prev_lane_center_offset)
-                lane_center_at_ego_fb = -lane_center_offset_fb
-                lane_heading_diff_fb = float(0.0 if prev_sign > 0.0 else math.pi)
-                lane_fb = np.array(
-                    [
-                        lane_center_offset_fb,
-                        lane_heading_diff_fb,
-                        float(prev_lane_width),
-                        float(prev_sign * lookahead_fb),
-                        float(lane_center_at_ego_fb),
-                        0.0,
-                    ],
-                    dtype=np.float32,
-                )
-                return lane_fb, {
-                    "lane_dir_sign": float(prev_sign),
-                    "lane_lookahead_used": float(lookahead_fb),
-                    "lane_fit_points": float(len(xs)),
-                    "lane_line_slice_count": float(line_slice_count),
-                    "lane_road_fallback_count": float(road_fallback_count),
-                    "lane_used_prev_fallback": 1.0,
-                }
             lane_fallback = np.zeros((6,), dtype=np.float32)
+            prev_sign = 1.0 if float(prev_lane_dir_sign) >= 0.0 else -1.0
             return lane_fallback, {
                 "lane_dir_sign": float(prev_sign),
-                "lane_lookahead_used": float(lookahead_fb),
-                "lane_fit_points": float(len(xs)),
-                "lane_line_slice_count": float(line_slice_count),
-                "lane_road_fallback_count": float(road_fallback_count),
-                "lane_used_prev_fallback": 0.0,
+                "lane_lookahead_used": float(np.clip(lookahead_dist, 3.0, 25.0)),
             }
 
         x_arr = np.asarray(xs, dtype=np.float32)
@@ -732,11 +481,6 @@ class SensorEstimator:
 
         lane_center_at_ego = c
         lane_center_offset = float(-lane_center_at_ego)
-        if prev_lane_center_offset is not None and np.isfinite(float(prev_lane_center_offset)):
-            lane_center_offset = float(
-                float(LANE_CENTER_SMOOTH_ALPHA) * lane_center_offset
-                + (1.0 - float(LANE_CENTER_SMOOTH_ALPHA)) * float(prev_lane_center_offset)
-            )
 
         slope0 = float(b)
         dir_vec = np.array([1.0, slope0], dtype=np.float32)
@@ -769,12 +513,6 @@ class SensorEstimator:
         slope_eval = float(2.0 * a * x_eval_lateral + b)
 
         lane_width = float(np.median(np.asarray(widths, dtype=np.float32))) if widths else 3.5
-        if prev_lane_width is not None and np.isfinite(float(prev_lane_width)):
-            lane_width = float(
-                float(LANE_WIDTH_SMOOTH_ALPHA) * lane_width
-                + (1.0 - float(LANE_WIDTH_SMOOTH_ALPHA)) * float(prev_lane_width)
-            )
-        lane_width = float(np.clip(lane_width, float(LANE_WIDTH_VALID_MIN_M), float(LANE_WIDTH_VALID_MAX_M)))
         next_wp_dx = float(x_eval)
         next_wp_dy = float(a * x_eval_lateral * x_eval_lateral + b * x_eval_lateral + c)
         kappa_base = float((2.0 * a) / max(1e-6, (1.0 + slope_eval * slope_eval) ** 1.5))
@@ -794,10 +532,6 @@ class SensorEstimator:
         return lane, {
             "lane_dir_sign": float(dir_sign),
             "lane_lookahead_used": float(lookahead),
-            "lane_fit_points": float(len(xs)),
-            "lane_line_slice_count": float(line_slice_count),
-            "lane_road_fallback_count": float(road_fallback_count),
-            "lane_used_prev_fallback": 0.0,
         }
 
     def _cluster_points_grid(self, pts: np.ndarray) -> List[np.ndarray]:
@@ -842,8 +576,7 @@ class SensorEstimator:
         ego_points: np.ndarray,
         labels: np.ndarray,
         ts: float,
-        radar_points: Optional[np.ndarray] = None,
-    ) -> Tuple[np.ndarray, Dict[str, float]]:
+    ) -> np.ndarray:
         x = ego_points[:, 0]
         y = ego_points[:, 1]
         z = ego_points[:, 2]
@@ -859,21 +592,13 @@ class SensorEstimator:
         if candidate.shape[0] == 0:
             self.prev_clusters = []
             self.prev_ts = ts
-            return np.zeros((self.k, 3), dtype=np.float32), {
-                "obs_radar_matches": 0.0,
-                "obs_candidate_clusters": 0.0,
-                "obs_radar_points": float(0 if radar_points is None else radar_points.shape[0]),
-            }
+            return np.zeros((self.k, 3), dtype=np.float32)
 
         clusters_idx = self._cluster_points_grid(candidate[:, :2])
         if not clusters_idx:
             self.prev_clusters = []
             self.prev_ts = ts
-            return np.zeros((self.k, 3), dtype=np.float32), {
-                "obs_radar_matches": 0.0,
-                "obs_candidate_clusters": 0.0,
-                "obs_radar_points": float(0 if radar_points is None else radar_points.shape[0]),
-            }
+            return np.zeros((self.k, 3), dtype=np.float32)
 
         clusters = []
         for idxs in clusters_idx:
@@ -889,7 +614,6 @@ class SensorEstimator:
         dt = None if self.prev_ts is None else max(1e-3, float(ts - self.prev_ts))
         out_entries = []
         used_prev = set()
-        radar_match_count = 0
         for cx, cy, _cz, dist in clusters:
             rel_speed = 0.0
             if dt is not None and self.prev_clusters:
@@ -906,14 +630,6 @@ class SensorEstimator:
                     used_prev.add(best_j)
                     px, _py, _pts = self.prev_clusters[best_j]
                     rel_speed = float(-(cx - px) / dt)
-            if USE_RADAR_FOR_OBS_SPEED and radar_points is not None and radar_points.shape[0] > 0:
-                d2 = (radar_points[:, 0] - cx) * (radar_points[:, 0] - cx) + (radar_points[:, 1] - cy) * (
-                    radar_points[:, 1] - cy
-                )
-                j = int(np.argmin(d2))
-                if float(d2[j]) <= float(RADAR_MATCH_RADIUS_M * RADAR_MATCH_RADIUS_M):
-                    rel_speed = float(radar_points[j, 2])
-                    radar_match_count += 1
             out_entries.append((cx, cy, rel_speed, dist))
 
         self.prev_clusters = [(e[0], e[1], ts) for e in out_entries]
@@ -925,11 +641,7 @@ class SensorEstimator:
             front_lat_tol=self.front_lat_tol,
             top_k=self.k,
         )
-        return selected, {
-            "obs_radar_matches": float(radar_match_count),
-            "obs_candidate_clusters": float(len(clusters)),
-            "obs_radar_points": float(0 if radar_points is None else radar_points.shape[0]),
-        }
+        return selected
 
 
 def sort_obstacles_by_priority(
@@ -1010,11 +722,10 @@ def compute_lane_gt(carla_env: CarlaEnv) -> np.ndarray:
 
     lane_width = float(getattr(wp, "lane_width", 3.5))
 
-    # Align next_wp GT semantics with sensor-side fixed lookahead definition.
-    # Use map waypoint progression only (no env target waypoint).
-    lookahead = float(np.clip(float(LANE_LOOKAHEAD_FIXED_M), 3.0, 25.0))
-    next_cands = wp.next(lookahead)
-    target_wp = next_cands[0] if next_cands else wp
+    target_wp = getattr(carla_env, "target_wp", None)
+    if target_wp is None:
+        nxt = wp.next(float(getattr(carla_env, "wp_step_dist", 5.0)))
+        target_wp = nxt[0] if nxt else wp
     tgt = target_wp.transform.location
 
     ego_fwd = ego_tf.get_forward_vector()
@@ -1229,16 +940,6 @@ def build_csv_fields(obstacle_k: int) -> List[str]:
         "frame",
         "reward",
         "done",
-        "diag_lane_fit_points",
-        "diag_lane_line_slice_count",
-        "diag_lane_road_fallback_count",
-        "diag_lane_used_prev_fallback",
-        "diag_lane_source_sem_lidar",
-        "diag_obs_radar_matches",
-        "diag_obs_candidate_clusters",
-        "diag_obs_radar_points",
-        "diag_lane_api_assist_used",
-        "diag_obs_api_assist_used",
     ]
     for n in LANE_NAMES:
         fields.extend([f"lane_gt_{n}", f"lane_pred_{n}", f"lane_abs_{n}"])
@@ -1297,7 +998,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sem-height", type=int, default=360)
     parser.add_argument("--sem-fov", type=float, default=100.0)
     parser.add_argument("--lidar-range", type=float, default=60.0)
-    parser.add_argument("--radar-range", type=float, default=50.0)
     parser.add_argument("--sensor-timeout", type=float, default=1.5)
 
     parser.add_argument("--throttle", type=float, default=0.35)
@@ -1344,16 +1044,6 @@ def main():
     obs_nonzero_steps = 0
     lane_reverse_dir_steps = 0
     lane_lookahead_used_vals = []
-    lane_fit_points_vals = []
-    lane_line_slice_vals = []
-    lane_road_fallback_vals = []
-    lane_used_prev_fallback_steps = 0
-    lane_source_sem_lidar_steps = 0
-    obs_radar_match_vals = []
-    obs_candidate_cluster_vals = []
-    obs_radar_points_vals = []
-    lane_api_assist_steps = 0
-    obs_api_assist_steps = 0
 
     valid_steps = 0
     total_env_steps = 0
@@ -1398,7 +1088,6 @@ def main():
                     sem_h=int(args.sem_height),
                     sem_fov=float(args.sem_fov),
                     lidar_range=float(args.lidar_range),
-                    radar_range=float(args.radar_range),
                 )
 
                 # sensor warmup
@@ -1421,7 +1110,7 @@ def main():
                     env_step_in_ep += 1
 
                     frame = int(env.world.get_snapshot().frame)
-                    sem, lidar, sem_lidar, radar = suite.poll(frame, timeout_s=float(args.sensor_timeout))
+                    sem, lidar = suite.poll(frame, timeout_s=float(args.sensor_timeout))
                     if sem is None or lidar is None:
                         missing_sensor_frames += 1
                         continue
@@ -1430,8 +1119,6 @@ def main():
                         carla_env=env,
                         sem=sem,
                         lidar=lidar,
-                        sem_lidar=sem_lidar,
-                        radar=radar,
                     )
                     projection_valid_ratios.append(float(est_meta.get("projection_valid_ratio", 0.0)))
                     lidar_only_fallback_steps += int(est_meta.get("used_lidar_only_fallback", 0.0) > 0.5)
@@ -1439,16 +1126,6 @@ def main():
                     obs_nonzero_steps += int(est_meta.get("obs_nonzero", 0.0) > 0.5)
                     lane_reverse_dir_steps += int(est_meta.get("lane_dir_sign", 1.0) < 0.0)
                     lane_lookahead_used_vals.append(float(est_meta.get("lane_lookahead_used", 0.0)))
-                    lane_fit_points_vals.append(float(est_meta.get("lane_fit_points", 0.0)))
-                    lane_line_slice_vals.append(float(est_meta.get("lane_line_slice_count", 0.0)))
-                    lane_road_fallback_vals.append(float(est_meta.get("lane_road_fallback_count", 0.0)))
-                    lane_used_prev_fallback_steps += int(est_meta.get("lane_used_prev_fallback", 0.0) > 0.5)
-                    lane_source_sem_lidar_steps += int(est_meta.get("lane_source_sem_lidar", 0.0) > 0.5)
-                    obs_radar_match_vals.append(float(est_meta.get("obs_radar_matches", 0.0)))
-                    obs_candidate_cluster_vals.append(float(est_meta.get("obs_candidate_clusters", 0.0)))
-                    obs_radar_points_vals.append(float(est_meta.get("obs_radar_points", 0.0)))
-                    lane_api_assist_steps += int(est_meta.get("lane_api_assist_used", 0.0) > 0.5)
-                    obs_api_assist_steps += int(est_meta.get("obs_api_assist_used", 0.0) > 0.5)
 
                     lane_gt = compute_lane_gt(env)
                     obs_gt_world_k3 = compute_obstacle_gt(
@@ -1483,16 +1160,6 @@ def main():
                         "frame": int(frame),
                         "reward": float(reward),
                         "done": int(done),
-                        "diag_lane_fit_points": float(est_meta.get("lane_fit_points", 0.0)),
-                        "diag_lane_line_slice_count": float(est_meta.get("lane_line_slice_count", 0.0)),
-                        "diag_lane_road_fallback_count": float(est_meta.get("lane_road_fallback_count", 0.0)),
-                        "diag_lane_used_prev_fallback": float(est_meta.get("lane_used_prev_fallback", 0.0)),
-                        "diag_lane_source_sem_lidar": float(est_meta.get("lane_source_sem_lidar", 0.0)),
-                        "diag_obs_radar_matches": float(est_meta.get("obs_radar_matches", 0.0)),
-                        "diag_obs_candidate_clusters": float(est_meta.get("obs_candidate_clusters", 0.0)),
-                        "diag_obs_radar_points": float(est_meta.get("obs_radar_points", 0.0)),
-                        "diag_lane_api_assist_used": float(est_meta.get("lane_api_assist_used", 0.0)),
-                        "diag_obs_api_assist_used": float(est_meta.get("obs_api_assist_used", 0.0)),
                     }
                     for i, n in enumerate(LANE_NAMES):
                         row[f"lane_gt_{n}"] = float(lane_gt[i])
@@ -1549,19 +1216,13 @@ def main():
     sac_obs_mae = np.mean(np.stack(sac_obs_errs, axis=0), axis=(0, 1))
     proj_ratio_mean = float(np.mean(projection_valid_ratios)) if projection_valid_ratios else 0.0
     lookahead_mean = float(np.mean(lane_lookahead_used_vals)) if lane_lookahead_used_vals else 0.0
-    lane_fit_points_mean = float(np.mean(lane_fit_points_vals)) if lane_fit_points_vals else 0.0
-    lane_line_slice_mean = float(np.mean(lane_line_slice_vals)) if lane_line_slice_vals else 0.0
-    lane_road_fallback_mean = float(np.mean(lane_road_fallback_vals)) if lane_road_fallback_vals else 0.0
-    obs_radar_matches_mean = float(np.mean(obs_radar_match_vals)) if obs_radar_match_vals else 0.0
-    obs_candidate_clusters_mean = float(np.mean(obs_candidate_cluster_vals)) if obs_candidate_cluster_vals else 0.0
-    obs_radar_points_mean = float(np.mean(obs_radar_points_vals)) if obs_radar_points_vals else 0.0
 
     summary = {
         "scenario": str(args.scenario),
         "map": str(args.map),
         "script_version": SCRIPT_VERSION,
         "gt_main_source": {
-            "lane": "carla.map.get_waypoint (+ wp.next fixed lookahead for next_wp)",
+            "lane": "carla.map.get_waypoint",
             "obstacle": "carla.world.get_actors",
         },
         "obstacle_gt_source": "world",
@@ -1579,20 +1240,6 @@ def main():
         "lane_reverse_dir_steps": int(lane_reverse_dir_steps),
         "lane_reverse_dir_rate": float(lane_reverse_dir_steps / max(1, valid_steps)),
         "lane_lookahead_used_mean": float(lookahead_mean),
-        "lane_fit_points_mean": float(lane_fit_points_mean),
-        "lane_line_slice_mean": float(lane_line_slice_mean),
-        "lane_road_fallback_mean": float(lane_road_fallback_mean),
-        "lane_used_prev_fallback_rate": float(lane_used_prev_fallback_steps / max(1, valid_steps)),
-        "lane_source_sem_lidar_rate": float(lane_source_sem_lidar_steps / max(1, valid_steps)),
-        "obs_radar_matches_mean": float(obs_radar_matches_mean),
-        "obs_candidate_clusters_mean": float(obs_candidate_clusters_mean),
-        "obs_radar_points_mean": float(obs_radar_points_mean),
-        "lane_api_assist_rate": float(lane_api_assist_steps / max(1, valid_steps)),
-        "obs_api_assist_rate": float(obs_api_assist_steps / max(1, valid_steps)),
-        "api_assist_weights": {
-            "lane": float(API_LANE_ASSIST_WEIGHT),
-            "obstacle": float(API_OBS_ASSIST_WEIGHT),
-        },
         "obstacle_nonzero_rate": float(obs_nonzero_steps / max(1, valid_steps)),
         "output_csv": os.path.abspath(output_csv),
     }

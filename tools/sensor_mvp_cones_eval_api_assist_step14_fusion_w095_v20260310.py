@@ -59,7 +59,7 @@ SAC_LANE_NAMES = [
     "wp_rel_y_norm",
 ]
 SAC_OBS_NAMES = ["rel_x_norm", "rel_y_norm", "dist_norm"]
-SCRIPT_VERSION = "sensor_mvp_api_assist_step16_obs_w099_v20260310"
+SCRIPT_VERSION = "sensor_mvp_api_assist_step14_fusion_w095_v20260310"
 LANE_LOOKAHEAD_FIXED_M = 12.0
 LANE_DIR_MOTION_MIN_STEP_M = 0.10
 LANE_DIR_OPPOSITE_MOTION = True
@@ -78,7 +78,7 @@ USE_RADAR_FOR_OBS_SPEED = False
 USE_API_LANE_ASSIST = True
 USE_API_OBS_ASSIST = True
 API_LANE_ASSIST_WEIGHT = 0.95
-API_OBS_ASSIST_WEIGHT = 0.99
+API_OBS_ASSIST_WEIGHT = 0.95
 
 
 def wrap_angle(a: float) -> float:
