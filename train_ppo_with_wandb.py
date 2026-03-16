@@ -91,6 +91,10 @@ class RunningMeanStd:
 def apply_curriculum(episode: int, env: "CarlaGymEnv", succ_rate: float = 0.0, window_ready: bool = False):
     cfg = env.config
 
+    # standalone/simple 这类单场景训练不应被多场景课程逻辑污染。
+    if not bool(getattr(cfg, "random_scenario", False)):
+        return
+
     # ✅ 成功率门控课程（优先于固定轮数）
     # 规则：窗口未就绪时，固定在 Stage1
     if not window_ready:
@@ -916,6 +920,32 @@ def train_with_logging(
     entropy_tracker = 0.0
     update_count = 0
 
+    def _latest_logged_scalar(agent_obj, key, default=0.0):
+        stats_obj = getattr(agent_obj, "statistics", None)
+        stats = getattr(stats_obj, "stats", None)
+        if not isinstance(stats, dict):
+            return float(default)
+
+        item = stats.get(key)
+        if not isinstance(item, dict):
+            return float(default)
+
+        values = item.get("list", [])
+        if not values:
+            return float(default)
+
+        value = values[-1]
+        try:
+            if tf.is_tensor(value):
+                value = value.numpy()
+            if isinstance(value, np.ndarray):
+                if value.size == 0:
+                    return float(default)
+                value = float(np.mean(value))
+            return float(value)
+        except Exception:
+            return float(default)
+
     # ============================================================
     # ✅ Early Stop / Convergence 规则（可通过 config.enable_early_stop 关闭）
     # ============================================================
@@ -1565,12 +1595,9 @@ def train_with_logging(
                     if not (np.isnan(policy_loss_val) or np.isinf(policy_loss_val)):
                         temp_policy_loss.append(policy_loss_val)
 
-                    if hasattr(agent, "_logs") and "entropy" in agent._logs:
-                        entropy_val = agent._logs["entropy"]
-                        if isinstance(entropy_val, (list, tuple)):
-                            entropy_val = entropy_val[-1] if entropy_val else 0.0
-                        if not (np.isnan(entropy_val) or np.isinf(entropy_val)):
-                            temp_entropy.append(float(entropy_val))
+                    entropy_val = _latest_logged_scalar(agent, "entropy", default=np.nan)
+                    if np.isfinite(entropy_val):
+                        temp_entropy.append(float(entropy_val))
 
                     agent.update_policy(policy_grads)
 
@@ -1627,7 +1654,6 @@ def train_with_logging(
             value_loss=value_loss_tracker,
             entropy=entropy_tracker
         )
-        logger.end_episode()
 
         # ---------------------- success / ran_full / no_collision ----------------------
         timeout_flag = bool(float(last_info.get("timeout", 0.0)) > 0.5)
@@ -1645,6 +1671,14 @@ def train_with_logging(
         speed_ok = bool(avg_speed >= success_speed_min)
         success = int(ran_full and no_collision and (done_reason not in bad_reasons) and speed_ok)
         safe_fast = int(no_collision and speed_ok and (done_reason not in bad_reasons))
+        logger.log_episode_outcome(
+            done_reason=done_reason,
+            scenario=scenario_name,
+            success=success,
+            speed_ok=int(speed_ok),
+            safe_fast=safe_fast,
+        )
+        logger.end_episode()
         scenario_window.append((scenario_name, int(success), int(no_collision), int(ran_full)))
 
         # ============================================================
@@ -2143,8 +2177,9 @@ def train_ppo(profile: str = "default"):
         try:
             wandb_run = wandb.init(
                 project="SAC-CARLA-PPO",
-                name=f"ppo-standalone-{time.strftime('%Y%m%d-%H%M%S')}",
+                name=f"ppo-{profile}-{time.strftime('%Y%m%d-%H%M%S')}",
                 config={
+                    "profile": profile,
                     "algorithm": "PPO",
                     "env": "CARLA",
                     "scenario": "4scenarios_lane_yield_plus_jaywalker",
@@ -3462,23 +3497,55 @@ def train_ppo(profile: str = "default"):
 
         if profile_name == "standalone":
             cfg.agent_name = "ppo-carla-standalone"
+            cfg.load_existing = False
+            cfg.resume_policy_only = False
             cfg.random_scenario = False
             cfg.scenario = "parked_obstacles"
             cfg.scenario_pool = ["parked_obstacles"]
-            cfg.observations_type = "state"
-            cfg.obs_obstacle_k = 0
-            cfg.use_yref_in_steer = False
-            cfg.use_yref_mapping = False
-            cfg.yref_steer_gain = 0.0
-            cfg.yref_gain = 0.0
+            cfg.scenario_weights = {"parked_obstacles": 1.0}
+            cfg.enable_forced_curriculum = False
+            cfg.observations_type = "state_lane_obstacles"
+            cfg.obs_obstacle_k = 5
+            cfg.obs_obstacle_range = 50.0
+            cfg.use_yref_in_steer = True
+            cfg.use_yref_mapping = True
+            cfg.yref_steer_gain = 0.003
+            cfg.yref_gain = cfg.yref_steer_gain
+            cfg.use_action_dim2 = False
             cfg.yref_penalty = 0.0
-            cfg.max_episode_steps = int(getattr(cfg, "max_episode_steps", 512))
-            cfg.train_episodes = int(getattr(cfg, "train_episodes", 1000))
-            cfg.batch_size = int(getattr(cfg, "batch_size", 256))
-            cfg.update_frequency = int(getattr(cfg, "update_frequency", 1))
-            cfg.optimization_steps = tuple(getattr(cfg, "optimization_steps", (6, 6)))
-            cfg.policy_lr = float(getattr(cfg, "policy_lr", 5e-5))
-            cfg.value_lr = float(getattr(cfg, "value_lr", 1e-4))
+            cfg.max_episode_steps = 256
+            cfg.train_episodes = 1000
+            cfg.batch_size = 128
+            cfg.update_frequency = 2
+            cfg.optimization_steps = (4, 4)
+            cfg.policy_lr = 1e-4
+            cfg.value_lr = 2e-4
+            cfg.num_parked_cars = 2
+            cfg.parked_car_spacing = 10.0
+            cfg.parked_car_start_distance_min = 18.0
+            cfg.parked_car_start_distance_max = 26.0
+            cfg.parked_car_offset = 0.45
+            cfg.target_speed_lane = 3.4
+            cfg.overspeed_start_lane = 4.4
+            cfg.v_max_lane = 6.0
+            cfg.v_cap_near_lane = 3.4
+            cfg.k_speed_lane = 1.8
+            cfg.low_speed_th_lane = 2.0
+            cfg.k_low_speed_lane = 0.65
+            cfg.speed_floor_target_lane = 2.0
+            cfg.speed_floor_k_lane = 0.8
+            cfg.progress_full_speed_lane = 2.6
+            cfg.clear_speed_target_lane = 2.4
+            cfg.k_slow_clear_lane = 0.55
+            cfg.success_speed_th_lane = 2.0
+            cfg.success_min_avg_speed_lane = 2.0
+            cfg.anti_crawl_speed_lane = 2.0
+            cfg.anti_crawl_min_avg_speed_lane = 2.0
+            cfg.anti_crawl_min_recent_speed_lane = 1.8
+            cfg.early_target_avg_speed = 2.0
+            cfg.early_bad_avg_speed = 1.8
+            cfg.early_restart_avg_speed_max = 1.4
+            cfg.offroad_margin = 1.5
         elif profile_name == "simple":
             cfg.agent_name = "ppo-carla-simple"
             cfg.random_scenario = False
@@ -3842,6 +3909,10 @@ def train_ppo(profile: str = "default"):
 
 
 if __name__ == "__main__":
-    model_path = train_ppo()
+    profile_arg = sys.argv[1] if len(sys.argv) > 1 else "default"
+    print(f"[Entry] script={os.path.abspath(__file__)}")
+    print(f"[Entry] cwd={os.getcwd()}")
+    print(f"[Entry] profile={profile_arg}")
+    model_path = train_ppo(profile=profile_arg)
     print(f"\n下一步: 在router中使用训练好的模型")
     print(f"  ppo_model_path='{model_path}'")

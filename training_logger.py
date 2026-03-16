@@ -35,6 +35,11 @@ class TrainingLogger:
             "avg_speed": 0.0,
             "collision_count": 0,
             "collision_rate": 0.0,
+            "done_reason": "unknown",
+            "scenario": "",
+            "success": 0,
+            "speed_ok": 0,
+            "safe_fast": 0,
             "start_time": 0.0,
             "duration": 0.0,
         }
@@ -67,6 +72,11 @@ class TrainingLogger:
             "avg_speed": 0.0,
             "collision_count": 0,
             "collision_rate": 0.0,
+            "done_reason": "unknown",
+            "scenario": "",
+            "success": 0,
+            "speed_ok": 0,
+            "safe_fast": 0,
             "start_time": time.time(),
             "duration": 0.0,
         }
@@ -108,6 +118,24 @@ class TrainingLogger:
             self.current_episode["value_loss"] = float(value_loss)
         if entropy is not None:
             self.current_episode["entropy"] = float(entropy)
+
+    def log_episode_outcome(self,
+                            done_reason: Optional[str] = None,
+                            scenario: Optional[str] = None,
+                            success: Optional[int] = None,
+                            speed_ok: Optional[int] = None,
+                            safe_fast: Optional[int] = None):
+        """记录episode级诊断字段，便于定位训练退化原因。"""
+        if done_reason is not None:
+            self.current_episode["done_reason"] = str(done_reason)
+        if scenario is not None:
+            self.current_episode["scenario"] = str(scenario)
+        if success is not None:
+            self.current_episode["success"] = int(success)
+        if speed_ok is not None:
+            self.current_episode["speed_ok"] = int(speed_ok)
+        if safe_fast is not None:
+            self.current_episode["safe_fast"] = int(safe_fast)
 
     def end_episode(self):
         """结束当前episode，计算统计量并保存"""
@@ -161,6 +189,7 @@ class TrainingLogger:
             "avg_entropy": np.mean([ep["entropy"] for ep in recent]),
             "avg_speed": np.mean([ep["avg_speed"] for ep in recent]),
             "collision_rate": np.mean([ep["collision_rate"] for ep in recent]),
+            "success_rate": np.mean([ep.get("success", 0) for ep in recent]) * 100.0,
         }
 
     def print_summary(self, window: int = 10):
@@ -183,7 +212,11 @@ class TrainingLogger:
         print(f"\n{'='*70}")
         print(f"Episode {latest['episode']} 完成 {collision_emoji}")
         print(f"{'='*70}")
-        print(f"  当前: Reward={latest['reward']:.2f}, Length={latest['length']}, Speed={latest['avg_speed']:.2f} m/s, Collision={'YES' if latest['collision_count'] > 0 else 'NO'}")
+        print(
+            f"  当前: Reward={latest['reward']:.2f}, Length={latest['length']}, "
+            f"Speed={latest['avg_speed']:.2f} m/s, Collision={'YES' if latest['collision_count'] > 0 else 'NO'}, "
+            f"DoneReason={latest.get('done_reason', 'unknown')}"
+        )
         print(f"  最近{len(recent)}个平均:")
         print(f"    - Reward: {stats['avg_reward']:.2f}")
         print(f"    - Length: {stats['avg_length']:.0f}")
@@ -191,6 +224,7 @@ class TrainingLogger:
         print(f"    - Value Loss: {stats['avg_value_loss']:.4f}")
         print(f"    - Entropy: {stats['avg_entropy']:.4f}")
         print(f"    - Speed: {stats['avg_speed']:.2f} m/s")
+        print(f"    - Success Rate: {stats['success_rate']:.2f}%")
         print(f"    - Collision Rate: {stats['collision_rate']:.2f}% ({collision_count}/{len(recent)} episodes)")
         print(f"{'='*70}\n")
 

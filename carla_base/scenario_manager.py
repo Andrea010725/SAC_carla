@@ -12,10 +12,13 @@ import random
 import math
 from typing import Optional, List, Tuple, Dict, Any
 import carla
-import sys
-sys.path.append("/home/ajifang/SAC_carla/carla_base/")
-from tiny_scenarios_obstacle import ahead_obstacle_scenario
-from carla_data_provider import CarlaDataProvider
+
+try:
+    from .tiny_scenarios_obstacle import ahead_obstacle_scenario
+    from .carla_data_provider import CarlaDataProvider
+except ImportError:
+    from tiny_scenarios_obstacle import ahead_obstacle_scenario
+    from carla_data_provider import CarlaDataProvider
 
 
 class ScenarioBase:

@@ -14,15 +14,18 @@ import os
 import argparse
 import pickle
 import json
-import sys
-sys.path.append("/home/ajifang/SAC_carla/carla_base/")
-from tiny_scenarios import VEHICLE_TYPE_DICT, TYPE_VEHICLE_DICT, choose_bp_name
+
 try:
-    from carla_data_provider import CarlaDataProvider
-except Exception:
+    from .tiny_scenarios import VEHICLE_TYPE_DICT, TYPE_VEHICLE_DICT, choose_bp_name
+except ImportError:
+    from tiny_scenarios import VEHICLE_TYPE_DICT, TYPE_VEHICLE_DICT, choose_bp_name
+
+try:
+    from .carla_data_provider import CarlaDataProvider
+except ImportError:
     try:
-        from .carla_data_provider import CarlaDataProvider
-    except Exception:
+        from carla_data_provider import CarlaDataProvider
+    except ImportError:
         CarlaDataProvider = None
 
 

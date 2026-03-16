@@ -37,24 +37,11 @@ class CarlaGymEnv(gym.Env):
         self.config = config
         self.carla_env = CarlaEnv(config, 2000, 8000)
         self.logger = logger  # 训练日志记录器
-
-        # 定义observation space (9维)
-        self.observation_space = gym.spaces.Box(
-            low=-np.inf,
-            high=np.inf,
-            shape=(9,),
-            dtype=np.float32
-        )
-
-        # 定义action space (2维: [throttle_brake, steer])
-        self.action_space = gym.spaces.Box(
-            low=-1.0,
-            high=1.0,
-            shape=(2,),
-            dtype=np.float32
-        )
+        self.observation_space = self.carla_env.observation_space
+        self.action_space = self.carla_env.action_space
 
         self.max_episode_steps = config.max_episode_steps
+        self.use_action_dim2 = bool(getattr(config, "use_action_dim2", False))
 
         # 🚗 解决车辆静止问题：添加action bias
         self.current_episode = 0
@@ -66,24 +53,30 @@ class CarlaGymEnv(gym.Env):
 
     def reset(self):
         """重置环境"""
-        self.carla_env.reset()
-        obs = self.carla_env._get_state_obs()
+        obs = self.carla_env.reset()
         self.current_episode += 1
         self._step_count = 0  # 重置step计数
         self.episode_collision = False  # 重置碰撞标志
-        return obs
+        return np.asarray(obs, dtype=np.float32)
 
     def step(self, action):
         """执行一步"""
+        action = np.asarray(action, dtype=np.float32).reshape(-1)
+        if action.size < 3:
+            action = np.pad(action, (0, 3 - action.size), mode="constant")
+
         # 🔧 NaN检测 - 如果action是NaN，用安全默认值替代
         if np.any(np.isnan(action)) or np.any(np.isinf(action)):
-            print(f"⚠️  检测到NaN/Inf action: {action}, 使用安全默认值 [0.3, 0.0]")
-            action = np.array([0.3, 0.0], dtype=np.float32)
+            print(f"⚠️  检测到NaN/Inf action: {action}, 使用安全默认值 [0.3, 0.0, 0.0]")
+            action = np.array([0.3, 0.0, 0.0], dtype=np.float32)
 
         # 🔧 强制裁剪action到合法范围，防止NaN和网络发散
         action = np.clip(action, -1.0, 1.0)
+        if self.use_action_dim2:
+            action[2] = 0.0
 
         # 🚗 初期添加action bias，鼓励前进（解决车辆静止问题）
+        bias = 0.0
         if self.current_episode < 500:  # 🔧 大幅延长 (原300) - 确保长期有bias
             # 计算当前episode的bias强度（随episode衰减）
             bias = self.action_bias_strength * (self.action_bias_decay ** self.current_episode)
@@ -107,9 +100,7 @@ class CarlaGymEnv(gym.Env):
             elif not hasattr(self, '_step_count'):
                 self._step_count = 0
 
-        # ✅ 直接使用CarlaEnv.step() - 包含渲染逻辑
-        # CarlaEnv.step()接受的action格式正好是 [throttle_brake, steer]
-        # 与PPO输出格式完全一致!
+        # ✅ 直接使用CarlaEnv.step() - 保持和底层环境一致的3维动作接口
         obs, reward, done, info = self.carla_env.step(action)
 
         # 📊 记录步骤信息到logger
@@ -129,7 +120,7 @@ class CarlaGymEnv(gym.Env):
 
             self.logger.log_step(speed=speed, collision=collision)
 
-        return obs, reward, done, info
+        return np.asarray(obs, dtype=np.float32), reward, done, info
 
     # 注意: _compute_reward() 和 _check_done() 方法已不需要
     # 因为 CarlaEnv.step() 内部已经实现了 reward 计算和 done 判断
