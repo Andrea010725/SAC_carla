@@ -94,6 +94,8 @@ def apply_curriculum(episode: int, env: "CarlaGymEnv", succ_rate: float = 0.0, w
     # standalone/simple 这类单场景训练不应被多场景课程逻辑污染。
     if not bool(getattr(cfg, "random_scenario", False)):
         return
+    if not bool(getattr(cfg, "enable_curriculum", True)):
+        return
 
     # ✅ 成功率门控课程（优先于固定轮数）
     # 规则：窗口未就绪时，固定在 Stage1
@@ -2155,6 +2157,8 @@ def train_ppo(profile: str = "default"):
         profile = "default"
     elif profile in ("standalone", "simple", "4scenarios", "four_scenarios"):
         profile = "4scenarios" if profile in ("4scenarios", "four_scenarios") else profile
+    elif profile in ("minimal4", "minimal_4scenarios", "rlplanner_minimal"):
+        profile = "minimal4"
     else:
         print(f"[Profile] ⚠️ 未知profile={profile}，回退到 default")
         profile = "default"
@@ -2173,7 +2177,10 @@ def train_ppo(profile: str = "default"):
     debug_vis_timesteps = 256
 
     wandb_run = None
-    if WANDB_AVAILABLE:
+    wandb_enabled = WANDB_AVAILABLE and profile != "minimal4"
+    if WANDB_AVAILABLE and (not wandb_enabled):
+        print("[Wandb] profile=minimal4 -> 跳过W&B初始化，保留最小训练链。")
+    if wandb_enabled:
         try:
             wandb_run = wandb.init(
                 project="SAC-CARLA-PPO",
@@ -3483,6 +3490,7 @@ def train_ppo(profile: str = "default"):
     def _apply_profile_overrides(cfg, profile_name: str):
         # 所有 profile 的公共稳态配置
         cfg.normalize_obs = bool(getattr(cfg, "normalize_obs", True))
+        cfg.enable_curriculum = bool(getattr(cfg, "enable_curriculum", True))
         cfg.value_representation = str(getattr(cfg, "value_representation", "scalar")).strip().lower()
         if cfg.value_representation not in ("scalar", "decomposed"):
             cfg.value_representation = "scalar"
@@ -3578,6 +3586,62 @@ def train_ppo(profile: str = "default"):
             cfg.value_lr = float(getattr(cfg, "value_lr", 2e-4))
             cfg.use_yref_in_steer = bool(getattr(cfg, "use_yref_in_steer", True))
             cfg.use_yref_mapping = bool(getattr(cfg, "use_yref_in_steer", True))
+        elif profile_name == "minimal4":
+            cfg.agent_name = "ppo-carla-minimal4"
+            cfg.load_existing = False
+            cfg.resume_policy_only = False
+            cfg.random_scenario = True
+            cfg.scenario = "cones"
+            cfg.scenario_pool = ["cones", "jaywalker", "trimma", "construction_lane_change"]
+            cfg.scenario_weights = {
+                "cones": 0.25,
+                "jaywalker": 0.25,
+                "trimma": 0.25,
+                "construction_lane_change": 0.25,
+            }
+            cfg.enable_curriculum = False
+            cfg.enable_forced_curriculum = False
+
+            # Keep obstacle/lane context, but cut extra action channels.
+            cfg.observations_type = "state_lane_obstacles"
+            cfg.obs_obstacle_k = 3
+            cfg.obs_obstacle_range = 35.0
+            cfg.use_action_dim2 = True
+            cfg.use_yref_in_steer = False
+            cfg.use_yref_mapping = False
+            cfg.yref_steer_gain = 0.0
+            cfg.yref_gain = 0.0
+            cfg.yref_penalty = 0.0
+
+            # Keep PPO itself simple.
+            cfg.max_episode_steps = int(getattr(cfg, "max_episode_steps", 256))
+            cfg.train_episodes = int(getattr(cfg, "train_episodes", 1500))
+            cfg.batch_size = int(getattr(cfg, "batch_size", 128))
+            cfg.update_frequency = int(getattr(cfg, "update_frequency", 2))
+            cfg.optimization_steps = tuple(getattr(cfg, "optimization_steps", (4, 4)))
+            cfg.policy_lr = float(getattr(cfg, "policy_lr", 1e-4))
+            cfg.value_lr = float(getattr(cfg, "value_lr", 2e-4))
+            cfg.normalize_obs = True
+            cfg.train_onpolicy_action_mode = True
+            cfg.ppo_store_executed_action = True
+
+            # Remove wrapper-side training hacks.
+            cfg.use_action_bias = False
+            cfg.use_forced_throttle = False
+            cfg.anti_crawl_enable = False
+            cfg.wrapper_crawl_penalty_enable = False
+            cfg.anti_crawl_terminate_enable = False
+            cfg.bad_brake_penalty_enable = False
+
+            # Remove training-control side loops that complicate diagnosis.
+            cfg.enable_early_stop = False
+            cfg.early_restart_enable = False
+            cfg.hard_bad_enable = False
+            cfg.degrade_rollback_enable = False
+            cfg.restore_best_on_bad_stop = False
+            cfg.restore_best_at_end = False
+            cfg.deterministic_eval_enable = False
+            cfg.wandb_step_log_interval = int(getattr(cfg, "wandb_step_log_interval", 200))
         else:
             cfg.agent_name = str(getattr(cfg, "agent_name", "ppo-carla-obs30"))
             cfg.value_representation = str(getattr(cfg, "value_representation", "scalar")).strip().lower()

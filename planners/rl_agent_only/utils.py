@@ -46,6 +46,15 @@ def get_optimizer_by_name(name: str, *args, **kwargs) -> tf.keras.optimizers.Opt
         raise ValueError(f'Cannot find optimizer {name}. Select one of {OPTIMIZERS.keys()}.')
 
     print(f'Optimizer: {name}.')
+    # 某些 TensorFlow/Keras 版本在 GPU 上默认对 optimizer.update_step 开启 XLA，
+    # 如果本机 CUDA 安装不完整（缺 libdevice），会在训练第一步直接崩掉。
+    # 这里优先显式关闭 optimizer 级别的 jit_compile，避免把环境问题变成训练阻塞。
+    if "jit_compile" not in kwargs:
+        try:
+            return optimizer_class(*args, jit_compile=False, **kwargs)
+        except TypeError:
+            pass
+
     return optimizer_class(*args, **kwargs)
 
 

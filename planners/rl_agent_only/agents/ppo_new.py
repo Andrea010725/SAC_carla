@@ -137,24 +137,25 @@ class PPOAgent(Agent):
                                  value=os.path.join(self.base_path, 'value_net'))
 
         if isinstance(network, dict):
-            network_class = network.pop('network', PPONetwork)
+            network_cfg = dict(network)
+            network_class = network_cfg.pop('network', PPONetwork)
 
             if network_class is PPONetwork:
                 # policy/value-specific arguments
-                policy_args = network.pop('policy', {})
-                value_args = network.pop('value', policy_args)
+                policy_args = dict(network_cfg.pop('policy', {}))
+                value_args = dict(network_cfg.pop('value', policy_args))
 
                 # common arguments
-                for k, v in network.items():
+                for k, v in network_cfg.items():
                     if k not in policy_args:
                         policy_args[k] = v
 
                     if k not in value_args:
                         value_args[k] = v
 
-                self.network = network_class(agent=self, policy=policy_args, value=value_args, **network)
+                self.network = network_class(agent=self, policy=policy_args, value=value_args)
             else:
-                self.network = network_class(agent=self, **network)
+                self.network = network_class(agent=self, **network_cfg)
         else:
             self.network = PPONetwork(agent=self, policy={}, value={})
 
